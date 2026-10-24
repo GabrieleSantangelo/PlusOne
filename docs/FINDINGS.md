@@ -77,14 +77,24 @@ input sets `UIBCDetected` and `DirectRenderer::setNonAVSyncMode(true)`.
   None for the P2P device and for every virtual interface, so comparing it
   made each docker/VPN interface that went away look like the Wi-Fi device
   going away. `NM.Object.get_path()` is the D-Bus path.
-- Twice, right after the PC joined another Wi-Fi network, the Intel AX211
-  firmware (89.123cf747.0) crashed while associating to the tablet's group
-  (`NMI_INTERRUPT_UMAC_FATAL`, `FW error in SYNC CMD LINK_CONFIG_CMD`) and
-  the driver was reprobed. The tablet then stayed group owner of that
-  half-made group (`P2P-DEVICE-FOUND` from its interface address with
-  `group_capab=0xab`) and ignored GO negotiation for 70-90 s, until
-  `P2P-DEVICE-LOST`; then its peer object path changed and an activation on
-  the old one fails with "The P2P peer ... is unknown".
+- Three times (09:20, 11:46, 14:25), the Intel AX211 firmware (89.123cf747.0)
+  crashed while associating to the tablet's group (`NMI_INTERRUPT_UMAC_FATAL`,
+  `FW error in SYNC CMD LINK_CONFIG_CMD`) and the driver was reprobed. Each
+  time it was the first Wi-Fi Direct join after the PC moved from a network on
+  2462 MHz to one on 5745 MHz (80 MHz wide, the channel the tablet's group
+  then used too), with no firmware restart in between; joins after the
+  restart, on the same network and channel, worked. The crash also drops the
+  PC from its network, and NetworkManager may join the previous one. The
+  tablet then stays group owner of that half-made group (`P2P-DEVICE-FOUND`
+  from its interface address with `group_capab=0xab`) and ignores GO
+  negotiation until `P2P-DEVICE-LOST`: 70-90 s the first two times, 2.5 min
+  (three attempts) the third, which connected 1 s after it. Its peer object
+  path then changes, and an activation on the old one fails with "The P2P
+  peer ... is unknown".
+- linux-firmware has four newer builds of that file
+  (`iwlwifi-so-a0-gf-a0-89.ucode`, revisions 735b75a4, f7dcb3ee, d2579d43,
+  b20dcd1f, March to September 2026); Ubuntu 24.04 ships 123cf747 (January
+  2026). Their commit messages do not say what they fix.
 - Quick Share announces itself over mDNS as `_FC9F5ED42C8A._tcp`; TXT `n` is
   the base64url endpoint info, whose first byte holds the device type in bits
   1-3 (1 phone, 2 tablet, 3 laptop; seen 0x34 from the Tab S10 FE+, 0x32 from

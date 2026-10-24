@@ -50,7 +50,11 @@ Sign on the tablet.
     for it again instead of failing on the old one until it gives up;
   - when the Intel Wi-Fi firmware crashes while joining the tablet, Plus One
     asks to close and reopen Second Screen (the tablet otherwise ignores new
-    attempts for a minute or more) and waits the full time again.
+    attempts for minutes) and waits the full time again; the request is a
+    notification, so it shows with the window closed too.
+- Asking again to sign a PDF that is waiting for the tablet, or already open,
+  no longer opens it twice: *Done* closed one window, and the others kept the
+  tablet connected.
 - New dependencies: `gir1.2-poppler-0.18`, `python3-pypdf` (`.deb`); the
   Flatpak builds poppler 25.12 and pypdf.
 

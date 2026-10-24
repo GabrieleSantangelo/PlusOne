@@ -10,7 +10,7 @@ import os
 from gi.repository import Gio, GLib
 
 from . import log, once
-from .engine import State
+from .engine import NOT_ANSWERING, State
 from .i18n import _
 
 MONITOR_WAIT = 5  # seconds for the tablet's monitor to appear once streaming
@@ -21,6 +21,7 @@ class Signing:
     def __init__(self, app):
         self.app = app
         self.queue = []            # paths waiting for the tablet
+        self.opening = set()       # paths waiting for the tablet's monitor
         self.windows = []
         self.connected_for_us = False
         for name, callback in (("sign-here", self._sign_here), ("open-file", self._open_file),
@@ -32,17 +33,29 @@ class Signing:
     def request(self, path):
         path = os.path.abspath(path)
         log("signing", path)
+        # Asked again while the tablet takes its time: one window per
+        # document, or Done would leave the others open, and the tablet with them.
+        for window in self.windows:
+            if window.path == path:
+                window.present()
+                return
+        if path in self.opening:
+            return
         controller = self.app.controller
         if controller.state == State.STREAMING:
             self._open_on_tablet(path)
             return
-        self.queue.append(path)
+        if path not in self.queue:
+            self.queue.append(path)
         if not controller.running:
             self.connected_for_us = True
             controller.start()
+        self._notify_waiting(path, _("Tap “Second screen” on the tablet to sign {name}")
+                             .format(name=os.path.basename(path)))
+
+    def _notify_waiting(self, path, body):
         note = Gio.Notification.new(_("Sign on the tablet"))
-        note.set_body(_("Tap “Second screen” on the tablet to sign {name}")
-                      .format(name=os.path.basename(path)))
+        note.set_body(body)
         note.add_button_with_target(_("Sign on this PC"), "app.sign-here", GLib.Variant("s", path))
         self.app.send_notification(NOTIFICATION, note)
 
@@ -55,6 +68,9 @@ class Signing:
             self.app.withdraw_notification(NOTIFICATION)
             for path in queue:
                 self._open_on_tablet(path)
+        elif state == State.CONNECTING and self.app.controller.detail[0] == NOT_ANSWERING:
+            self._notify_waiting(self.queue[-1], _(NOT_ANSWERING))
+            return True
         elif state in (State.IDLE, State.ERROR) and not self.app.controller.running:
             # Gave up, failed or was stopped: offer the PC instead.
             queue, self.queue = self.queue, []
@@ -72,6 +88,7 @@ class Signing:
     # -- windows ---------------------------------------------------------------
     def _open_on_tablet(self, path, tries=0):
         from .sign import tablet_monitor
+        self.opening.add(path)
         monitor = tablet_monitor()
         if monitor is None and tries < MONITOR_WAIT * 4:
             GLib.timeout_add(250, once(self._open_on_tablet, path, tries + 1))
@@ -80,6 +97,7 @@ class Signing:
 
     def _open(self, path, monitor=None):
         from .sign import SignWindow
+        self.opening.discard(path)
         try:
             window = SignWindow(self.app, path, lambda result: self._done(window, path, result))
         except GLib.Error as e:
@@ -110,7 +128,7 @@ class Signing:
         GLib.idle_add(once(self._maybe_disconnect))
 
     def _maybe_disconnect(self):
-        if self.connected_for_us and not self.windows and not self.queue:
+        if self.connected_for_us and not self.windows and not self.queue and not self.opening:
             self.connected_for_us = False
             self.app.controller.stop()
 

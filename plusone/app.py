@@ -25,7 +25,7 @@ gi.require_version("NM", "1.0")
 from gi.repository import Adw, Gio, GLib, Gst  # noqa: E402
 
 from . import __version__, add_log_handler, i18n, log, once  # noqa: E402
-from .engine import Controller, Settings, State  # noqa: E402
+from .engine import NOT_ANSWERING, Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .nearby import Nearby  # noqa: E402
 from .signing import Signing  # noqa: E402
@@ -323,6 +323,10 @@ class PlusOneApp(Adw.Application):
             note = Gio.Notification.new(title)
             note.set_body(detail)
             note.add_button(_("Connect"), "app.connect")
+        elif template == NOT_ANSWERING:
+            # Nothing else would tell: the window may well be closed.
+            note = Gio.Notification.new(title)
+            note.set_body(detail)
         else:
             self.withdraw_notification(NOTIFICATION)
             return

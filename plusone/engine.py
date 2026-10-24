@@ -21,6 +21,8 @@ UIBC_PORT = 50000
 # Searching for the tablet keeps the Wi-Fi radio busy, so it is time-boxed:
 CONNECT_WINDOW = 120    # after the user asks to connect
 RECONNECT_WINDOW = 90   # after the tablet closes Second Screen, to catch a reopen
+# Only the user can help then: the tablet is stuck in a half-made group.
+NOT_ANSWERING = "The tablet is not answering: close and reopen Second Screen"
 
 
 @dataclass
@@ -169,7 +171,7 @@ class Controller:
         self._set_state(State.CONNECTING, "Connecting to {name}…", name=name)
 
     def _on_link_hint(self):
-        self._set_state(State.CONNECTING, "The tablet is not answering: close and reopen Second Screen")
+        self._set_state(State.CONNECTING, NOT_ANSWERING)
 
     def _accept_loop(self):
         while self._running:
