@@ -143,7 +143,11 @@ gdbus call --session -d io.github.gabrielesantangelo.PlusOne -o /io/github/gabri
 ### Sign a PDF on the tablet
 
 Right-click a PDF in Files → **Sign on Tablet** (or *Open With → Sign on
-Tablet*, or launch *Sign on Tablet* from the app grid and pick a file).
+Tablet*, or launch *Sign on Tablet* from the app grid and pick a file). Files
+offers it while a tablet is on your network or connected: Plus One sees it
+when the tablet announces itself, which Android's Quick Share and KDE Connect
+both do. **Options → Sign on Tablet** in the Plus One window turns it off
+everywhere, and shows which tablet Plus One sees.
 
 1. If the tablet is not connected yet, Plus One connects it: tap **Second
    screen** on the tablet.
@@ -274,7 +278,8 @@ What comes next, and the convenience rules every feature follows, is in
 ```
 plusone/          the app: app.py (background app, D-Bus, notifications), gui.py (window),
                   engine.py (ties display, p2p, rtsp, media, uibc, pen together),
-                  signing.py + sign.py + pdf.py + ink.py (Sign on Tablet)
+                  signing.py + sign.py + pdf.py + ink.py + modeler.py (Sign on Tablet),
+                  nearby.py (tablets on the network)
 data/gnome-shell/ the Quick Settings extension
 data/nautilus/    the Files context-menu entry
 tests/            unit and protocol tests (a scripted fake tablet, no hardware needed)

@@ -69,6 +69,30 @@ input sets `UIBCDetected` and `DirectRenderer::setNonAVSyncMode(true)`.
   dials back to 127.0.0.1:7236 within a second; RTP goes to the tablet's LAN
   IP. Each USB function change restarts adbd (new wireless-debugging port).
 
+## Wi-Fi Direct after a change of network (2026-10-24)
+
+- NetworkManager's `StartFind` ends after 30 s unless given a `timeout`
+  (1-600 s): measured, `P2P-FIND-STOPPED` 30 s after the call.
+- `NM.Device.get_path()` in libnm is the udev `ID_PATH`, not the D-Bus path:
+  None for the P2P device and for every virtual interface, so comparing it
+  made each docker/VPN interface that went away look like the Wi-Fi device
+  going away. `NM.Object.get_path()` is the D-Bus path.
+- Twice, right after the PC joined another Wi-Fi network, the Intel AX211
+  firmware (89.123cf747.0) crashed while associating to the tablet's group
+  (`NMI_INTERRUPT_UMAC_FATAL`, `FW error in SYNC CMD LINK_CONFIG_CMD`) and
+  the driver was reprobed. The tablet then stayed group owner of that
+  half-made group (`P2P-DEVICE-FOUND` from its interface address with
+  `group_capab=0xab`) and ignored GO negotiation for 70-90 s, until
+  `P2P-DEVICE-LOST`; then its peer object path changed and an activation on
+  the old one fails with "The P2P peer ... is unknown".
+- Quick Share announces itself over mDNS as `_FC9F5ED42C8A._tcp`; TXT `n` is
+  the base64url endpoint info, whose first byte holds the device type in bits
+  1-3 (1 phone, 2 tablet, 3 laptop; seen 0x34 from the Tab S10 FE+, 0x32 from
+  a phone). KDE Connect's `_kdeconnect._udp` TXT has `type=tablet` and
+  `name=`. RFC 6762 recommends a 75 min TTL for the PTR that lists a service
+  and 120 s for its SRV, so a tablet that leaves silently is noticed by
+  resolving it again, not by waiting for it to be unlisted.
+
 ## Pen handling in note apps (for the signing window)
 
 Notewise 4.1.4 (`com.yygg.note.app`) and Samsung Notes 4.4.45, pulled from

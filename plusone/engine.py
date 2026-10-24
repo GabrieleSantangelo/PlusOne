@@ -40,6 +40,8 @@ class Settings:
     # login, so the Quick Settings toggle connects at once.
     background: bool = True
     language: str = "auto"
+    # "Sign on Tablet" in Files and Open With.
+    sign_on_tablet: bool = True
 
 
 class State:

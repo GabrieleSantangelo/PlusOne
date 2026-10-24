@@ -27,6 +27,7 @@ from gi.repository import Adw, Gio, GLib, Gst  # noqa: E402
 from . import __version__, add_log_handler, i18n, log, once  # noqa: E402
 from .engine import Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
+from .nearby import Nearby  # noqa: E402
 from .signing import Signing  # noqa: E402
 
 APP_ID = "io.github.gabrielesantangelo.PlusOne"
@@ -46,6 +47,7 @@ INTERFACE_XML = f"""
     <property name="Title" type="s" access="read"/>
     <property name="Detail" type="s" access="read"/>
     <property name="Background" type="b" access="readwrite"/>
+    <property name="SignAvailable" type="b" access="read"/>
   </interface>
 </node>"""
 CONFIG = os.path.join(GLib.get_user_config_dir(), "plus-one", "settings.json")
@@ -58,6 +60,8 @@ TITLES = {
     State.ERROR: "Problem",
 }
 EXTENSION = "plus-one@gabrielesantangelo.github.io"
+SIGN_ENTRY = f"{APP_ID}.Sign.desktop"
+HIDDEN_KEY = "X-PlusOne-Hidden"
 IDLE_HINT = "Press Connect, then tap “Second screen” in the tablet's quick settings"
 NOTIFICATION = "status"
 
@@ -107,6 +111,37 @@ def set_autostart(enabled, config_dir=None):
     path.write_text("[Desktop Entry]\nType=Application\nName=Plus One\n"
                     f"Exec={launcher()} --gapplication-service\nIcon={APP_ID}\n"
                     "NoDisplay=true\nX-GNOME-Autostart-enabled=true\n")
+
+
+def set_sign_entry(shown, data_dir=None):
+    """Show or hide the "Sign on Tablet" app (Open With, the app grid). An
+    entry with Hidden=true in the user's applications folder hides the one of
+    the same name installed system-wide; a per-user install (install.sh) has
+    its only entry there, which is hidden and shown again in place."""
+    if IN_FLATPAK:
+        return  # the sandbox cannot write there
+    path = Path(data_dir or GLib.get_user_data_dir()) / "applications" / SIGN_ENTRY
+    entry = GLib.KeyFile()
+    try:
+        entry.load_from_file(str(path), GLib.KeyFileFlags.KEEP_COMMENTS
+                             | GLib.KeyFileFlags.KEEP_TRANSLATIONS)
+        ours = entry.get_string("Desktop Entry", HIDDEN_KEY)
+    except GLib.Error:
+        ours = None if path.exists() else "absent"
+    if not shown and ours == "absent":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[Desktop Entry]\nType=Application\nName=Sign on Tablet\n"
+                        f"Exec={launcher()} --sign %F\nHidden=true\n{HIDDEN_KEY}=created\n")
+    elif not shown and ours is None:
+        entry.set_boolean("Desktop Entry", "Hidden", True)
+        entry.set_string("Desktop Entry", HIDDEN_KEY, "edited")
+        entry.save_to_file(str(path))
+    elif shown and ours == "created":
+        path.unlink()
+    elif shown and ours == "edited":
+        entry.remove_key("Desktop Entry", "Hidden")
+        entry.remove_key("Desktop Entry", HIDDEN_KEY)
+        entry.save_to_file(str(path))
 
 
 def _shell_extensions_call(method, args, reply_type, callback):
@@ -168,6 +203,7 @@ class PlusOneApp(Adw.Application):
             action.connect("activate", callback)
             self.add_action(action)
         self.signing = Signing(self)
+        self.nearby = Nearby(on_change=self._on_nearby)
 
     # -- GApplication ------------------------------------------------------
     def do_startup(self):
@@ -175,6 +211,9 @@ class PlusOneApp(Adw.Application):
         Gst.init(None)
         if self.settings.background:
             set_autostart(True)
+        set_sign_entry(self.settings.sign_on_tablet)
+        if self.settings.sign_on_tablet:
+            self.nearby.start()
         self._update_hold()
 
     def do_activate(self):
@@ -299,6 +338,29 @@ class PlusOneApp(Adw.Application):
         self._update_hold()
         self._emit_properties()
 
+    def set_sign_on_tablet(self, enabled):
+        if enabled == self.settings.sign_on_tablet:
+            return
+        self.settings.sign_on_tablet = enabled
+        save_settings(self.settings)
+        set_sign_entry(enabled)
+        if enabled:
+            self.nearby.start()
+        else:
+            self.nearby.stop()
+        self._on_nearby()
+
+    def sign_available(self):
+        """Whether Files should offer "Sign on Tablet" now: switched on, and
+        a tablet connected or on the network (or no telling)."""
+        return self.settings.sign_on_tablet and (
+            self.controller.state in (State.CONNECTING, State.STREAMING) or self.nearby.present())
+
+    def _on_nearby(self):
+        self._emit_properties()
+        for listener in list(self.listeners):
+            listener()
+
     # -- D-Bus -------------------------------------------------------------
     def _properties(self):
         title, detail = self.status_text()
@@ -307,7 +369,8 @@ class PlusOneApp(Adw.Application):
                 "Active": GLib.Variant("b", self.controller.running),
                 "Title": GLib.Variant("s", title),
                 "Detail": GLib.Variant("s", detail),
-                "Background": GLib.Variant("b", self.settings.background)}
+                "Background": GLib.Variant("b", self.settings.background),
+                "SignAvailable": GLib.Variant("b", self.sign_available())}
 
     def _emit_properties(self):
         if self._registration:

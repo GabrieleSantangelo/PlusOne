@@ -25,6 +25,12 @@ _IT = {
     "Mbit/s: higher is sharper but uses more bandwidth": "Mbit/s: più alto = più nitido, più banda",
     "Options": "Opzioni",
     "Touch and S Pen": "Touch e S Pen",
+    "Sign on Tablet": "Firma sul tablet",
+    "In Files, for PDFs, while a tablet is on the network":
+        "In File, per i PDF, quando c'è un tablet in rete",
+    "On the network now: {name}": "In rete ora: {name}",
+    "A tablet is on the network now": "Ora c'è un tablet in rete",
+    "No tablet on the network now": "Ora nessun tablet in rete",
     "Ready in the background": "Pronto in background",
     "Starts at login and stays ready after you close this window":
         "Parte all'accesso e resta pronto anche dopo aver chiuso questa finestra",

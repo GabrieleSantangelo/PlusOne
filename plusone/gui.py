@@ -8,7 +8,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from . import i18n, once  # noqa: E402
-from .app import set_shell_extension, shell_extension_state  # noqa: E402
+from .app import IN_FLATPAK, set_shell_extension, shell_extension_state  # noqa: E402
 from .engine import State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .rtsp import MODES  # noqa: E402
@@ -73,6 +73,8 @@ class Window(Adw.ApplicationWindow):
 
         self.options_group = Adw.PreferencesGroup()
         self.touch_row = Adw.SwitchRow(active=self.settings.touch)
+        # Files and Open With are outside a Flatpak's reach.
+        self.sign_row = Adw.SwitchRow(active=self.settings.sign_on_tablet, visible=not IN_FLATPAK)
         self.background_row = Adw.SwitchRow(active=self.settings.background)
         # Shown once the shell says the extension is installed (never in a Flatpak).
         self.extension_row = Adw.SwitchRow(visible=False)
@@ -84,8 +86,8 @@ class Window(Adw.ApplicationWindow):
         language = self.settings.language if self.settings.language in i18n.LANGUAGES else "auto"
         self.language_row.set_selected(i18n.LANGUAGES.index(language))
         self._language_handler = self.language_row.connect("notify::selected", self._on_language)
-        for row in (self.touch_row, self.background_row, self.extension_row, self.adb_row,
-                    self.language_row):
+        for row in (self.touch_row, self.sign_row, self.background_row, self.extension_row,
+                    self.adb_row, self.language_row):
             self.options_group.add(row)
         page.add(self.options_group)
         # Settings are read when a connection starts: lock them while one is up.
@@ -109,6 +111,8 @@ class Window(Adw.ApplicationWindow):
             row.connect(signal, self._apply_settings)
         self.background_row.connect("notify::active",
                                     lambda row, _p: app.set_background(row.get_active()))
+        self.sign_row.connect("notify::active",
+                              lambda row, _p: app.set_sign_on_tablet(row.get_active()))
         self._extension_handler = self.extension_row.connect(
             "notify::active", lambda row, _p: set_shell_extension(row.get_active()))
         shell_extension_state(self._show_extension_state)
@@ -125,6 +129,7 @@ class Window(Adw.ApplicationWindow):
         self.bitrate_row.set_subtitle(_("Mbit/s: higher is sharper but uses more bandwidth"))
         self.options_group.set_title(_("Options"))
         self.touch_row.set_title(_("Touch and S Pen"))
+        self.sign_row.set_title(_("Sign on Tablet"))
         self.background_row.set_title(_("Ready in the background"))
         self.background_row.set_subtitle(_("Starts at login and stays ready after you close this window"))
         self.extension_row.set_title(_("Quick Settings toggle"))
@@ -194,6 +199,18 @@ class Window(Adw.ApplicationWindow):
             row.set_sensitive(not in_session)
         if self.background_row.get_active() != self.settings.background:
             self.background_row.set_active(self.settings.background)
+        self.sign_row.set_subtitle(self._sign_subtitle())
+
+    def _sign_subtitle(self):
+        text = _("In Files, for PDFs, while a tablet is on the network")
+        nearby = self.app.nearby
+        if not self.settings.sign_on_tablet or not nearby.known:
+            return text
+        names = nearby.names()
+        if names:
+            return text + "\n" + _("On the network now: {name}").format(name=", ".join(names))
+        return text + "\n" + (_("A tablet is on the network now") if nearby.tablets
+                               else _("No tablet on the network now"))
 
     def _append_log(self, line):
         buf = self.log_view.get_buffer()

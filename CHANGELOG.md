@@ -35,7 +35,22 @@ Sign on the tablet.
   metadata are kept; rotated pages are handled.
 - Falls back to signing on the PC when the tablet does not connect, and to a
   save dialog when the folder is not writable (Flatpak).
-- D-Bus method `SignDocument(path)`.
+- *Sign on Tablet* in Files shows only while a tablet is on the network
+  (it says so through Quick Share or KDE Connect) or connected, and a switch
+  in the window's options turns it off everywhere (Files, *Open With*, the
+  app grid). The window shows which tablet it sees.
+- D-Bus method `SignDocument(path)` and property `SignAvailable`.
+- Connecting after a change of Wi-Fi network no longer takes minutes:
+  - a docker or VPN interface going away no longer passes for the Wi-Fi
+    device going away (which left Plus One waiting for it until it gave up);
+  - Plus One keeps looking for the tablet for as long as it waits for it
+    (NetworkManager stopped looking after 30 s, so a tablet opened later was
+    not seen);
+  - when the tablet drops out of sight between two attempts, Plus One looks
+    for it again instead of failing on the old one until it gives up;
+  - when the Intel Wi-Fi firmware crashes while joining the tablet, Plus One
+    asks to close and reopen Second Screen (the tablet otherwise ignores new
+    attempts for a minute or more) and waits the full time again.
 - New dependencies: `gir1.2-poppler-0.18`, `python3-pypdf` (`.deb`); the
   Flatpak builds poppler 25.12 and pypdf.
 
