@@ -5,6 +5,7 @@ fingers never draw, so a palm resting on the screen leaves no marks. Two
 fingers zoom and move the page. A mouse also draws, for signing on the PC.
 """
 import datetime
+import faulthandler
 import math
 import os
 import threading
@@ -39,7 +40,8 @@ TOOLBAR_SPACE = 84  # pixels kept clear under the page for the floating toolbar
 # The S Pen reports at a steady rate, but they reach us in bursts over
 # Wi-Fi: a stroke's clock counts reports rather than reading arrival times.
 REPORT_INTERVAL = 1 / 285
-MIN_STEP = 0.25  # widget pixels a modelled point must move to be kept
+MIN_STEP = 1.0  # widget pixels a modelled point must move to be kept
+STALL = 3  # seconds without answering: GNOME is about to call the window frozen
 
 CSS = """
 .sign-canvas { background-color: mix(@window_bg_color, @window_fg_color, 0.08); }
@@ -110,10 +112,12 @@ class PageArea(Gtk.DrawingArea):
         self._model = None    # the stroke's modeler, in widget pixels
         self._clock = 0.0     # time of the stroke's last sample, seconds
         self._skipped = None  # last modelled point, if too close to keep (yet)
+        self._by_mouse = False  # the stroke being drawn is the mouse's
         self._eraser = None   # page point under the eraser, while erasing
         self._erased = False  # this eraser stroke removed something already
         self._logged_tool = False
         self._logged_mismatch = False
+        self._logged_drag = False
         self.raw = RawPen(pen_feed.listen())
         self._raw_map = None    # tablet (0..1) to widget pixels, while drawing from it
         self._raw_tick = None
@@ -142,7 +146,7 @@ class PageArea(Gtk.DrawingArea):
         zoom = Gtk.GestureZoom()
         zoom.connect("begin", self._zoom_begin)
         zoom.connect("scale-changed", self._zoom_changed)
-        zoom.connect("end", lambda *a: self.queue_draw())
+        zoom.connect("end", lambda *a: self._sharpen())
         self.add_controller(zoom)
 
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
@@ -176,6 +180,11 @@ class PageArea(Gtk.DrawingArea):
         self.view.zoom_at(zoom * scale, x, y, anchor)
         self.queue_draw()
 
+    def _sharpen(self):
+        """After a pinch, the page and its marks at exactly the new zoom."""
+        self._cache = None
+        self.queue_draw()
+
     def _scroll(self, controller, dx, dy):
         state = controller.get_current_event_state()
         if state & Gdk.ModifierType.CONTROL_MASK:
@@ -203,6 +212,7 @@ class PageArea(Gtk.DrawingArea):
     # a prediction covers the modeler's lag and some of the stream's.
     def _begin(self, x, y, pressure, t=0.0):
         px, py = self.view.to_page(x, y)
+        self._by_mouse = False
         if self.window.place_at(px, py):
             return
         self._stroke = Stroke([], width=self.window.pen_width, color=self.window.pen_color)
@@ -374,9 +384,18 @@ class PageArea(Gtk.DrawingArea):
         self._finish()
 
     def _mouse_begin(self, gesture, x, y):
+        # The stylus gesture handles the pen, which GTK also reports as a
+        # drag, from a device that says it is a mouse ("Wayland Tablet
+        # Pointer"): only the event's tool gives it away. Its late positions
+        # mixed into a pen stroke drew needles and bumps. Fingers never draw.
+        event = gesture.get_current_event()
         device = gesture.get_device()
-        if device is not None and device.get_source() in PEN_SOURCES:
-            # The stylus gesture handles the pen; fingers never draw.
+        pen = event is not None and event.get_device_tool() is not None
+        if pen or (self._stroke is not None and not self._by_mouse) or (
+                device is not None and device.get_source() in PEN_SOURCES):
+            if pen and not self._logged_drag:
+                self._logged_drag = True
+                log("pen: also reported as a pointer drag, ignored")
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         self._mouse_origin = (x, y)
@@ -385,33 +404,51 @@ class PageArea(Gtk.DrawingArea):
             self._erase_to(x, y)
         else:
             self._begin(x, y, NO_PRESSURE, time.monotonic())
+            self._by_mouse = self._stroke is not None
 
+    # A mouse stroke runs on the clock, a pen stroke counts reports: the two
+    # never feed the same stroke.
     def _mouse_update(self, gesture, dx, dy):
         x, y = self._mouse_origin
         if self._eraser is not None:
             self._erase_to(x + dx, y + dy)
-        else:
+        elif self._by_mouse:
             self._extend(x + dx, y + dy, NO_PRESSURE, time.monotonic())
 
     def _mouse_end(self, gesture, dx, dy):
         self._eraser = None
-        self._finish()
+        if self._by_mouse:
+            self._by_mouse = False
+            self._finish()
         self.queue_draw()
 
     # -- drawing ---------------------------------------------------------------
     def _page_surface(self, scale):
-        """The page rendered at `scale` device pixels per point (cached)."""
+        """The page with its finished marks, rendered at `scale` device
+        pixels per point. Cached: new marks are drawn onto it as they come,
+        so a frame does not redraw every stroke on the page (thousands of
+        segments); erasing, undo, another page or zoom render it again."""
         index = self.window.index
-        if self._cache and self._cache[0] == index and abs(self._cache[1] / scale - 1) < 0.15:
-            return self._cache[1], self._cache[2]
-        w, h = self.page_size()
-        surface = cairo.ImageSurface(cairo.FORMAT_RGB24, max(1, int(w * scale)), max(1, int(h * scale)))
-        cr = cairo.Context(surface)
-        cr.set_source_rgb(1, 1, 1)
-        cr.paint()
-        cr.scale(scale, scale)
-        self.window.page().render(cr)
-        self._cache = (index, scale, surface)
+        marks = self.window.marks.get(index, [])
+        cached = self._cache
+        if (cached and cached[0] == index and abs(cached[1] / scale - 1) < 0.15
+                and len(cached[3]) <= len(marks) and all(a is b for a, b in zip(cached[3], marks))):
+            _index, scale, surface, drawn = cached
+        else:
+            w, h = self.page_size()
+            surface = cairo.ImageSurface(cairo.FORMAT_RGB24, max(1, int(w * scale)), max(1, int(h * scale)))
+            cr = cairo.Context(surface)
+            cr.set_source_rgb(1, 1, 1)
+            cr.paint()
+            cr.scale(scale, scale)
+            self.window.page().render(cr)
+            drawn = ()
+        if len(drawn) < len(marks):
+            cr = cairo.Context(surface)
+            cr.scale(scale, scale)
+            draw_marks(cr, marks[len(drawn):])
+            drawn = tuple(marks)
+        self._cache = (index, scale, surface, drawn)
         return scale, surface
 
     def _draw(self, area, cr, width, height):
@@ -443,12 +480,10 @@ class PageArea(Gtk.DrawingArea):
         cr.scale(v.zoom, v.zoom)
         cr.rectangle(0, 0, w, h)
         cr.clip()
-        marks = list(self.window.marks.get(self.window.index, []))
         if self._stroke is not None:
             # Drawn up to where the pen is predicted to be by now.
             tail = [(*v.to_page(x, y), p) for x, y, p in self._model.predict()]
-            marks.append(Stroke(self._stroke.points + tail, self._stroke.width, self._stroke.color))
-        draw_marks(cr, marks)
+            draw_marks(cr, [Stroke(self._stroke.points + tail, self._stroke.width, self._stroke.color)])
         if self._eraser is not None:
             cr.arc(*self._eraser, ERASER_RADIUS / v.zoom, 0, 2 * math.pi)
             cr.set_source_rgba(1, 1, 1, 0.6)
@@ -516,6 +551,9 @@ class SignWindow(Adw.ApplicationWindow):
                                            Gtk.CallbackAction.new(lambda *a: self._escape() or True)))
         self.add_controller(keys)
         self.connect("close-request", self._on_close)
+        # Should the window ever freeze, the journal gets where it is stuck.
+        self._watching = True
+        GLib.timeout_add(500, self._alive)
         self.show_page(0)
 
     # -- toolbar ---------------------------------------------------------------
@@ -877,7 +915,15 @@ class SignWindow(Adw.ApplicationWindow):
         self.marks.clear()
         self.close()
 
+    def _alive(self):
+        """Re-arms the stack dump, which fires only if this stops running."""
+        if self._watching:
+            faulthandler.dump_traceback_later(STALL)
+        return self._watching
+
     def _on_close(self, _window):
+        self._watching = False
+        faulthandler.cancel_dump_traceback_later()
         pen_feed.unlisten(self.area.raw.reader)
         drawn, desktop = self.area.raw_counts
         if drawn:

@@ -18,10 +18,9 @@ Sign on the tablet.
   themes), tools sit in a floating bar under it with an eraser button, *My
   signature* shows your signature, a faint preview follows the pen while
   placing it, and messages are toasts.
-- Stray pen samples are dropped: now and then Second Screen sends, mid-stroke,
-  a sample from a few reports ahead, which drew a 4-15 pt needle out of the
-  line, or (more often) a small bump where the line swelled, its pressure
-  being off too (in any app using the pen).
+- No more needles and bumps in pen strokes: GTK also reports the pen as a
+  mouse drag (from a device that calls itself a mouse), and those late
+  positions, with a fixed pressure, were mixed into the stroke.
 - Ink like Notewise's: strokes go through a stroke model (the one Google's
   ink-stroke-modeler describes, which Notewise uses): the pen's jitter is
   smoothed, curves come out round and the stroke still ends exactly where

@@ -10,7 +10,6 @@ import struct
 import threading
 
 from . import log
-from .pen import Despike
 from .pen import feed as pen_feed
 
 TOUCH_DOWN, TOUCH_UP, TOUCH_MOVE = 0, 1, 2
@@ -28,7 +27,6 @@ class UibcServer:
         self.pen = None
         self.reports = 0
         self.pen_states = set()  # pen state bytes logged so far
-        self.despike = Despike()
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -136,16 +134,12 @@ class UibcServer:
             if len(data) > 1 and data[1] not in self.pen_states:
                 self.pen_states.add(data[1])
                 log(f"UIBC: pen state {data[1]:#04x} in {data.hex()}")
-            for report in self.despike.feed(data):
-                pen_feed.publish(report)
-                self.pen.report(report)
+            pen_feed.publish(data)
+            self.pen.report(data)
         else:
             log("UIBC: pen report before any descriptor, dropped")
 
     def _close_pen(self):
-        if self.despike.dropped:
-            log(f"pen: dropped {self.despike.dropped} stray samples")
-        self.despike = Despike()
         if self.pen:
             self.pen.close()
             self.pen = None

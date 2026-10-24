@@ -19,7 +19,7 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib  # noqa: E402
+from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 
 from test_pdf import make_pdf  # noqa: E402
 
@@ -152,6 +152,16 @@ def tablet(bits, x, y):
     feed.publish(struct.pack("<BBHHHbb", 0x14, bits, round(x * 32.767), round(y * 32.767), 1500, 0, 0))
 
 
+def to_line(point, points):
+    """Distance from point to the polyline through points."""
+    best = math.inf
+    for (ax, ay, _p), (bx, by, _q) in zip(points, points[1:]):
+        dx, dy = bx - ax, by - ay
+        t = max(0.0, min(1.0, ((point[0] - ax) * dx + (point[1] - ay) * dy) / ((dx * dx + dy * dy) or 1)))
+        best = min(best, math.dist(point, (ax + t * dx, ay + t * dy)))
+    return best
+
+
 def test_strokes_use_every_tablet_sample(window, monkeypatch):
     win, _results, _src = window
     area = win.area
@@ -165,12 +175,13 @@ def test_strokes_use_every_tablet_sample(window, monkeypatch):
     area._pen_motion(Stylus(), 239, 309.75)    # GTK passed on only the last of the burst
     area._pen_up(Stylus(), 240, 310)
     stroke = win.marks[0][-1]
-    # Smoothed, but from the touch to where the tip lifted, near every sample.
+    # Smoothed, but from the touch to where the tip lifted.
     assert stroke.points[0][:2] == pytest.approx(area.view.to_page(200, 300), abs=0.05)
     assert stroke.points[-1][:2] == pytest.approx(area.view.to_page(239, 309.75), abs=0.05)
     assert stroke.points[0][2] == pytest.approx(1500 / 4096)
     samples = [area.view.to_page(200 + i, 300 + (i / 4 if i >= 10 else 0)) for i in range(40)]
-    assert all(min(math.dist(s, p[:2]) for p in stroke.points) * area.view.zoom < 1.5 for s in samples)
+    # Within 2 px of every sample (the 2.5 px step at the tenth is rounded off).
+    assert all(to_line(s, stroke.points) * area.view.zoom < 2.0 for s in samples)
     assert area.raw_counts == [40, 1] and area._raw_tick is None
 
 
@@ -198,3 +209,44 @@ def test_pen_colour_and_width(window):
     win.place_at(100, 700)
     assert win.marks[0][-1].color == (0.8, 0.1, 0.1)
     assert load_pen(sign.PEN) == ((0.8, 0.1, 0.1), 4.0, 0)   # remembered for next time
+
+
+class Drag:
+    """What the mouse handlers ask of GTK's drag gesture; tool set for the pen."""
+    def __init__(self, tool=None):
+        self.tool, self.state = tool, None
+
+    def get_current_event(self):
+        return self
+
+    def get_device_tool(self):
+        return self.tool
+
+    def get_device(self):
+        return None  # GTK's tablet device says it is a mouse anyway
+
+    def set_state(self, state):
+        self.state = state
+
+
+def test_the_pen_as_a_pointer_drag_never_draws(window):
+    win, _results, _src = window
+    area = win.area
+    area._pen_down(Stylus(), 200, 300)
+    pen_drag = Drag(tool=object())
+    area._mouse_begin(pen_drag, 200, 300)       # GTK reports the pen as a drag too
+    assert pen_drag.state == Gtk.EventSequenceState.DENIED
+    area._pen_motion(Stylus(), 205, 300)
+    area._pen_up(Stylus(), 210, 300)
+    assert len(win.marks[0]) == 1
+    # A mouse draws, and a pen stroke in progress keeps it out.
+    mouse = Drag()
+    area._mouse_begin(mouse, 100, 100)
+    area._mouse_update(mouse, 40, 0)
+    area._mouse_end(mouse, 40, 0)
+    assert mouse.state is None and len(win.marks[0]) == 2
+    area._pen_down(Stylus(), 300, 300)
+    late = Drag()
+    area._mouse_begin(late, 300, 300)
+    assert late.state == Gtk.EventSequenceState.DENIED
+    area._pen_up(Stylus(), 310, 300)

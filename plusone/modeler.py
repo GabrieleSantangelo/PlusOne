@@ -23,8 +23,9 @@ them), times in seconds.
 import math
 from dataclasses import dataclass
 
-LEVELS = 10    # smoothing 0 (least) to 10
-STILL = 0.012  # seconds without moving: the pen has stopped
+LEVELS = 10     # smoothing 0 (least) to 10
+STILL = 0.012   # seconds without moving: the pen has stopped
+MAX_GAP = 0.05  # seconds at most modelled between two samples
 
 
 @dataclass
@@ -146,6 +147,9 @@ class StrokeModeler:
         """Step the tip towards the moving anchor, at least min_rate steps
         a second; the anchor moves in a straight line between samples."""
         ax, ay, at = self.anchor
+        # After a long gap only its end is stepped: the tip had long caught
+        # up, and stepping it all could take seconds.
+        at = max(at, t - MAX_GAP)
         steps = max(1, math.ceil((t - at) * self.params.min_rate))
         dt = (t - at) / steps
         out = []

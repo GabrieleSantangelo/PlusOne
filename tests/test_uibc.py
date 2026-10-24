@@ -78,12 +78,9 @@ def test_pen_descriptor_then_reports(server):
     srv, sink, _, pens = server
     sink.sendall(packet(1, hidc(1, PEN_DESCRIPTOR)))
     sink.sendall(packet(1, hidc(0, PEN_REPORT)))
-    lifted = bytes([0x14, 0x10]) + PEN_REPORT[2:]
-    sink.sendall(packet(1, hidc(0, lifted)))
-    assert wait_for(lambda: pens and len(pens[0].calls) == 2)
+    assert wait_for(lambda: pens and pens[0].calls)
     assert pens[0].descriptor == PEN_DESCRIPTOR
-    # A report with the tip down waits for the next one (stray sample check).
-    assert pens[0].calls == [("report", PEN_REPORT), ("report", lifted)]
+    assert pens[0].calls == [("report", PEN_REPORT)]
 
 
 def test_pen_report_without_descriptor_is_dropped(server):

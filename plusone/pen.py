@@ -12,7 +12,6 @@ The reports are also published, all of them, to readers in this process
 (`feed`): the signing window draws with those.
 """
 import collections
-import math
 import os
 import struct
 import threading
@@ -41,58 +40,6 @@ def parse_report(data):
         return None
     bits, x, y, pressure = struct.unpack("<BHHH", data[1:8])
     return bits, x / AXIS_MAX, y / AXIS_MAX, min(1.0, pressure / PRESSURE_MAX)
-
-
-class Despike:
-    """Drops the stray samples Second Screen sends.
-
-    Now and then, in the middle of a stroke, the tablet sends a sample from a
-    few reports ahead and then carries on in order (that position comes again
-    later): drawn as is, a 4-15 pt needle sticks out of the line. Holding each
-    report back by one (3.5 ms) shows it, as the pen jumping away and
-    straight back, and that report is dropped.
-
-    Most such samples hop less than that, but their pressure jumps too, away
-    and back (by 0.06-0.15 where the pen's own changes stay under 0.02 a
-    report): drawn, the line swells for a moment, every few millimetres."""
-
-    JUMP = 0.0015          # of the screen width: about 3 pixels
-    PRESSURE_JUMP = 0.04   # of full pressure
-
-    def __init__(self):
-        self.held = None    # (report, parsed) waiting for the next report
-        self.last = None    # (x, y, pressure) of the last report passed on, tip down
-        self.dropped = 0
-
-    def feed(self, data):
-        """Reports to pass on, in order."""
-        sample = parse_report(data)
-        drawing = sample is not None and bool(sample[0] & TIP)
-        out = []
-        if self.held:
-            report, (bits, *here) = self.held
-            self.held = None
-            if drawing and bits == sample[0] and self.last and self._stray(self.last, here, sample[1:]):
-                self.dropped += 1
-            else:
-                out.append(report)
-                self.last = here
-        if drawing:
-            self.held = (data, sample)
-        else:  # hovering or lifted: nothing to hold back
-            self.last = None
-            out.append(data)
-        return out
-
-    @classmethod
-    def _stray(cls, before, here, after):
-        """Whether `here` (x, y, pressure) leaves the stroke and comes back."""
-        a, b = math.dist(before[:2], here[:2]), math.dist(here[:2], after[:2])
-        if a > cls.JUMP and b > cls.JUMP and math.dist(before[:2], after[:2]) < 0.3 * min(a, b):
-            return True
-        up, down = here[2] - before[2], here[2] - after[2]
-        jump = min(abs(up), abs(down))
-        return up * down > 0 and jump > cls.PRESSURE_JUMP and abs(before[2] - after[2]) < 0.5 * jump
 
 
 class Feed:

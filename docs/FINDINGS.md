@@ -110,6 +110,10 @@ the tablet and read with REA (JADX, objdump); static analysis only.
   (every other one) move time but not the velocity estimate. The prediction
   was retuned on a real signature: a straight line along the filtered
   velocity, 30 ms ahead at most, 0.12 px RMS off the line drawn next.
-- The same data showed that most of Second Screen's stray samples hop less
-  than 3 px but carry a pressure 0.06-0.15 off (the pen's own changes stay
-  under 0.02 a report): `pen.Despike` drops those too.
+- The "stray samples" in signatures (a point a few reports ahead, needles
+  and bumps) were not Second Screen's: all 232 had the same pressure, the
+  signing window's default for a mouse. GTK 4 on Wayland also hands a
+  tablet pen to drag gestures, from its "Wayland Tablet Pointer" device
+  whose source is *mouse*, so checking the device's source let it through;
+  the event's device tool is what tells a pen. The pen reports themselves
+  had none (0 in 5225 through the filter that briefly ran on UIBC).
