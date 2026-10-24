@@ -3,6 +3,7 @@
 Needs a display: CI runs it on GTK's Broadway backend (tools/ci.sh sets
 PLUSONE_GUI_TESTS=1); on a desktop it is skipped so no window pops up.
 """
+import math
 import os
 import struct
 import time
@@ -164,9 +165,12 @@ def test_strokes_use_every_tablet_sample(window, monkeypatch):
     area._pen_motion(Stylus(), 239, 309.75)    # GTK passed on only the last of the burst
     area._pen_up(Stylus(), 240, 310)
     stroke = win.marks[0][-1]
-    assert len(stroke.points) == 40
+    # Smoothed, but from the touch to where the tip lifted, near every sample.
     assert stroke.points[0][:2] == pytest.approx(area.view.to_page(200, 300), abs=0.05)
+    assert stroke.points[-1][:2] == pytest.approx(area.view.to_page(239, 309.75), abs=0.05)
     assert stroke.points[0][2] == pytest.approx(1500 / 4096)
+    samples = [area.view.to_page(200 + i, 300 + (i / 4 if i >= 10 else 0)) for i in range(40)]
+    assert all(min(math.dist(s, p[:2]) for p in stroke.points) * area.view.zoom < 1.5 for s in samples)
     assert area.raw_counts == [40, 1] and area._raw_tick is None
 
 
@@ -185,7 +189,7 @@ def test_tablet_samples_that_do_not_line_up_are_ignored(window, monkeypatch):
 
 def test_pen_colour_and_width(window):
     win, _results, _src = window
-    win._set_pen(color=(0.8, 0.1, 0.1), width=4.0)
+    win._set_pen(color=(0.8, 0.1, 0.1), width=4.0, smoothing=0)
     win.area._begin(100, 100, 0.5)
     win.area._extend(150, 120, 0.5)
     win.area._finish()
@@ -193,4 +197,4 @@ def test_pen_colour_and_width(window):
     win._place_date()
     win.place_at(100, 700)
     assert win.marks[0][-1].color == (0.8, 0.1, 0.1)
-    assert load_pen(sign.PEN) == ((0.8, 0.1, 0.1), 4.0)      # remembered for next time
+    assert load_pen(sign.PEN) == ((0.8, 0.1, 0.1), 4.0, 0)   # remembered for next time

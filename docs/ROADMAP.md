@@ -179,6 +179,10 @@ video, nothing else to start.
   a zero-app camera for people who can plug the tablet in.
 - Whether the companion app can start the display too (fewer apps involved
   when it is installed).
+- Ink drawn on the tablet itself while signing, so it sits under the nib
+  instead of a video frame behind (Notewise and Samsung Notes draw in the
+  front buffer). It needs the pen's events next to Second Screen's window;
+  plain overlay windows do not get them.
 
 ## Not planned
 

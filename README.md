@@ -155,7 +155,8 @@ Tablet*, or launch *Sign on Tablet* from the app grid and pick a file).
    left untouched) and a notification offers *Open* and *Show in folder*. If
    the connection was opened for signing, the tablet disconnects again.
 
-The pen button in the toolbar sets the colour and the thickness; Plus One
+The pen button in the toolbar sets the colour, the thickness and the
+stabilization (how much the ink smooths the pen's movement); Plus One
 remembers them. Also in the window: **Keep as my signature** (draw it
 once), then **My signature** places it with one tap; **Date** and **Text**
 add a date or a few words where you tap; **Undo**, **Clear page**, page

@@ -164,16 +164,18 @@ def test_raw_pen_forgets_old_samples():
 
 
 def test_pen_settings(tmp_path):
-    from plusone.ink import MAX_WIDTH, load_pen, save_pen
+    from plusone.ink import MAX_WIDTH, SMOOTHING, load_pen, save_pen
     from plusone.pdf import INK, PEN_WIDTH
     path = str(tmp_path / "plus-one" / "pen.json")
-    assert load_pen(path) == (INK, PEN_WIDTH)
-    save_pen(path, (0.8, 0.1, 0.1), 4.5)
-    assert load_pen(path) == ((0.8, 0.1, 0.1), 4.5)
-    save_pen(path, (0.8, 0.1, 0.1), 99)
-    assert load_pen(path)[1] == MAX_WIDTH
+    assert load_pen(path) == (INK, PEN_WIDTH, SMOOTHING)
+    save_pen(path, (0.8, 0.1, 0.1), 4.5, 6)
+    assert load_pen(path) == ((0.8, 0.1, 0.1), 4.5, 6)
+    save_pen(path, (0.8, 0.1, 0.1), 99, 40)
+    assert load_pen(path)[1:] == (MAX_WIDTH, 10)
+    (tmp_path / "old.json").write_text('{"color": [0, 0, 0], "width": 2}')  # before stabilization
+    assert load_pen(str(tmp_path / "old.json")) == ((0, 0, 0), 2, SMOOTHING)
     (tmp_path / "bad.json").write_text('{"color": [2, 0, 0], "width": 1}')
-    assert load_pen(str(tmp_path / "bad.json")) == (INK, PEN_WIDTH)
+    assert load_pen(str(tmp_path / "bad.json")) == (INK, PEN_WIDTH, SMOOTHING)
 
 
 def test_placed_signature_uses_the_pen(tmp_path):

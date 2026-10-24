@@ -5,10 +5,12 @@ import json
 import math
 import os
 
+from .modeler import LEVELS
 from .pdf import INK, PEN_WIDTH, Stroke, Text
 
 SIGNATURE_WIDTH = 140.0  # points (about 5 cm) when a saved signature is placed
 MIN_WIDTH, MAX_WIDTH = 0.8, 6.0  # pen widths offered, points
+SMOOTHING = 2  # of modeler.LEVELS: the ink trails the pen by ~15 ms
 TIP = 0x01  # tip switch bit of a pen report
 
 
@@ -98,24 +100,25 @@ class RawPen:
 
 
 def load_pen(path):
-    """(colour, width) last chosen for the pen."""
+    """(colour, width, smoothing) last chosen for the pen."""
     try:
         with open(path) as f:
             data = json.load(f)
         color = tuple(float(c) for c in data["color"])
         width = float(data["width"])
+        smoothing = round(float(data.get("smoothing", SMOOTHING)))
         if len(color) == 3 and all(0 <= c <= 1 for c in color):
-            return color, max(MIN_WIDTH, min(MAX_WIDTH, width))
-    except (OSError, ValueError, TypeError, KeyError):
+            return color, max(MIN_WIDTH, min(MAX_WIDTH, width)), max(0, min(LEVELS, smoothing))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
-    return INK, PEN_WIDTH
+    return INK, PEN_WIDTH, SMOOTHING
 
 
-def save_pen(path, color, width):
+def save_pen(path, color, width, smoothing):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".part"
     with open(tmp, "w") as f:
-        json.dump({"color": list(color), "width": width}, f)
+        json.dump({"color": list(color), "width": width, "smoothing": smoothing}, f)
     os.replace(tmp, path)
 
 

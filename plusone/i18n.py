@@ -54,6 +54,7 @@ _IT = {
     "Next page": "Pagina successiva",
     "Write with the pen · hold its button to erase": "Scrivi con la penna · tieni premuto il tasto per cancellare",
     "Thickness": "Spessore",
+    "Stabilization": "Stabilizzazione",
     "Blue ink": "Inchiostro blu",
     "Black": "Nero",
     "Blue": "Blu",

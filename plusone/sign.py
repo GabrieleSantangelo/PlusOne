@@ -8,6 +8,7 @@ import datetime
 import math
 import os
 import threading
+import time
 
 import cairo
 import gi
@@ -22,6 +23,7 @@ from . import log, once  # noqa: E402
 from .i18n import _  # noqa: E402
 from .ink import (MAX_WIDTH, MIN_WIDTH, RawPen, View, load_pen, load_signature,  # noqa: E402
                   place, save_pen, save_signature, touches)
+from .modeler import LEVELS, Params, StrokeModeler  # noqa: E402
 from .pdf import INK, Stroke, Text, draw_marks, output_path, save_signed  # noqa: E402
 from .pen import feed as pen_feed  # noqa: E402
 
@@ -34,6 +36,10 @@ ERASER_RADIUS = 12  # widget pixels around the pen tip
 ERASE_BUTTONS = Gdk.ModifierType.BUTTON2_MASK | Gdk.ModifierType.BUTTON3_MASK
 RAW_TOLERANCE = 24  # widget pixels between where the tablet and GTK put the tip
 TOOLBAR_SPACE = 84  # pixels kept clear under the page for the floating toolbar
+# The S Pen reports at a steady rate, but they reach us in bursts over
+# Wi-Fi: a stroke's clock counts reports rather than reading arrival times.
+REPORT_INTERVAL = 1 / 285
+MIN_STEP = 0.25  # widget pixels a modelled point must move to be kept
 
 CSS = """
 .sign-canvas { background-color: mix(@window_bg_color, @window_fg_color, 0.08); }
@@ -101,6 +107,9 @@ class PageArea(Gtk.DrawingArea):
         self.fitted = False
         self._cache = None  # (page index, zoom, surface)
         self._stroke = None
+        self._model = None    # the stroke's modeler, in widget pixels
+        self._clock = 0.0     # time of the stroke's last sample, seconds
+        self._skipped = None  # last modelled point, if too close to keep (yet)
         self._eraser = None   # page point under the eraser, while erasing
         self._erased = False  # this eraser stroke removed something already
         self._logged_tool = False
@@ -189,23 +198,36 @@ class PageArea(Gtk.DrawingArea):
         ok, value = gesture.get_axis(Gdk.AxisUse.PRESSURE)
         return value if ok and value > 0 else NO_PRESSURE
 
-    def _begin(self, x, y, pressure):
+    # Samples go through a stroke modeler (see modeler.py), as in Notewise:
+    # the ink is smoothed by the pen's stabilization level, and while drawing
+    # a prediction covers the modeler's lag and some of the stream's.
+    def _begin(self, x, y, pressure, t=0.0):
         px, py = self.view.to_page(x, y)
         if self.window.place_at(px, py):
             return
-        self._stroke = Stroke([(px, py, pressure)], width=self.window.pen_width, color=self.window.pen_color)
-        self.queue_draw()
+        self._stroke = Stroke([], width=self.window.pen_width, color=self.window.pen_color)
+        self._model = StrokeModeler(Params.smoothing(self.window.pen_smoothing))
+        self._clock = t
+        self._add(self._model.down(x, y, pressure, t))
 
-    def _extend(self, x, y, pressure):
+    def _extend(self, x, y, pressure, t=None):
+        """One more sample, by default one pen report after the last."""
         if self._stroke is None:
             return
-        px, py = self.view.to_page(x, y)
-        last = self._stroke.points[-1]
-        if (px, py) == last[:2]:
-            # Same position, new pressure: about half the pen's reports.
-            self._stroke.points[-1] = (px, py, max(pressure, last[2]))
-        else:
-            self._stroke.points.append((px, py, pressure))
+        self._clock = self._clock + REPORT_INTERVAL if t is None else t
+        self._add(self._model.move(x, y, pressure, self._clock))
+
+    def _add(self, modelled):
+        """Modelled widget points into the stroke, in page points; those
+        that barely moved are left out."""
+        points = self._stroke.points
+        for x, y, pressure in modelled:
+            point = (*self.view.to_page(x, y), pressure)
+            if points and math.dist(point[:2], points[-1][:2]) * self.view.zoom < MIN_STEP:
+                self._skipped = point
+            else:
+                points.append(point)
+                self._skipped = None
         self.queue_draw()
 
     def _backlog(self, gesture):
@@ -224,8 +246,12 @@ class PageArea(Gtk.DrawingArea):
 
     def _finish(self):
         if self._stroke is not None:
+            # The ink catches up with the pen, and ends where it lifted.
+            self._add(self._model.up(*self._model.raw[-1]))
+            if self._skipped:
+                self._stroke.points.append(self._skipped)
             self.window.add_mark(self._stroke)
-            self._stroke = None
+            self._stroke = self._model = self._skipped = None
 
     def _is_eraser(self, gesture):
         """Side button held, or the eraser end of a pen that has one."""
@@ -358,14 +384,14 @@ class PageArea(Gtk.DrawingArea):
             self._erased = False
             self._erase_to(x, y)
         else:
-            self._begin(x, y, NO_PRESSURE)
+            self._begin(x, y, NO_PRESSURE, time.monotonic())
 
     def _mouse_update(self, gesture, dx, dy):
         x, y = self._mouse_origin
         if self._eraser is not None:
             self._erase_to(x + dx, y + dy)
         else:
-            self._extend(x + dx, y + dy, NO_PRESSURE)
+            self._extend(x + dx, y + dy, NO_PRESSURE, time.monotonic())
 
     def _mouse_end(self, gesture, dx, dy):
         self._eraser = None
@@ -419,7 +445,9 @@ class PageArea(Gtk.DrawingArea):
         cr.clip()
         marks = list(self.window.marks.get(self.window.index, []))
         if self._stroke is not None:
-            marks.append(self._stroke)
+            # Drawn up to where the pen is predicted to be by now.
+            tail = [(*v.to_page(x, y), p) for x, y, p in self._model.predict()]
+            marks.append(Stroke(self._stroke.points + tail, self._stroke.width, self._stroke.color))
         draw_marks(cr, marks)
         if self._eraser is not None:
             cr.arc(*self._eraser, ERASER_RADIUS / v.zoom, 0, 2 * math.pi)
@@ -456,7 +484,7 @@ class SignWindow(Adw.ApplicationWindow):
         self.pending = None   # marks waiting for a tap to be placed
         self.result = None
         self.signature = load_signature(SIGNATURE)
-        self.pen_color, self.pen_width = load_pen(PEN)
+        self.pen_color, self.pen_width, self.pen_smoothing = load_pen(PEN)
 
         header = Adw.HeaderBar(show_end_title_buttons=False)
         cancel = Gtk.Button(label=_("Cancel"))
@@ -583,6 +611,11 @@ class SignWindow(Adw.ApplicationWindow):
         scale.set_value(self.pen_width)
         scale.connect("value-changed", lambda s: self._set_pen(width=s.get_value()))
         box.append(scale)
+        box.append(Gtk.Label(label=_("Stabilization"), xalign=0, css_classes=["caption-heading", "dim-label"]))
+        steady = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, LEVELS, 1)
+        steady.set_value(self.pen_smoothing)
+        steady.connect("value-changed", lambda s: self._set_pen(smoothing=round(s.get_value())))
+        box.append(steady)
         self.pen_preview = Gtk.DrawingArea(content_width=240, content_height=56)
         self.pen_preview.set_draw_func(self._draw_preview)
         frame = Gtk.Frame(child=self.pen_preview, css_classes=["view"])
@@ -650,10 +683,11 @@ class SignWindow(Adw.ApplicationWindow):
         draw_marks(cr, [Stroke([(ox + x * scale, oy + y * scale, p) for x, y, p in s], width=2.2,
                                color=self.pen_color) for s in strokes])
 
-    def _set_pen(self, color=None, width=None):
+    def _set_pen(self, color=None, width=None, smoothing=None):
         self.pen_color = color or self.pen_color
         self.pen_width = width or self.pen_width
-        save_pen(PEN, self.pen_color, self.pen_width)
+        self.pen_smoothing = self.pen_smoothing if smoothing is None else smoothing
+        save_pen(PEN, self.pen_color, self.pen_width, self.pen_smoothing)
         self.pen_swatch.queue_draw()
         self.pen_preview.queue_draw()
         self.signature_thumb.queue_draw()

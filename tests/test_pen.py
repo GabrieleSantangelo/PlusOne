@@ -99,3 +99,19 @@ def test_despike_keeps_fast_strokes_corners_and_hover():
     assert run(d, reports) == reports and d.dropped == 0
     # Hover reports are never held back.
     assert d.feed(pen_report(0x10, 10, 10, 0)) == [pen_report(0x10, 10, 10, 0)]
+
+
+def test_despike_drops_a_pressure_spike_and_keeps_pressure_changes():
+    from plusone.pen import Despike
+    d = Despike()
+    # Slow writing, 3 units a report, pressing a little harder each time; the
+    # sixth report hops 6 units ahead and back with 400 more pressure.
+    good = [pen_report(0x11, 1000 + 3 * i, 5000, 1500 + 20 * i) for i in range(10)]
+    spike = pen_report(0x11, 1021, 5000, 2000)
+    lift = [pen_report(0x10, 1027, 5000, 0)]
+    assert run(d, good[:5] + [spike] + good[5:] + lift) == good + lift
+    assert d.dropped == 1
+    # Pressing down at the start of a stroke is no spike, however fast.
+    d = Despike()
+    press = [pen_report(0x11, 2000, 5000, p) for p in (0, 300, 900, 1600, 2000, 2100, 2050)] + lift
+    assert run(d, press) == press and d.dropped == 0

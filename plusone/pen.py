@@ -50,13 +50,18 @@ class Despike:
     few reports ahead and then carries on in order (that position comes again
     later): drawn as is, a 4-15 pt needle sticks out of the line. Holding each
     report back by one (3.5 ms) shows it, as the pen jumping away and
-    straight back, and that report is dropped."""
+    straight back, and that report is dropped.
 
-    JUMP = 0.0015  # of the screen width: about 3 pixels
+    Most such samples hop less than that, but their pressure jumps too, away
+    and back (by 0.06-0.15 where the pen's own changes stay under 0.02 a
+    report): drawn, the line swells for a moment, every few millimetres."""
+
+    JUMP = 0.0015          # of the screen width: about 3 pixels
+    PRESSURE_JUMP = 0.04   # of full pressure
 
     def __init__(self):
         self.held = None    # (report, parsed) waiting for the next report
-        self.last = None    # position of the last report passed on, tip down
+        self.last = None    # (x, y, pressure) of the last report passed on, tip down
         self.dropped = 0
 
     def feed(self, data):
@@ -65,14 +70,13 @@ class Despike:
         drawing = sample is not None and bool(sample[0] & TIP)
         out = []
         if self.held:
-            report, (bits, x, y, _pressure) = self.held
+            report, (bits, *here) = self.held
             self.held = None
-            if (drawing and bits == sample[0] and self.last
-                    and self._stray(self.last, (x, y), sample[1:3])):
+            if drawing and bits == sample[0] and self.last and self._stray(self.last, here, sample[1:]):
                 self.dropped += 1
             else:
                 out.append(report)
-                self.last = (x, y)
+                self.last = here
         if drawing:
             self.held = (data, sample)
         else:  # hovering or lifted: nothing to hold back
@@ -82,8 +86,13 @@ class Despike:
 
     @classmethod
     def _stray(cls, before, here, after):
-        a, b = math.dist(before, here), math.dist(here, after)
-        return a > cls.JUMP and b > cls.JUMP and math.dist(before, after) < 0.3 * min(a, b)
+        """Whether `here` (x, y, pressure) leaves the stroke and comes back."""
+        a, b = math.dist(before[:2], here[:2]), math.dist(here[:2], after[:2])
+        if a > cls.JUMP and b > cls.JUMP and math.dist(before[:2], after[:2]) < 0.3 * min(a, b):
+            return True
+        up, down = here[2] - before[2], here[2] - after[2]
+        jump = min(abs(up), abs(down))
+        return up * down > 0 and jump > cls.PRESSURE_JUMP and abs(before[2] - after[2]) < 0.5 * jump
 
 
 class Feed:

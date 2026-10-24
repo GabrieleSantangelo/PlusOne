@@ -20,7 +20,14 @@ Sign on the tablet.
   placing it, and messages are toasts.
 - Stray pen samples are dropped: now and then Second Screen sends, mid-stroke,
   a sample from a few reports ahead, which drew a 4-15 pt needle out of the
-  line (in any app using the pen).
+  line, or (more often) a small bump where the line swelled, its pressure
+  being off too (in any app using the pen).
+- Ink like Notewise's: strokes go through a stroke model (the one Google's
+  ink-stroke-modeler describes, which Notewise uses): the pen's jitter is
+  smoothed, curves come out round and the stroke still ends exactly where
+  the pen lifted. A *Stabilization* setting (0-10, as in Notewise) sets how
+  much; while drawing, the line runs ahead to where the pen is predicted to
+  be, which hides part of the delay.
 - While the signing window fills the tablet it draws from the pen reports
   as they arrive (about 285 a second), not from desktop events.
 - Saved signature (draw once, place with one tap), date and text fields, undo,
