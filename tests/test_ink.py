@@ -192,3 +192,11 @@ def test_fit_leaves_room_for_the_toolbar():
     top = view.to_widget(0, 0)[1]
     bottom = view.to_widget(595, 842)[1]
     assert top == pytest.approx(16) and bottom == pytest.approx(1100 - 80 - 16)
+
+
+def test_thickness_slider_favours_thin_pens():
+    from plusone.ink import MAX_WIDTH, MIN_WIDTH, pen_width, thickness
+    assert pen_width(0) == MIN_WIDTH and pen_width(1) == MAX_WIDTH
+    assert pen_width(thickness(1.3)) == pytest.approx(1.3)
+    assert pen_width(0.5) < 2                  # half the slider is still a fine pen
+    assert thickness(0.1) == 0 and thickness(99) == 1

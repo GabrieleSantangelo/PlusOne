@@ -6,6 +6,7 @@ fingers zoom and move the page. A mouse also draws, for signing on the PC.
 """
 import datetime
 import faulthandler
+import itertools
 import math
 import os
 import threading
@@ -22,10 +23,10 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Poppler  # noqa: E
 
 from . import log, once  # noqa: E402
 from .i18n import _  # noqa: E402
-from .ink import (MAX_WIDTH, MIN_WIDTH, RawPen, View, load_pen, load_signature,  # noqa: E402
-                  place, save_pen, save_signature, touches)
+from .ink import (RawPen, View, load_pen, load_signature, pen_width, place,  # noqa: E402
+                  save_pen, save_signature, thickness, touches)
 from .modeler import LEVELS, Params, StrokeModeler  # noqa: E402
-from .pdf import INK, Stroke, Text, draw_marks, output_path, save_signed  # noqa: E402
+from .pdf import INK, Stroke, Text, curve, draw_marks, draw_segments, output_path, save_signed  # noqa: E402
 from .pen import feed as pen_feed  # noqa: E402
 
 SIGNATURE = os.path.join(GLib.get_user_data_dir(), "plus-one", "signature.json")
@@ -97,6 +98,46 @@ def open_document(path):
     return Poppler.Document.new_from_file(Gio.File.new_for_path(path).get_uri(), None)
 
 
+class Lag:
+    """How long pen samples wait before the window draws them, and how
+    often it draws while a stroke is on: logged for slow strokes and for
+    the whole window, to tell the window's delay from the stream's."""
+
+    SLOW = 0.030  # seconds a sample may wait on average
+
+    def __init__(self):
+        self.waits, self.gaps = [], []      # this stroke
+        self.all_waits, self.all_gaps = [], []
+        self.last_frame = None
+
+    def waited(self, seconds):
+        self.waits.append(seconds)
+
+    def frame(self):
+        now = time.monotonic()
+        if self.last_frame is not None:
+            self.gaps.append(now - self.last_frame)
+        self.last_frame = now
+
+    def stroke_done(self):
+        if self.waits and sum(self.waits) / len(self.waits) > self.SLOW:
+            log("pen: slow stroke: " + self._describe(self.waits, self.gaps))
+        self.all_waits += self.waits
+        self.all_gaps += self.gaps
+        self.waits, self.gaps, self.last_frame = [], [], None
+
+    def summary(self):
+        return self._describe(self.all_waits, self.all_gaps)
+
+    @staticmethod
+    def _describe(waits, gaps):
+        def ms(values):
+            if not values:
+                return "-"
+            return f"{1000 * sum(values) / len(values):.0f} ms (max {1000 * max(values):.0f})"
+        return f"samples waited {ms(waits)}, frames every {ms(gaps)}"
+
+
 class PageArea(Gtk.DrawingArea):
     """One page with its marks; turns pen/mouse input into page coordinates."""
 
@@ -113,6 +154,9 @@ class PageArea(Gtk.DrawingArea):
         self._clock = 0.0     # time of the stroke's last sample, seconds
         self._skipped = None  # last modelled point, if too close to keep (yet)
         self._by_mouse = False  # the stroke being drawn is the mouse's
+        self._inked = 0           # its segments already drawn onto the cached page
+        self._ink_surface = None  # which cached page they are on
+        self.stats = Lag()        # how far behind the pen the window runs
         self._eraser = None   # page point under the eraser, while erasing
         self._erased = False  # this eraser stroke removed something already
         self._logged_tool = False
@@ -260,8 +304,44 @@ class PageArea(Gtk.DrawingArea):
             self._add(self._model.up(*self._model.raw[-1]))
             if self._skipped:
                 self._stroke.points.append(self._skipped)
-            self.window.add_mark(self._stroke)
-            self._stroke = self._model = self._skipped = None
+            stroke, cached = self._stroke, self._cache
+            inked = self._inked and cached is not None and cached[2] is self._ink_surface
+            if inked:
+                cr = cairo.Context(self._ink_surface)
+                cr.scale(cached[1], cached[1])
+                draw_segments(cr, stroke, self._segments(stroke.points))
+            self.window.add_mark(stroke)
+            if inked:
+                # On the cached page already: drawn again it would come out bolder.
+                marks = self.window.marks.get(self.window.index, [])
+                if len(marks) == len(cached[3]) + 1 and marks[-1] is stroke and all(
+                        a is b for a, b in zip(cached[3], marks)):
+                    self._cache = (*cached[:3], tuple(marks))
+                else:
+                    self._cache = None
+            self.stats.stroke_done()
+            self._stroke = self._model = self._skipped = self._ink_surface = None
+            self._inked = 0
+
+    def _segments(self, points, upto=None):
+        """curve() segments of points from the first not inked yet, up to
+        (not including) upto."""
+        start = max(0, self._inked - 1)  # the previous point shapes the first one
+        skip = self._inked - start
+        return itertools.islice(curve(points[start:]), skip, None if upto is None else upto - start)
+
+    def _ink(self, surface, scale):
+        """Draw the stroke's settled segments (all four points that shape
+        each are in) onto the cached page: a frame then only draws the last
+        few, however long the stroke."""
+        if self._ink_surface is not surface:
+            self._ink_surface, self._inked = surface, 0
+        settled = len(self._stroke.points) - 2
+        if settled > self._inked:
+            cr = cairo.Context(surface)
+            cr.scale(scale, scale)
+            draw_segments(cr, self._stroke, self._segments(self._stroke.points, settled))
+            self._inked = settled
 
     def _is_eraser(self, gesture):
         """Side button held, or the eraser end of a pen that has one."""
@@ -322,9 +402,12 @@ class PageArea(Gtk.DrawingArea):
         return samples
 
     def _raw_more(self, *_args):
-        for sample in self.raw.more():
+        samples = self.raw.more()
+        for sample in samples:
             self._extend(*self._from_tablet(sample))
             self.raw_counts[0] += 1
+        if samples:
+            self.stats.waited(time.monotonic() - self.raw.latest)
         return GLib.SOURCE_CONTINUE
 
     def _raw_stop(self):
@@ -472,6 +555,9 @@ class PageArea(Gtk.DrawingArea):
         cr.save()
         cr.translate(v.ox, v.oy)
         scale, surface = self._page_surface(v.zoom * self.get_scale_factor())
+        if self._stroke is not None:
+            self._ink(surface, scale)
+            self.stats.frame()
         cr.save()
         cr.scale(v.zoom / scale, v.zoom / scale)
         cr.set_source_surface(surface, 0, 0)
@@ -481,9 +567,12 @@ class PageArea(Gtk.DrawingArea):
         cr.rectangle(0, 0, w, h)
         cr.clip()
         if self._stroke is not None:
-            # Drawn up to where the pen is predicted to be by now.
+            # The rest of the stroke, up to where the pen is predicted to be by now.
             tail = [(*v.to_page(x, y), p) for x, y, p in self._model.predict()]
-            draw_marks(cr, [Stroke(self._stroke.points + tail, self._stroke.width, self._stroke.color)])
+            if self._inked:
+                draw_segments(cr, self._stroke, self._segments(self._stroke.points + tail))
+            else:
+                draw_marks(cr, [Stroke(self._stroke.points + tail, self._stroke.width, self._stroke.color)])
         if self._eraser is not None:
             cr.arc(*self._eraser, ERASER_RADIUS / v.zoom, 0, 2 * math.pi)
             cr.set_source_rgba(1, 1, 1, 0.6)
@@ -626,7 +715,7 @@ class SignWindow(Adw.ApplicationWindow):
         """Shows the pen's colour and width; its popover changes them."""
         self.pen_swatch = Gtk.DrawingArea(content_width=24, content_height=24)
         self.pen_swatch.set_draw_func(lambda a, cr, w, h: self._dot(
-            cr, w, h, self.pen_color, 6 + 14 * (self.pen_width - MIN_WIDTH) / (MAX_WIDTH - MIN_WIDTH)))
+            cr, w, h, self.pen_color, 6 + 14 * thickness(self.pen_width)))
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
                       margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
         colors = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER)
@@ -645,9 +734,9 @@ class SignWindow(Adw.ApplicationWindow):
             colors.append(button)
         box.append(colors)
         box.append(Gtk.Label(label=_("Thickness"), xalign=0, css_classes=["caption-heading", "dim-label"]))
-        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, MIN_WIDTH, MAX_WIDTH, 0.1)
-        scale.set_value(self.pen_width)
-        scale.connect("value-changed", lambda s: self._set_pen(width=s.get_value()))
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.01)
+        scale.set_value(thickness(self.pen_width))
+        scale.connect("value-changed", lambda s: self._set_pen(width=pen_width(s.get_value())))
         box.append(scale)
         box.append(Gtk.Label(label=_("Stabilization"), xalign=0, css_classes=["caption-heading", "dim-label"]))
         steady = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, LEVELS, 1)
@@ -927,7 +1016,8 @@ class SignWindow(Adw.ApplicationWindow):
         pen_feed.unlisten(self.area.raw.reader)
         drawn, desktop = self.area.raw_counts
         if drawn:
-            log(f"pen: drew {drawn} tablet samples; the desktop passed on {desktop} meanwhile")
+            log(f"pen: drew {drawn} tablet samples; the desktop passed on {desktop} meanwhile; "
+                + self.area.stats.summary())
         callback, self.on_done = self.on_done, None
         if callback:
             callback(self.result)

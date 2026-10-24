@@ -8,6 +8,7 @@ import os
 import struct
 import time
 
+import cairo
 import pytest
 
 if not os.environ.get("PLUSONE_GUI_TESTS"):
@@ -250,3 +251,26 @@ def test_the_pen_as_a_pointer_drag_never_draws(window):
     area._mouse_begin(late, 300, 300)
     assert late.state == Gtk.EventSequenceState.DENIED
     area._pen_up(Stylus(), 310, 300)
+
+
+def test_a_long_stroke_is_inked_once(window):
+    # Settled segments go onto the cached page as the stroke grows; the
+    # finished page must match one drawn from scratch (drawn twice, the
+    # line would come out bolder).
+    win, _results, _src = window
+    area = win.area
+    frame = cairo.ImageSurface(cairo.FORMAT_ARGB32, area.get_width(), area.get_height())
+    area._begin(200, 300, 0.4)
+    for i in range(1, 240):
+        area._extend(200 + i, 300 + 40 * math.sin(i / 15), 0.3 + 0.2 * math.sin(i / 30))
+        if i % 25 == 0:
+            area._draw(area, cairo.Context(frame), frame.get_width(), frame.get_height())
+    assert area._inked > 150
+    area._finish()
+    index, scale, cached, drawn = area._cache
+    assert drawn == tuple(win.marks[0])
+    area._cache = None
+    _scale, fresh = area._page_surface(scale)
+    cached.flush()
+    fresh.flush()
+    assert bytes(cached.get_data()) == bytes(fresh.get_data())

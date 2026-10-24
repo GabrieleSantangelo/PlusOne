@@ -12,8 +12,8 @@ Sign on the tablet.
   connected for this.
 - Hold the S Pen's side button to erase whole strokes; undo restores them,
   and also a cleared page.
-- Pen colour (five inks) and thickness, remembered; pressure shows in the
-  line.
+- Pen colour (five inks) and thickness, down to a fine 0.3 pt (most of the
+  slider is for thin pens), remembered; pressure shows in the line.
 - A cleaner signing window: the page floats on a soft shadow (light and dark
   themes), tools sit in a floating bar under it with an eraser button, *My
   signature* shows your signature, a faint preview follows the pen while

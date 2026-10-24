@@ -9,7 +9,7 @@ from .modeler import LEVELS
 from .pdf import INK, PEN_WIDTH, Stroke, Text
 
 SIGNATURE_WIDTH = 140.0  # points (about 5 cm) when a saved signature is placed
-MIN_WIDTH, MAX_WIDTH = 0.8, 6.0  # pen widths offered, points
+MIN_WIDTH, MAX_WIDTH = 0.3, 6.0  # pen widths offered, points
 SMOOTHING = 2  # of modeler.LEVELS: the ink trails the pen by ~15 ms
 TIP = 0x01  # tip switch bit of a pen report
 
@@ -60,11 +60,14 @@ class RawPen:
         self.reader = reader
         self.recent = collections.deque()
         self.drawing = False
+        self.latest = None
 
     def _pull(self):
         new = []
         while self.reader:
             new.append(self.reader.popleft())
+        if new:
+            self.latest = new[-1][0]  # when the newest arrived
         self.recent.extend(new)
         while self.recent and self.recent[0][0] < self.recent[-1][0] - self.HISTORY:
             self.recent.popleft()
@@ -97,6 +100,17 @@ class RawPen:
             else:
                 self.drawing = False
         return out
+
+
+def thickness(width):
+    """Position 0..1 on the thickness slider for a pen width. Squared: the
+    thin end, where signatures are written, gets most of the slider."""
+    return math.sqrt(max(0.0, min(1.0, (width - MIN_WIDTH) / (MAX_WIDTH - MIN_WIDTH))))
+
+
+def pen_width(position):
+    """Pen width for a position 0..1 on the thickness slider."""
+    return MIN_WIDTH + (MAX_WIDTH - MIN_WIDTH) * position ** 2
 
 
 def load_pen(path):
@@ -139,7 +153,7 @@ def place(signature, x, y, width=SIGNATURE_WIDTH, pen=PEN_WIDTH, color=INK):
     # Pen width scales with the signature so a small one does not look bold.
     scaled = pen * width / signature.get("width", width)
     return [Stroke([(x + sx * width, y - height / 2 + sy * width, p) for sx, sy, p in s],
-                   width=max(0.6, min(scaled, pen * 1.5)), color=color)
+                   width=max(MIN_WIDTH, min(scaled, pen * 1.5)), color=color)
             for s in signature["strokes"]]
 
 

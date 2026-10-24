@@ -1,4 +1,5 @@
 """The streaming pipeline produces MPEG-TS in RTP (payload type 33)."""
+import collections
 import socket
 import time
 
@@ -59,7 +60,7 @@ def test_keyframe_requests_are_rate_limited(monkeypatch):
             return Enc()
 
     streamer = media.Streamer.__new__(media.Streamer)
-    streamer.pipeline, streamer._last_keyframe = Pipeline(), 0.0
+    streamer.pipeline, streamer._last_keyframe, streamer._sent = Pipeline(), 0.0, collections.deque()
     clock = iter([100.0, 100.3, 100.9, 101.2])
     monkeypatch.setattr(media.time, "monotonic", lambda: next(clock))
     for _ in range(4):

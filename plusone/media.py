@@ -3,6 +3,7 @@
 Video-only MPEG-TS: without an audio track the sink renders frames as they
 arrive instead of syncing them to an audio clock (measured ~90 ms -> ~50 ms).
 """
+import collections
 import time
 
 from gi.repository import Gst
@@ -71,6 +72,11 @@ class Streamer:
             f"udpsink host={host} port={port} bind-port={bind_port} sync=false async=false")
         self._cap_keyframes(self.pipeline.get_by_name("enc"), bitrate, fps)
         self._last_keyframe = 0.0
+        # Encoded frames of the last seconds, (time, bytes, keyframe): when
+        # the tablet loses data, the log says what was being sent.
+        self._sent = collections.deque()
+        self.pipeline.get_by_name("enc").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._count)
         self.pipeline.get_bus().add_signal_watch()
         self.pipeline.get_bus().connect("message::error", self._on_error)
         log(f"pipeline: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {host}:{port}")
@@ -95,10 +101,26 @@ class Streamer:
             if enc.find_property(prop):
                 enc.set_property(prop, value)
 
+    def _count(self, _pad, info):
+        buf = info.get_buffer()
+        now = time.monotonic()
+        self._sent.append((now, buf.get_size(), not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)))
+        while self._sent[0][0] < now - 2:
+            self._sent.popleft()
+        return Gst.PadProbeReturn.OK
+
+    def sent(self):
+        """What the encoder put out over the last 2 seconds."""
+        frames = list(self._sent)
+        size = sum(f[1] for f in frames)
+        return (f"{size * 8 / 2000:.0f} kbit/s, {len(frames) / 2:.0f} frames/s, "
+                f"{sum(f[2] for f in frames)} keyframes, largest frame {max((f[1] for f in frames), default=0) // 1024} KB")
+
     def force_keyframe(self):
         # After a loss the sink keeps asking; one keyframe per second is
         # enough, more only add bursts that cause more loss.
         now = time.monotonic()
+        log(f"stream before the loss: {self.sent()}")
         if now - self._last_keyframe < MIN_KEYFRAME_GAP:
             return
         self._last_keyframe = now
