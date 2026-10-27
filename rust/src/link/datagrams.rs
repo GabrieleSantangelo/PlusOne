@@ -82,6 +82,10 @@ impl Datagrams {
         self.sock.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
+    pub fn app(&self) -> Option<SocketAddr> {
+        *self.app.lock().unwrap()
+    }
+
     pub fn set_app(&self, app: SocketAddr) {
         *self.app.lock().unwrap() = Some(app);
     }

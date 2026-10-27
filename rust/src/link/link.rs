@@ -14,7 +14,7 @@ use crate::msg;
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion};
 use serde_json::Value;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -311,11 +311,4 @@ pub fn connect(targets: &[Target], expect: Option<&str>, paired: &Paired, any_ve
         }
     }
     Err(error)
-}
-
-/// Where a target's (host, port) is, for the socket API.
-pub fn socket_addr(target: &Target) -> Option<SocketAddr> {
-    match target {
-        Target::Tcp(host, port) => (host.as_str(), *port).to_socket_addrs().ok()?.next(),
-    }
 }

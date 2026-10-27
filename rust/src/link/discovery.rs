@@ -11,7 +11,6 @@
 
 use super::link::Target;
 use crate::log;
-use gio::prelude::*;
 use glib::variant::ToVariant;
 use glib::Variant;
 use std::cell::RefCell;
