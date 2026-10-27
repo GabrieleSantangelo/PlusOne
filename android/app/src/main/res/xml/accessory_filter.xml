@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The PC's plus-one-link asks a tablet plugged in to be this accessory
+     (link/daemon/src/usb.rs): Android then opens UsbActivity. -->
+<resources>
+    <usb-accessory manufacturer="Plus One" model="Plus One" />
+</resources>

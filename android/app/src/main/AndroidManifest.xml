@@ -24,6 +24,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
     <!-- Lets a PDF sent by the PC open by itself; granted by the user in Settings. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
@@ -89,6 +90,22 @@
             android:taskAffinity="io.github.gabrielesantangelo.plusone.capture"
             android:excludeFromRecents="true"
             android:noHistory="true" />
+
+        <!-- The PC by cable (link's core, docs/LINK.md): nothing shown, the
+             accessory handed to the service. -->
+        <activity
+            android:name=".UsbActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+                android:resource="@xml/accessory_filter" />
+        </activity>
 
         <service
             android:name=".CompanionService"

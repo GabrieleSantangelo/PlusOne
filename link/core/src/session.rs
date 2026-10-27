@@ -21,7 +21,8 @@ use crate::{log, Class};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use crate::stream::Stream;
+use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -121,6 +122,8 @@ pub struct Session {
     /// The other side's certificate's fingerprint, and what its hello said.
     pub peer: String,
     pub name: String,
+    /// What it runs on: "lan", "usb", "bluetooth".
+    pub path: String,
     features: Mutex<Value>,
     node: Weak<NodeInner>,
     started: Instant,
@@ -130,9 +133,9 @@ pub struct Session {
     next_id: AtomicU16,
     outbox: Mutex<Vec<u8>>,
     wake: Wake,
-    tcp: TcpStream,
-    udp: UdpSocket,
-    udp_peer: Mutex<SocketAddr>,
+    stream: Box<dyn Stream>,
+    udp: Option<UdpSocket>,
+    udp_peer: Mutex<Option<SocketAddr>>,
     sealer: Sealer,
     proven_us: AtomicU64,
     rtt_us: AtomicU64,
@@ -142,26 +145,25 @@ pub struct Session {
 /// What the TLS handshake and the hellos left: the session starts from it.
 pub(crate) struct Established {
     conn: rustls::Connection,
-    tcp: TcpStream,
+    stream: Box<dyn Stream>,
     decoder: Decoder,
     peer: String,
     hello: Value,
-    udp: UdpSocket,
-    udp_peer: SocketAddr,
+    udp: Option<UdpSocket>,
+    udp_peer: Option<SocketAddr>,
     sealer: Sealer,
     opener: Opener,
     dialer: bool,
+    path: String,
 }
 
 /// The TLS handshake, the keys and the hellos, on a new connection. The
-/// verifier has checked the other side is paired.
-pub(crate) fn establish(mut conn: rustls::Connection, mut tcp: TcpStream, dialer: bool, hello: Value)
-                        -> io::Result<Established> {
-    tcp.set_nodelay(true)?;
-    tcp.set_read_timeout(Some(HANDSHAKE))?;
-    tcp.set_write_timeout(Some(HANDSHAKE))?;
+/// verifier has checked the other side is paired. path: what it runs on.
+pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream>, dialer: bool, hello: Value,
+                        path: &str) -> io::Result<Established> {
+    stream.set_timeouts(Some(HANDSHAKE))?;
     while conn.is_handshaking() {
-        conn.complete_io(&mut tcp)?;
+        conn.complete_io(&mut stream)?;
     }
     let peer = conn.peer_certificates().and_then(|c| c.first()).map(|c| crate::fingerprint(c))
         .ok_or_else(|| invalid("no certificate"))?;
@@ -172,22 +174,30 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut tcp: TcpStream, dialer
     let sealer = Sealer::new(keys[ours..ours + 32].try_into().unwrap(), send_direction);
     let opener = Opener::new(keys[theirs..theirs + 32].try_into().unwrap(), receive_direction);
 
-    let local = tcp.local_addr()?;
-    let udp = UdpSocket::bind(SocketAddr::new(local.ip(), 0))?;
-    // As much as the system allows (net.core.wmem_max, rmem_max).
-    sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, UDP_BUFFER);
-    sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, UDP_BUFFER);
+    // Datagrams as UDP when there is IP under the stream.
+    let udp = match stream.addresses() {
+        Some((_, local)) => {
+            let udp = UdpSocket::bind(SocketAddr::new(local, 0))?;
+            // As much as the system allows (net.core.wmem_max, rmem_max).
+            sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, UDP_BUFFER);
+            sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, UDP_BUFFER);
+            Some(udp)
+        }
+        None => None,
+    };
     let mut hello = hello;
-    hello["udp"] = json!(udp.local_addr()?.port());
+    if let Some(udp) = &udp {
+        hello["udp"] = json!(udp.local_addr()?.port());
+    }
     let mut bytes = Vec::new();
     frame::encode(frame::SESSION, 0, hello.to_string().as_bytes(), &mut bytes);
     conn.writer().write_all(&bytes)?;
     while conn.wants_write() {
-        conn.write_tls(&mut tcp)?;
+        conn.write_tls(&mut stream)?;
     }
     let mut decoder = Decoder::default();
     let theirs = loop {
-        if let Some((kind, _, body)) = read_frame(&mut conn, &mut tcp, &mut decoder)? {
+        if let Some((kind, _, body)) = read_frame(&mut conn, &mut stream, &mut decoder)? {
             if kind != frame::SESSION {
                 return Err(invalid("a frame before the hello"));
             }
@@ -198,13 +208,18 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut tcp: TcpStream, dialer
             break message;
         }
     };
-    let port = theirs["udp"].as_u64().filter(|p| (1..=65535).contains(p)).ok_or_else(|| invalid("no UDP port"))?;
-    let udp_peer = SocketAddr::new(tcp.peer_addr()?.ip(), port as u16);
-    Ok(Established { conn, tcp, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer })
+    let port = theirs["udp"].as_u64().filter(|p| (1..=65535).contains(p));
+    let udp_peer = match (stream.addresses(), port) {
+        (Some((peer, _)), Some(port)) if udp.is_some() => Some(SocketAddr::new(peer, port as u16)),
+        _ => None,
+    };
+    let udp = if udp_peer.is_some() { udp } else { None };
+    Ok(Established { conn, stream, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer,
+                     path: path.to_owned() })
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
-fn read_frame(conn: &mut rustls::Connection, tcp: &mut TcpStream, decoder: &mut Decoder)
+fn read_frame(conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>, decoder: &mut Decoder)
               -> io::Result<Option<(u8, u16, Vec<u8>)>> {
     if let Some(frame) = decoder.next()? {
         return Ok(Some(frame));
@@ -219,7 +234,7 @@ fn read_frame(conn: &mut rustls::Connection, tcp: &mut TcpStream, decoder: &mut 
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(e),
     }
-    if conn.read_tls(tcp)? == 0 {
+    if conn.read_tls(stream)? == 0 {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     conn.process_new_packets().map_err(|e| invalid(e.to_string()))?;
@@ -228,14 +243,16 @@ fn read_frame(conn: &mut rustls::Connection, tcp: &mut TcpStream, decoder: &mut 
 
 impl Session {
     pub(crate) fn start(node: &Arc<NodeInner>, established: Established) -> io::Result<Arc<Session>> {
-        let Established { conn, tcp, decoder, peer, hello, udp, udp_peer, sealer, opener, dialer } = established;
-        tcp.set_read_timeout(None)?;
-        tcp.set_write_timeout(None)?;
-        tcp.set_nonblocking(true)?;
-        udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let Established { conn, stream, decoder, peer, hello, udp, udp_peer, sealer, opener, dialer, path } = established;
+        stream.set_timeouts(None)?;
+        stream.set_nonblocking(true)?;
+        if let Some(udp) = &udp {
+            udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+        }
         let session = Arc::new(Session {
             peer,
             name: hello["name"].as_str().unwrap_or("").to_owned(),
+            path,
             features: Mutex::new(hello["features"].clone()),
             node: Arc::downgrade(node),
             started: Instant::now(),
@@ -246,7 +263,7 @@ impl Session {
             next_id: AtomicU16::new(if dialer { 1 } else { 2 }),
             outbox: Mutex::default(),
             wake: Wake::new()?,
-            tcp: tcp.try_clone()?,
+            stream: stream.try_clone()?,
             udp,
             udp_peer: Mutex::new(udp_peer),
             sealer,
@@ -256,11 +273,13 @@ impl Session {
         });
         let me = session.clone();
         std::thread::Builder::new().name("link-stream".into()).spawn(move || {
-            let reason = me.run_stream(conn, tcp, decoder).err().unwrap_or_else(|| "closed".into());
+            let reason = me.run_stream(conn, stream, decoder).err().unwrap_or_else(|| "closed".into());
             me.end(&reason);
         })?;
-        let me = session.clone();
-        std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(opener))?;
+        if session.udp.is_some() {
+            let me = session.clone();
+            std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(opener))?;
+        }
         Ok(session)
     }
 
@@ -291,9 +310,11 @@ impl Session {
     /// the Wi-Fi driver's: each packet counts until it is transmitted) and
     /// the stream's backlog: how far behind the network is.
     pub fn queued(&self) -> usize {
-        let mut udp: libc::c_int = 0;
-        unsafe { libc::ioctl(self.udp.as_raw_fd(), libc::TIOCOUTQ, &mut udp) };
-        udp.max(0) as usize + self.outbox.lock().unwrap().len()
+        let mut queued: libc::c_int = 0;
+        if let Some(udp) = &self.udp {
+            unsafe { libc::ioctl(udp.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+        }
+        queued.max(0) as usize + self.outbox.lock().unwrap().len()
     }
 
     /// The channels open now.
@@ -322,7 +343,7 @@ impl Session {
             return;
         }
         log!("{}: the session is over ({reason})", self.label());
-        let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+        self.stream.shutdown();
         self.wake.wake();
         for (_, waiting) in self.pending.lock().unwrap().drain() {
             let _ = waiting.send(Err("the session is over".into()));
@@ -477,7 +498,7 @@ impl Session {
         self.wake.wake();
     }
 
-    fn run_stream(self: &Arc<Self>, mut conn: rustls::Connection, mut tcp: TcpStream, mut decoder: Decoder)
+    fn run_stream(self: &Arc<Self>, mut conn: rustls::Connection, mut stream: Box<dyn Stream>, mut decoder: Decoder)
                   -> Result<(), String> {
         conn.set_buffer_limit(None);
         let mut plain = vec![0u8; 64 << 10];
@@ -502,7 +523,7 @@ impl Session {
             }
             let mut blocked = false;
             while conn.wants_write() {
-                match conn.write_tls(&mut tcp) {
+                match conn.write_tls(&mut stream) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         blocked = true;
@@ -520,16 +541,16 @@ impl Session {
                 self.send_message(json!({"t": "ping"}));
                 continue;
             }
-            if now >= next_udp_ping {
+            if self.udp.is_some() && now >= next_udp_ping {
                 let early = self.started.elapsed() < UDP_PROOF;
                 next_udp_ping = now + if self.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
                 let mut ping = vec![PING];
                 ping.extend_from_slice(&self.us().to_be_bytes());
                 self.send_datagram_now(PATH, &ping, &mut Vec::new());
             }
-            let wait = next_ping.min(next_udp_ping).saturating_duration_since(now);
+            let wait = if self.udp.is_some() { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
             let mut fds = [
-                libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 }, revents: 0 },
+                libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 }, revents: 0 },
                 libc::pollfd { fd: self.wake.fd(), events: libc::POLLIN, revents: 0 },
             ];
             sys::poll(&mut fds, Some(wait)).map_err(|e| e.to_string())?;
@@ -540,7 +561,7 @@ impl Session {
                 continue;
             }
             loop {
-                match conn.read_tls(&mut tcp) {
+                match conn.read_tls(&mut stream) {
                     Ok(0) => return Err("the other side closed".into()),
                     Ok(_) => {
                         conn.process_new_packets().map_err(|e| e.to_string())?;
@@ -613,9 +634,9 @@ impl Session {
     }
 
     fn send_datagram_now(&self, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
+        let (Some(udp), Some(to)) = (&self.udp, *self.udp_peer.lock().unwrap()) else { return };
         self.sealer.seal(channel, body, sealed);
-        let to = *self.udp_peer.lock().unwrap();
-        if let Err(e) = sys::send_to(self.udp.as_raw_fd(), sealed, &to) {
+        if let Err(e) = sys::send_to(udp.as_raw_fd(), sealed, &to) {
             if e.kind() == io::ErrorKind::WouldBlock {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -623,10 +644,11 @@ impl Session {
     }
 
     fn run_datagrams(self: Arc<Self>, mut opener: Opener) {
+        let Some(udp) = &self.udp else { return };
         let mut buf = vec![0u8; 2048];
         let mut sealed = Vec::with_capacity(64);
         while !self.is_closed() {
-            let (length, from) = match self.udp.recv_from(&mut buf) {
+            let (length, from) = match udp.recv_from(&mut buf) {
                 Ok(got) => got,
                 Err(_) => continue,  // the timeout: look at closed again
             };
@@ -635,8 +657,8 @@ impl Session {
             // address may change; only a sealed packet can say so).
             {
                 let mut peer = self.udp_peer.lock().unwrap();
-                if *peer != from {
-                    *peer = from;
+                if *peer != Some(from) {
+                    *peer = Some(from);
                 }
             }
             if channel != PATH {

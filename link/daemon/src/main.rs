@@ -18,6 +18,9 @@
 //!                                (mDNS): id (its start), name, address
 //!   {"op": "queued", "device"}   bytes on their way to it, not yet sent
 //!   {"op": "close", "device"}    its session over (its channels with it)
+//!   {"op": "usb"[, "use": false]}  any Android tablet plugged in asked to be
+//!                                Plus One's accessory (usb.rs), from now on;
+//!                                one reached by cable before always is
 //!   {"op": "open", "device", "feature", "channel", "class"}
 //!                                a channel, its descriptor with the answer
 //!                                (the session made first if there is none)
@@ -36,6 +39,7 @@
 //! nothing wakes the tablet's Wi-Fi while nothing is in use.
 
 mod api;
+mod usb;
 
 use plusone_link::{log, Class, Event, Identity, Node};
 use serde_json::{json, Value};
@@ -57,6 +61,10 @@ struct Daemon {
     /// Where each tablet was last reached: {id: "IP:PORT"}.
     state: PathBuf,
     finding: Mutex<()>,
+    usb: usb::Watcher,
+    /// The USB serial of the device last asked to be an accessory: its
+    /// session, when it comes, remembers it.
+    switched: Mutex<Option<String>>,
     watchers: Mutex<Vec<Arc<OwnedFd>>>,
     /// Who serves each feature now (a serial: the last one to ask).
     serving: Mutex<std::collections::HashMap<String, u64>>,
@@ -86,6 +94,7 @@ impl Daemon {
                 "connected": session.is_some(),
                 "features": session.map(|s| s.features()).unwrap_or(json!({})),
                 "rtt_ms": session.and_then(|s| s.rtt()).map(|r| r.as_secs_f64() * 1000.0),
+                "path": session.map(|s| s.path.as_str()),
                 "dropped": session.map(|s| s.dropped()).unwrap_or(0),
             }));
         }
@@ -118,13 +127,7 @@ impl Daemon {
             return;
         }
         state.insert(device.to_owned(), json!(address.to_string()));
-        if let Some(parent) = self.state.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let part = self.state.with_extension("part");
-        if std::fs::write(&part, Value::Object(state).to_string()).is_ok() {
-            let _ = std::fs::rename(&part, &self.state);
-        }
+        self.save(state);
     }
 
     /// The session with a paired tablet: the one up, or a new one where it
@@ -191,6 +194,54 @@ impl Daemon {
         Ok(json!({"ok": true, "tablets": tablets}))
     }
 
+    /// The cable, every usb::EVERY.
+    fn watch_usb(self: &Arc<Self>) {
+        let me = self.clone();
+        let connect: Arc<dyn Fn(std::os::unix::net::UnixStream, &usb::Device) -> Result<String, String> + Send + Sync> =
+            Arc::new(move |stream, _device| {
+                let session = me.node.connect_stream(Box::new(stream), "usb")?;
+                log!("usb: a session with {} by cable", session.name);
+                if let Some(serial) = me.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
+                    me.remember_usb(&serial);
+                }
+                // Until it is over: then the cable may carry the next.
+                while !session.is_closed() {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Ok(session.peer.clone())
+            });
+        loop {
+            std::thread::sleep(usb::EVERY);
+            let state = self.remembered();
+            let serials: Vec<String> = state.get("usb").and_then(Value::as_array).into_iter().flatten()
+                .filter_map(|s| s.as_str().map(str::to_owned)).collect();
+            self.usb.look(&|serial| serials.iter().any(|s| s == serial),
+                          &|device| *self.switched.lock().unwrap() = Some(device.serial.clone()),
+                          connect.clone());
+        }
+    }
+
+    fn remember_usb(&self, serial: &str) {
+        let mut state = self.remembered();
+        let mut serials: Vec<Value> = state.get("usb").and_then(Value::as_array).cloned().unwrap_or_default();
+        if serials.iter().any(|s| s.as_str() == Some(serial)) {
+            return;
+        }
+        serials.push(json!(serial));
+        state.insert("usb".into(), Value::Array(serials));
+        self.save(state);
+    }
+
+    fn save(&self, state: serde_json::Map<String, Value>) {
+        if let Some(parent) = self.state.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let part = self.state.with_extension("part");
+        if std::fs::write(&part, Value::Object(state).to_string()).is_ok() {
+            let _ = std::fs::rename(&part, &self.state);
+        }
+    }
+
     fn queued(&self, request: &Value) -> Result<Value, String> {
         let session = self.node.session(request["device"].as_str().ok_or("no device")?).ok_or("not connected")?;
         Ok(json!({"ok": true, "queued": session.queued()}))
@@ -205,7 +256,8 @@ impl Daemon {
             let sessions = self.node.sessions();
             idle.retain(|peer, _| sessions.iter().any(|s| &s.peer == peer));
             for session in sessions {
-                if session.channels() > 0 {
+                // By cable: kept (the tablet charges; its Wi-Fi is not woken).
+                if session.channels() > 0 || session.path == "usb" {
                     idle.remove(&session.peer);
                 } else if now.duration_since(*idle.entry(session.peer.clone()).or_insert(now)) >= IDLE {
                     log!("{}: idle, closed", session.name);
@@ -266,6 +318,10 @@ impl Daemon {
                 "connect" => (self.connect(&request), None),
                 "browse" => (self.browse(&request), None),
                 "queued" => (self.queued(&request), None),
+                "usb" => {
+                    self.usb.asked.store(request["use"].as_bool().unwrap_or(true), Ordering::Relaxed);
+                    (Ok(json!({"ok": true})), None)
+                }
                 "close" => {
                     if let Some(session) = request["device"].as_str().and_then(|d| self.node.session(d)) {
                         session.close();
@@ -342,8 +398,11 @@ fn main() {
         let base = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{home}/.local/state"));
         format!("{base}/plus-one/link.json")
     }));
-    let daemon = Arc::new(Daemon { node: node.clone(), config, state, finding: Mutex::default(), watchers: Mutex::default(),
-                                   serving: Mutex::default(), serial: AtomicU64::new(0) });
+    let daemon = Arc::new(Daemon { node: node.clone(), config, state, finding: Mutex::default(), usb: usb::Watcher::new(),
+                                   switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(),
+                                   serial: AtomicU64::new(0) });
+    let cable = daemon.clone();
+    std::thread::Builder::new().name("link-usb".into()).spawn(move || cable.watch_usb()).unwrap();
     let reaper = daemon.clone();
     std::thread::Builder::new().name("link-idle".into()).spawn(move || reaper.reap()).unwrap();
     let events = daemon.clone();

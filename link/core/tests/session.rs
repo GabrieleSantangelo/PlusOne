@@ -207,3 +207,44 @@ fn a_node_closed_listens_no_more() {
     std::thread::sleep(Duration::from_millis(100));
     assert!(pc.connect(address, Duration::from_secs(1)).is_err());
 }
+
+#[test]
+fn a_session_on_a_stream_with_no_ip_carries_everything() {
+    // As over USB or Bluetooth: one byte stream, no UDP.
+    let (pc_id, pc_fp) = identity();
+    let (tablet_id, tablet_fp) = identity();
+    let tablet = Node::new("tablet", &tablet_id, trusting(&pc_fp)).unwrap();
+    tablet.serve("echo", 1, |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 || incoming.channel.send(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+    let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let accepter = tablet.clone();
+    let accepting = std::thread::spawn(move || accepter.accept_stream(Box::new(b), "usb").map(|s| s.path.clone()));
+    let session = pc.connect_stream(Box::new(a), "usb").unwrap();
+    assert_eq!(accepting.join().unwrap().unwrap(), "usb");
+    assert_eq!(session.path, "usb");
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let video = session.open("echo", "v", Class::Realtime).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    control.send(b"control").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(7));
+    let mut got = 0;
+    for i in 0..300u32 {
+        let mut packet = vec![0u8; 1422];
+        packet[..4].copy_from_slice(&i.to_be_bytes());
+        video.send(&packet).unwrap();
+        if video.recv(&mut buf, Some(Duration::from_millis(200))).unwrap() == Some(1422) {
+            got += 1;
+        }
+    }
+    assert_eq!(got, 300);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(session.rtt().is_none(), "no UDP to measure");
+    assert!(!session.is_closed());
+}

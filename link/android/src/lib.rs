@@ -3,7 +3,8 @@
 //! - nativeStart(name, certificate, signer): a node, its handle. The key
 //!   never leaves Android's keystore: the TLS handshake asks signer.sign;
 //! - nativeSetPaired(handle, fingerprints): the PCs it trusts, as they change;
-//! - nativeRequest(handle, json): listen, connect, open (the channel's
+//! - nativeRequest(handle, json): listen, connect, accept_fd (a session the
+//!   PC starts on a USB accessory's fd, bridged), open (the channel's
 //!   descriptor in the answer's "fd", the caller's to own), serve, unserve,
 //!   devices, close;
 //! - nativeNext(handle, ms): the next event (a channel the PC opened, with
@@ -19,7 +20,8 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::os::fd::IntoRawFd;
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -92,7 +94,7 @@ impl Signer for Keystore {
 // -- requests ---------------------------------------------------------------------------
 
 fn session_json(session: &plusone_link::Session) -> Value {
-    json!({"id": session.peer, "name": session.name, "features": session.features(),
+    json!({"id": session.peer, "name": session.name, "features": session.features(), "path": session.path,
            "rtt_ms": session.rtt().map(|r| r.as_secs_f64() * 1000.0), "dropped": session.dropped()})
 }
 
@@ -107,6 +109,65 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
         "connect" => {
             let address = text("address")?.parse().map_err(|e| format!("the address: {e}"))?;
             let session = core.node.connect(address, Duration::from_secs_f64(request["timeout"].as_f64().unwrap_or(5.0)))?;
+            Ok(json!({"ok": true, "device": session.peer}))
+        }
+        "accept_fd" => {
+            let fd = request["fd"].as_i64().filter(|fd| *fd >= 0).ok_or("no fd")? as i32;
+            let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            let (mut reader, mut writer) = (file.try_clone().map_err(|e| e.to_string())?, file);
+            // READY and our number, again every USB_AGAIN, until the PC's GO
+            // with it; what comes before (an attempt's of before) dropped.
+            let number: [u8; 8] = std::array::from_fn(|i| (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos() >> (i * 8)) as u8);
+            let mut ready = plusone_link::stream::USB_READY.to_vec();
+            ready.extend_from_slice(&number);
+            let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let repeater = {
+                let (mut writer, answered, ready) = (writer.try_clone().map_err(|e| e.to_string())?, answered.clone(), ready.clone());
+                std::thread::spawn(move || {
+                    let step = std::time::Duration::from_millis(50);
+                    loop {
+                        if writer.write_all(&ready).is_err() {
+                            return;
+                        }
+                        let mut waited = std::time::Duration::ZERO;
+                        while waited < plusone_link::stream::USB_AGAIN {
+                            if answered.load(std::sync::atomic::Ordering::SeqCst) {
+                                return;
+                            }
+                            std::thread::sleep(step);
+                            waited += step;
+                        }
+                    }
+                })
+            };
+            let mut buf = vec![0u8; 16 << 10];
+            let got = loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break false,
+                    Ok(n) if plusone_link::stream::usb_number(plusone_link::stream::USB_GO, &buf[..n]) == Some(number) => break true,
+                    Ok(_) => continue,
+                }
+            };
+            answered.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = repeater.join();  // no READY after this: the session's bytes only
+            if !got {
+                return Err("the cable went before the PC answered".into());
+            }
+            let stream = plusone_link::stream::bridge(
+                // The accessory's reads: 0 is the cable gone.
+                move |buf| match reader.read(buf) {
+                    Ok(0) => Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    other => other,
+                },
+                move |data| {
+                    for piece in plusone_link::stream::usb_pieces(data) {
+                        writer.write_all(piece)?;
+                    }
+                    Ok(())
+                },
+                16 << 10).map_err(|e| e.to_string())?;
+            let session = core.node.accept_stream(Box::new(stream), text("path").unwrap_or("usb"))?;
             Ok(json!({"ok": true, "device": session.peer}))
         }
         "open" => {

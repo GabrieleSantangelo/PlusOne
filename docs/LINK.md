@@ -1,8 +1,10 @@
 # The link: connection apart from the features
 
 Status (branch `link`): the core, plus-one-link, plusone_link and the
-core in the app work, measured with the tablet; the desktop goes over the
-link when plus-one-link runs.
+core in the app work, measured with the tablet; the desktop, the
+speakers, the camera and the microphone go over it when plus-one-link
+runs, by cable too (USB). Not yet: signing and updates (they need bulk
+channels), Bluetooth, paths changing during a session.
 
 The connection to the tablet becomes a layer of its own, in Rust, the same
 code on both sides: on the PC a program of its own (`plus-one-link`), in
@@ -229,6 +231,28 @@ the tablet, the desktop through the link: 60 fps, 24-27 ms median, 30-31
 ms at 90%, as over the link of before at 14:45 (60 fps, 26-28, 30-31).
 The speakers alone, 40 s twice each way: the tablet held 40-80 ms over
 either, a few packets missed on both, no gap heard.
+
+By cable (2026-10-27): plus-one-link asks the tablet plugged in to be
+Plus One's accessory (Android Open Accessory, through usbfs, no libusb);
+Android asks once whether Plus One opens it (UsbActivity); the app then
+says it is there with a number of its own, again every 2 s, the PC
+answers with the same number, and TLS starts: bytes of an attempt before
+are never taken for this one's. Both sides try again as long as the cable
+is plugged in; a cable session is never closed for being idle. Round
+trips on "echo", the PC on battery:
+
+| | Cable | The hotspot's Wi-Fi (before) |
+|---|---|---|
+| Control, one at a time: p50 / p99 / max | 3.9 / 5.2 / 5.3 ms | 10.8 / 29.5 / 34.7 ms |
+| Realtime, 200 a second | 3.3 / 4.5 / 4.9 ms | 8.9 / 15.3 / 22.3 ms |
+| Realtime, 17 Mbit/s each way | 8.0 / 11.5 / 16.8 ms, none lost | 12.8 / 22.9 / 44.2 ms, 6 of 18000 lost |
+
+The desktop (test pattern, 20 Mbit/s, 60 fps), both on battery, against
+the home Wi-Fi (2.4 GHz) over the link of before: by cable 27.4-27.9 ms
+median from capture to decoded, 34-36 ms at 90%, none lost, the bitrate
+kept; the home Wi-Fi 41-52 ms, 81-106 ms, frames lost, the bitrate down
+to 2-4 Mbit/s. On battery the PC's encoding is slower (13 ms from capture
+to sent, 9 on mains).
 
 ## Phases
 

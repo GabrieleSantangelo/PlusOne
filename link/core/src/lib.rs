@@ -12,11 +12,13 @@ pub mod mdns;
 pub mod node;
 pub mod seal;
 pub mod session;
+pub mod stream;
 pub mod sys;
 
 pub use identity::{fingerprint, Identity, Paired};
 pub use node::{Event, Handler, Node};
 pub use session::{Channel, Incoming, Session};
+pub use stream::Stream;
 
 /// How a channel's messages travel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3,6 +3,7 @@
 
 use crate::identity::{Identity, Paired};
 use crate::session::{self, Incoming, Session};
+use crate::stream::Stream;
 use crate::log;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -70,6 +71,12 @@ impl NodeInner {
             drop(sessions);
             self.event(Event::Gone(session.peer.clone(), reason.to_owned()));
         }
+    }
+
+    fn accept(self: &Arc<Self>, stream: Box<dyn Stream>, path: &str) -> std::io::Result<Arc<Session>> {
+        let conn = rustls::ServerConnection::new(self.server.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let established = session::establish(conn.into(), stream, false, self.hello(), path)?;
+        self.add(established)
     }
 
     /// A new session with a device: the one before it, if any, ends (it
@@ -159,10 +166,8 @@ impl Node {
                 // Each on its own: a slow or hostile one holds up no other.
                 let _ = std::thread::Builder::new().name("link-accept".into()).spawn(move || {
                     let from = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                    let result = rustls::ServerConnection::new(node.server.clone())
-                        .map_err(|e| std::io::Error::other(e.to_string()))
-                        .and_then(|conn| session::establish(conn.into(), tcp, false, node.hello()))
-                        .and_then(|established| node.add(established));
+                    let _ = tcp.set_nodelay(true);
+                    let result = node.accept(Box::new(tcp), "lan");
                     if let Err(e) = result {
                         log!("{from}: no session ({e})");
                     }
@@ -170,6 +175,21 @@ impl Node {
             }
         })?;
         Ok(bound)
+    }
+
+    /// A session with the device at the other end of stream, which
+    /// connected to us (its TLS server: we), or None to run it here.
+    pub fn accept_stream(&self, stream: Box<dyn Stream>, path: &str) -> Result<Arc<Session>, String> {
+        self.0.accept(stream, path).map_err(|e| e.to_string())
+    }
+
+    /// A session with the device at the other end of stream, which we
+    /// reached (its TLS client: we).
+    pub fn connect_stream(&self, stream: Box<dyn Stream>, path: &str) -> Result<Arc<Session>, String> {
+        let name = rustls::pki_types::ServerName::try_from("plus-one.invalid").unwrap();
+        let conn = rustls::ClientConnection::new(self.0.client.clone(), name).map_err(|e| e.to_string())?;
+        let established = session::establish(conn.into(), stream, true, self.0.hello(), path).map_err(|e| e.to_string())?;
+        self.0.add(established).map_err(|e| e.to_string())
     }
 
     /// Everything over: no more listening, every session closed.
@@ -191,9 +211,7 @@ impl Node {
     /// A session with the device listening at address.
     pub fn connect(&self, address: SocketAddr, timeout: Duration) -> Result<Arc<Session>, String> {
         let tcp = TcpStream::connect_timeout(&address, timeout).map_err(|e| format!("{address}: {e}"))?;
-        let name = rustls::pki_types::ServerName::try_from("plus-one.invalid").unwrap();
-        let conn = rustls::ClientConnection::new(self.0.client.clone(), name).map_err(|e| e.to_string())?;
-        let established = session::establish(conn.into(), tcp, true, self.0.hello()).map_err(|e| format!("{address}: {e}"))?;
-        self.0.add(established).map_err(|e| e.to_string())
+        tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+        self.connect_stream(Box::new(tcp), "lan").map_err(|e| format!("{address}: {e}"))
     }
 }
