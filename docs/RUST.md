@@ -44,7 +44,7 @@ with its own Rust (1.85) and -dev libraries (Dockerfile.rust). The binary,
 |---|---|---|---|
 | Discovery, trust, links, datagrams | `plusone/link/` | `rust/src/link/` | done; the same identity and pairings |
 | The desktop: monitor, stream, rate, fingers, pen | `appdisplay.py`, `display.py`, `media.py`, `pen.py` | `rust/src/display/` | done; `plus-one-rs display` |
-| Speakers | `pcm.py`, `devices.py` | | next |
+| Speakers | `pcm.py`, `devices.py` | `rust/src/pcm.rs`, `rust/src/devices/` | done; `plus-one-rs speakers` |
 | Camera, microphone | `devices.py`, `rtc.py` | | |
 | Signing | `signing.py`, `sign_jobs.py`, `sign.py`, `pdf.py`, `ink.py`... | | |
 | The app: service, D-Bus, notifications, updates | `app.py`, `updates.py`, `engine.py` | | |
@@ -78,5 +78,29 @@ capture, encoder, Wi-Fi and the tablet's decoder decide it. The real
 desktop, which the GPU captures: under 2 % of a core for the whole
 process, 5.3 ms from capture to sent (Python: 5.7-6.5).
 
-Next to measure: the desktop, the speakers and the fingers at once, where
-Python's threads wait for each other.
+## Measured: the desktop and the speakers at once
+
+`tools/bench/av.sh` sends a test pattern and a test tone to the fake
+tablet at once, with the threads the app has for them (the desktop's
+stream and its listener, the speakers' stream and theirs, a link held for
+each). The fake tablet times each 5 ms packet of sound against when it
+was due, while the frames go out, 20 s each:
+
+| | Python, 20 Mbit/s | Rust | Python, 100 Mbit/s | Rust |
+|---|---|---|---|---|
+| Sound late, p99 | 0.38 ms | 0.27 | 0.38 | 0.24 |
+| Sound late, p99.9 / most | 1.09 / 1.39 | 0.94 / 1.36 | 1.09 / 1.75 | 0.72 / 1.43 |
+| Sound: gaps over 20 ms | 0 | 0 | 0 | 0 |
+| Frames: capture to in, p50 / p99 | 9.36 / 11.68 ms | 10.06 / 12.57 | 10.88 / 14.35 | 11.35 / 17.11 |
+| CPU in 20 s | 14.1 s | 14.5 | 16.2 | 16.7 |
+
+The sound is a little more even in Rust, and in Python within 1-2 ms of
+when it was due anyway: the tablet waits 40 ms before it plays, nobody
+hears the difference. The frames are alike (runs differ by ±0.5 ms; in
+the run before, Rust was the faster). The wait for Python's lock does not
+show at these loads: the heavy work (capture, VA's encoder, OpenSSL) is C
+also when Python calls it, and what Python itself does is little.
+
+So far, then: Rust sends packets far faster, but the packets are not
+where the time goes. What it buys at Plus One's loads is not speed but a
+single language with types, and no lock between the parts.

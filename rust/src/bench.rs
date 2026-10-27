@@ -83,18 +83,134 @@ pub fn fake_app(args: &[String]) {
     tls.set_private_key(&key).unwrap();
     tls.set_certificate(&cert).unwrap();
     tls.set_verify_callback(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT, |_, _| true);
-    let tls = tls.build();
+    let tls = Arc::new(tls.build());
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    eprintln!("fake app: at 127.0.0.1:{port}, screen {width}x{height}");
+    listener.set_nonblocking(true).unwrap();
+    let seconds: f64 = value("--seconds").and_then(|v| v.parse().ok()).unwrap_or(30.0);
+    eprintln!("fake app: at 127.0.0.1:{port}, screen {width}x{height}, for {seconds} s");
+    // Each connection on a thread of its own, as the app's LinkServer; what
+    // each session measured, said when it ends.
+    let reports: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut sessions = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((tcp, _)) => {
+                tcp.set_nonblocking(false).unwrap();
+                let (tls, reports) = (tls.clone(), reports.clone());
+                sessions.push(std::thread::spawn(move || {
+                    if let Some(report) = session(&tls, tcp, (width, height)) {
+                        reports.lock().unwrap().push(report);
+                    }
+                }));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    for session in sessions {
+        let _ = session.join();
+    }
+    for report in reports.lock().unwrap().iter() {
+        println!("{report}");
+    }
+}
 
-    let (tcp, _) = listener.accept().unwrap();
-    let mut stream = tls.accept(tcp).expect("TLS");
-    let hello = wire::receive(&mut stream, UNPAIRED_HEADER).unwrap();
-    assert_eq!(hello.get("type").and_then(Value::as_str), Some("hello"));
+/// One connection: hello, then its request (the desktop, the speakers).
+fn session(tls: &SslAcceptor, tcp: std::net::TcpStream, screen: (u32, u32)) -> Option<String> {
+    let mut stream = tls.accept(tcp).ok()?;
+    let hello = wire::receive(&mut stream, UNPAIRED_HEADER).ok()?;
+    if hello.get("type").and_then(Value::as_str) != Some("hello") {
+        return None;
+    }
     wire::send(&mut stream, &msg!({"type": "hello", "name": "Bench", "version": 3, "paired": true,
-                                   "at": "127.0.0.1", "app": 900}), None).unwrap();
-    let request = wire::receive(&mut stream, MAX_HEADER).unwrap();
-    assert_eq!(request.get("type").and_then(Value::as_str), Some("display"));
+                                   "at": "127.0.0.1", "app": 900}), None).ok()?;
+    let request = wire::receive(&mut stream, MAX_HEADER).ok()?;
+    match request.get("type").and_then(Value::as_str) {
+        Some("display") => Some(display(stream, &request, screen)),
+        Some("speakers") => Some(speakers(stream, &request)),
+        _ => None,
+    }
+}
+
+/// The link, until the PC says stop or hangs up.
+fn link_until_stop(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while let Ok(message) = wire::receive(&mut stream, MAX_HEADER) {
+            if message.get("type").and_then(Value::as_str) == Some("stop") {
+                break;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+}
+
+fn opener(key: &[u8]) -> CipherCtx {
+    let mut opener = CipherCtx::new().unwrap();
+    opener.decrypt_init(Some(Cipher::aes_256_gcm()), Some(key), None).unwrap();
+    opener
+}
+
+/// The PC's packet's body, or None if it is not one sealed with the key.
+fn open(opener: &mut CipherCtx, packet: &[u8]) -> Option<Vec<u8>> {
+    let n = packet.len();
+    if n < NONCE + TAG + 1 || u32::from_be_bytes(packet[..4].try_into().unwrap()) != FROM_PC {
+        return None;
+    }
+    opener.decrypt_init(None, None, Some(&packet[..NONCE])).ok()?;
+    opener.set_tag(&packet[n - TAG..n]).ok()?;
+    let mut body = vec![0u8; n - NONCE - TAG + 16];
+    let k = opener.cipher_update(&packet[NONCE..n - TAG], Some(&mut body)).ok()?;
+    let f = opener.cipher_final(&mut body[k..]).ok()?;
+    body.truncate(k + f);
+    Some(body)
+}
+
+/// The speakers: each 5 ms packet's arrival against when it was due (the
+/// first one's arrival, then 5 ms each): how late the sound comes, and how
+/// unevenly, while the rest of the PC's side is busy.
+fn speakers(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &wire::Message) -> String {
+    let offer: Value = serde_json::from_str(request.get("sdp").and_then(Value::as_str).unwrap_or("{}")).unwrap();
+    let key = unhex(offer.get("key").and_then(Value::as_str).unwrap()).unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let answer = serde_json::json!({"port": udp.local_addr().unwrap().port()}).to_string();
+    wire::send(&mut stream, &msg!({"type": "answer", "sdp": answer}), None).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    link_until_stop(stream, done.clone());
+    let mut opener = opener(&key);
+    let mut packet = [0u8; 2048];
+    let mut first: Option<(i64, u32)> = None;
+    let mut lateness = Vec::new();  // ms past due
+    let mut previous: Option<i64> = None;
+    let mut gaps = 0;  // more than 20 ms between two packets
+    while !done.load(Ordering::Relaxed) {
+        let Ok((n, _)) = udp.recv_from(&mut packet) else { continue };
+        let arrived = now_ns();
+        let Some(body) = open(&mut opener, &packet[..n]) else { continue };
+        if body.len() < 5 || body[0] != 7 {
+            continue;
+        }
+        let number = u32::from_be_bytes(body[1..5].try_into().unwrap());
+        let (t0, n0) = *first.get_or_insert((arrived, number));
+        let due = t0 + (number.wrapping_sub(n0) as i64) * 5_000_000;
+        lateness.push((arrived - due) as f64 / 1e6);
+        if previous.is_some_and(|p| arrived - p > 20_000_000) {
+            gaps += 1;
+        }
+        previous = Some(arrived);
+    }
+    // Relative to the earliest: the sender's own pace drifts against nothing here.
+    let least = lateness.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut late: Vec<f64> = lateness.iter().map(|l| l - least).collect();
+    late.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |p: f64| late.get(((late.len() as f64 * p) as usize).min(late.len().saturating_sub(1))).copied().unwrap_or(0.0);
+    format!("speakers: {} packets; late against the steady 5 ms: p50 {:.2} ms, p99 {:.2}, p99.9 {:.2}, max {:.2}; \
+             {gaps} gaps over 20 ms", late.len(), q(0.5), q(0.99), q(0.999), late.last().copied().unwrap_or(0.0))
+}
+
+/// The desktop: frames put back together, each one's capture to its last
+/// packet in, reports each second as the app's.
+fn display(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &wire::Message, (width, height): (u32, u32)) -> String {
     let key = unhex(request.get("key").and_then(Value::as_str).unwrap()).unwrap();
     let pc_port = request.get("port").and_then(Value::as_u64).unwrap() as u16;
     let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -104,24 +220,11 @@ pub fn fake_app(args: &[String]) {
     wire::send(&mut stream, &msg!({"type": "display-ready", "port": udp.local_addr().unwrap().port(),
                                    "width": width, "height": height, "refresh": 60.0}), None).unwrap();
     let pc = std::net::SocketAddr::from(([127, 0, 0, 1], pc_port));
-
     let done = Arc::new(AtomicBool::new(false));
-    // The link: until the PC says stop or hangs up.
-    {
-        let done = done.clone();
-        std::thread::spawn(move || {
-            while let Ok(message) = wire::receive(&mut stream, MAX_HEADER) {
-                if message.get("type").and_then(Value::as_str) == Some("stop") {
-                    break;
-                }
-            }
-            done.store(true, Ordering::Relaxed);
-        });
-    }
+    link_until_stop(stream, done.clone());
 
     let measured = Arc::new(Mutex::new(Measured::default()));
-    let mut opener = CipherCtx::new().unwrap();
-    opener.decrypt_init(Some(Cipher::aes_256_gcm()), Some(&key), None).unwrap();
+    let mut opener = opener(&key);
     let mut sealer = CipherCtx::new().unwrap();
     sealer.encrypt_init(Some(Cipher::aes_256_gcm()), Some(&key), None).unwrap();
     let mut sent = 0u64;
@@ -170,15 +273,7 @@ pub fn fake_app(args: &[String]) {
         }
         let Ok((n, _)) = udp.recv_from(&mut packet) else { continue };
         let arrived = now_ns();
-        if n < NONCE + TAG + 1 || u32::from_be_bytes(packet[..4].try_into().unwrap()) != FROM_PC {
-            continue;
-        }
-        opener.decrypt_init(None, None, Some(&packet[..NONCE])).unwrap();
-        opener.set_tag(&packet[n - TAG..n]).unwrap();
-        let mut body = vec![0u8; n - NONCE - TAG + 16];
-        let Ok(k) = opener.cipher_update(&packet[NONCE..n - TAG], Some(&mut body)) else { continue };
-        let Ok(f) = opener.cipher_final(&mut body[k..]) else { continue };  // not sealed with the key
-        body.truncate(k + f);
+        let Some(body) = open(&mut opener, &packet[..n]) else { continue };
         if body.len() < 18 || body[0] != 1 {
             continue;
         }
@@ -215,9 +310,9 @@ pub fn fake_app(args: &[String]) {
     l.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let q = |p: f64| l.get(((l.len() as f64 * p) as usize).min(l.len().saturating_sub(1))).copied().unwrap_or(0.0);
     let seconds = started.elapsed().as_secs_f64();
-    println!("frames {} ({:.1}/s), lost {}, {:.1} Mbit/s, {} packets; capture to last packet in: \
-              p50 {:.2} ms, p90 {:.2}, p99 {:.2}, max {:.2}",
-             m.frames, m.frames as f64 / seconds, m.lost, m.bytes as f64 * 8.0 / seconds / 1e6, m.packets,
-             q(0.5), q(0.9), q(0.99), l.last().copied().unwrap_or(0.0));
     let _ = hex;
+    format!("display: frames {} ({:.1}/s), lost {}, {:.1} Mbit/s, {} packets; capture to last packet in: \
+             p50 {:.2} ms, p90 {:.2}, p99 {:.2}, max {:.2}",
+            m.frames, m.frames as f64 / seconds, m.lost, m.bytes as f64 * 8.0 / seconds / 1e6, m.packets,
+            q(0.5), q(0.9), q(0.99), l.last().copied().unwrap_or(0.0))
 }

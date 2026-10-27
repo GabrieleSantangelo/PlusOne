@@ -20,6 +20,6 @@ pub mod wire;
 
 pub use datagrams::Datagrams;
 pub use discovery::{Discovery, Nearby, Source};
-pub use link::{connect, Target};
+pub use link::{connect, Error, Target};
 pub use tablets::Tablets;
 pub use trust::Paired;
