@@ -434,6 +434,24 @@ fn a_session_through_a_relay() {
 }
 
 #[test]
+fn a_wifi_direct_path_is_one_on_both_sides() {
+    // Taken as any TCP connection, it is what the PC says it is: the tablet
+    // takes it over its LAN path, as the PC does (it closed it there).
+    let (pc_id, pc_fp) = identity();
+    let (tablet_id, tablet_fp) = identity();
+    let tablet = Node::new("tablet", &tablet_id, trusting(&pc_fp)).unwrap();
+    let address = tablet.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    until("the tablet's session", || tablet.session(&pc_fp).is_some());
+    let moved = pc.connect_as(address, Duration::from_secs(2), "p2p").unwrap();
+    assert_eq!(moved.id, session.id);
+    until("p2p on the PC", || session.path().as_deref() == Some("p2p"));
+    let theirs = tablet.session(&pc_fp).unwrap();
+    until("p2p on the tablet", || theirs.path().as_deref() == Some("p2p"));
+}
+
+#[test]
 fn a_session_goes_on_over_another_path() {
     let (pc, tablet, address) = pair();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();

@@ -36,6 +36,8 @@ DEVICE_ACTIVATED = 100
 ACTIVATED, DEACTIVATED = 2, 4
 ACTIVATION = 55        # seconds: wpa_supplicant repeats its request this long
 FIND = 20              # seconds to see the tablet among the peers
+AFTER_APP = 1.5        # seconds between the app's connect and the PC's
+CONNECT = 15           # seconds for the link's path in the group (its DHCP first)
 GROUP_OWNER = "192.168.49.1"  # Android's group owner, always
 LINK_PORT = 47101      # the app's link (CompanionService.LINK_PORT)
 
@@ -146,15 +148,28 @@ class Group:
             "ipv6": {"method": GLib.Variant("s", "ignore")},
         }
         options = {"persist": GLib.Variant("s", "volatile"), "bind-activation": GLib.Variant("s", "dbus-client")}
+        # The app first (Android then has the PC allowed), the PC's negotiation
+        # after: both at once, the PC's request met a "not yet" (status 1)
+        # and the app's provision discovery found the PC off its channel.
+        self.tablet.send({"type": "p2p-go"})
+        time.sleep(AFTER_APP)
         reply = _call(self.bus, NM_PATH, NM, "AddAndActivateConnection2",
                       GLib.Variant("(a{sa{sv}}ooa{sv})", (connection, device, peer, options)))
         self.active = reply[1]
-        self.tablet.send({"type": "p2p-go"})
         self._wait()
         group = self.tablet.receive(timeout=ACTIVATION)
         owner = group.get("address") if group.get("owner") else None
         log(f"p2p: the group is up in {time.monotonic() - t0:.1f} s; the app's address there {owner or '?'}")
-        self.link_connect(f"{owner or GROUP_OWNER}:{LINK_PORT}")
+        # Up, and the PC's address in it a moment later (the app's DHCP).
+        until = time.monotonic() + CONNECT
+        while True:
+            try:
+                self.link_connect(f"{owner or GROUP_OWNER}:{LINK_PORT}")
+                return
+            except Exception as e:  # noqa: BLE001 - plusone_link.LinkError, OSError: again until CONNECT
+                if time.monotonic() > until:
+                    raise NoGroup(f"the link not in the group: {e}") from None
+                time.sleep(1)
 
     def _peer(self, device, name):
         """The tablet among NetworkManager's peers, by its name there."""

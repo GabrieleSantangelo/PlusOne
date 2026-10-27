@@ -112,7 +112,8 @@ fn rank(kind: &str) -> u8 {
         "usb" => 4,
         "p2p" | "ap" => 3,  // Wi-Fi Direct, the PC's own access point: once through the air, no one else's queue
         "lan" => 2,
-        _ => 1,
+        "bt" => 1,  // Bluetooth: slow, but with no network at all
+        _ => 0,     // the relay
     }
 }
 
@@ -395,6 +396,10 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
     }
     hello["resume"] = json!(resume);
     hello["detached"] = json!(detached);
+    // What the path is: the side that made it knows (a TCP connection
+    // accepted could be the LAN's or a Wi-Fi Direct group's or the PC's own
+    // network's, all alike to the side taking it).
+    hello["path"] = json!(kind);
     let mut bytes = Vec::new();
     let mut body = 0u64.to_be_bytes().to_vec();  // numbered 0: before the session's own
     body.extend_from_slice(hello.to_string().as_bytes());
@@ -424,8 +429,13 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
     let udp = if udp_peer.is_some() { udp } else { None };
     let resumes = resume.filter(|r| theirs["resume"].as_str() == Some(r.as_str()));
     let forced = theirs["detached"].as_bool().unwrap_or(false);
+    // Taken, a TCP path is what its dialer says (both sides authenticated by now).
+    let kind = match theirs["path"].as_str() {
+        Some(said @ ("p2p" | "ap")) if !dialer && kind == "lan" => said.to_owned(),
+        _ => kind.to_owned(),
+    };
     Ok(Established { conn, stream, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer,
-                     kind: kind.to_owned(), id, resumes, forced })
+                     kind, id, resumes, forced })
 }
 
 /// A connection made ready to be a path: non-blocking from now on, its

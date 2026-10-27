@@ -57,16 +57,41 @@ pub fn accept(listener: &OwnedFd) -> io::Result<Option<OwnedFd>> {
     Ok((credentials.uid == unsafe { libc::getuid() }).then_some(client))
 }
 
-/// One message from an app: None at its end.
-pub fn receive(client: RawFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
-    let length = plusone_link::sys::recv(client, buf)?;
+/// One message from an app, and the descriptor it carries if any (a
+/// stream for a path: "stream"): None at its end.
+pub fn receive(client: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, Option<OwnedFd>)>> {
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iov;
+    header.msg_iovlen = 1;
+    header.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    header.msg_controllen = space as _;
+    let length = loop {
+        let got = unsafe { libc::recvmsg(client, &mut header, libc::MSG_CMSG_CLOEXEC) };
+        if got >= 0 {
+            break got as usize;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    let mut fd = None;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&header);
+        if !cmsg.is_null() && (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+            fd = Some(OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const RawFd)));
+        }
+    }
     if length == 0 {
         return Ok(None);
     }
-    if length > buf.len() {
+    if header.msg_flags & libc::MSG_TRUNC != 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "a request too big"));
     }
-    Ok(Some(length))
+    Ok(Some((length, fd)))
 }
 
 /// One message to an app, never waiting for room (an event: an app that

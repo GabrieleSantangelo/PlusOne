@@ -239,6 +239,20 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
             }).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true}))
         }
+        "accept_stream" => {
+            // A stream the app made (a Bluetooth socket's, bridged): a path
+            // of that kind, the PC making the session on it.
+            let fd = request["fd"].as_i64().filter(|fd| *fd >= 0).ok_or("no fd")? as i32;
+            let stream = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            let (node, kind) = (core.node.clone(), text("path")?.to_owned());
+            std::thread::Builder::new().name("link-stream".into()).spawn(move || {
+                match node.accept_stream(Box::new(stream), &kind) {
+                    Ok(session) => plusone_link::log!("{}: a session by {kind}", session.name),
+                    Err(e) => plusone_link::log!("by {kind}: {e}"),
+                }
+            }).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true}))
+        }
         "open" => {
             let session = core.node.session(text("device")?).ok_or("not connected")?;
             let class = request["class"].as_str().and_then(Class::parse).ok_or("no class")?;

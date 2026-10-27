@@ -34,6 +34,7 @@ class CompanionService : Service(), LinkServer.Host {
     var link: io.github.gabrielesantangelo.plusone.link.LinkCore? = null
         private set
     private var linkAnnouncer: MdnsAnnouncer? = null
+    private var bluetooth: BtListener? = null
     private val pairedChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         link?.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
     }
@@ -105,6 +106,7 @@ class CompanionService : Service(), LinkServer.Host {
         // The features moved over so far: their handlers of the link of before.
         LinkFeatures(this, core, listOf(DisplayHandler(this), SpeakersHandler(this), CaptureHandler(this), sign, update, P2pHandler(this),
             ApHandler(this)))
+        bluetooth = BtListener(this, core).also { it.start() }
         Thread({
             try {
                 // The same port each time, if free: where the PC reached it
@@ -155,6 +157,7 @@ class CompanionService : Service(), LinkServer.Host {
         server?.stop()
         getSharedPreferences("paired", MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(pairedChanged)
         linkAnnouncer?.stop()
+        bluetooth?.stop()
         link?.close()
         super.onDestroy()
     }

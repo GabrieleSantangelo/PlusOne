@@ -53,6 +53,13 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
         request(JSONObject().put("op", "accept_fd").put("fd", fd).put("path", path))
     }
 
+    /** A stream the app made (a Bluetooth socket, bridged: path "bt") to the
+     * core, which owns fd from then on: the PC makes its session (or a path
+     * for the one there is) on it. */
+    fun acceptStream(fd: Int, path: String) {
+        request(JSONObject().put("op", "accept_stream").put("fd", fd).put("path", path))
+    }
+
     /** A feature of the app's: the PC's channels for it to handler. */
     fun serve(feature: String, version: Int = 1, handler: (LinkChannel) -> Unit) {
         served[feature] = handler

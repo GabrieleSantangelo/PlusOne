@@ -165,3 +165,17 @@ def test_a_session_in_use_waits_longer(world):
 def test_not_there():
     with pytest.raises(LinkError, match="not there"):
         Link("/nonexistent/plus-one/link")
+
+
+def test_a_stream_made_here_is_a_path(world):
+    # As a Bluetooth socket BlueZ gives Plus One: here a TCP connection to
+    # the test tablet, handed over; the session goes on it, of that kind.
+    link, address, tablet_id, _tablet = world
+    host, port = address.rsplit(":", 1)
+    sock = socket.create_connection((host, int(port)), timeout=5)
+    assert link.stream("bt", sock) == tablet_id
+    sock.close()  # the daemon has its own
+    assert next(d for d in link.devices() if d["id"] == tablet_id)["path"] == "bt"
+    channel = link.open(tablet_id, "echo", "x", CONTROL)
+    channel.send(b"by Bluetooth")
+    assert channel.recv(timeout=5) == b"by Bluetooth"

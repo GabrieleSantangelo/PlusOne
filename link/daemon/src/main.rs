@@ -17,6 +17,9 @@
 //!                                "ap": the address is in a Wi-Fi Direct
 //!                                group with it, on the PC's own access
 //!                                point (a better path, not remembered)
+//!   {"op": "stream", "kind": "bt"} with a stream socket's descriptor: a
+//!                                path on it (a Bluetooth socket BlueZ gave
+//!                                the app), the session made on it
 //!   {"op": "browse"[, "wait": S]}  the tablets announcing the link nearby
 //!                                (mDNS): id (its start), name, address
 //!   {"op": "queued", "device"}   bytes on their way to it, not yet sent
@@ -119,6 +122,20 @@ impl Daemon {
             (None, Some(device)) => self.session(device)?,
             (None, None) => return Err("no address or device".into()),
         };
+        Ok(json!({"ok": true, "device": session.peer, "name": session.name}))
+    }
+
+    /// A path on a stream an app made and hands over (its descriptor with
+    /// the request): a Bluetooth socket ("bt"), the PC making the session.
+    fn stream(&self, request: &Value, given: Option<OwnedFd>) -> Result<Value, String> {
+        let fd = given.ok_or("no descriptor")?;
+        let kind = match request["kind"].as_str() {
+            Some(kind @ "bt") => kind,
+            _ => return Err("not a kind of stream path".into()),
+        };
+        let stream = std::os::unix::net::UnixStream::from(fd);  // read, write, shut down: any stream socket
+        stream.set_nonblocking(false).map_err(|e| e.to_string())?;  // as it came: the handshake waits on it
+        let session = self.node.connect_stream(Box::new(stream), kind)?;
         Ok(json!({"ok": true, "device": session.peer, "name": session.name}))
     }
 
@@ -349,7 +366,7 @@ impl Daemon {
         let client = Arc::new(client);
         let mut buf = vec![0u8; REQUEST];
         let mut served: Vec<(String, u64)> = Vec::new();
-        while let Ok(Some(length)) = api::receive(client.as_raw_fd(), &mut buf) {
+        while let Ok(Some((length, given))) = api::receive(client.as_raw_fd(), &mut buf) {
             let request: Value = match serde_json::from_slice(&buf[..length]) {
                 Ok(request) => request,
                 Err(e) => {
@@ -360,6 +377,7 @@ impl Daemon {
             let (reply, fd) = match request["op"].as_str().unwrap_or("") {
                 "devices" => (Ok(self.devices()), None),
                 "connect" => (self.connect(&request), None),
+                "stream" => (self.stream(&request, given), None),
                 "browse" => (self.browse(&request), None),
                 "queued" => (self.queued(&request), None),
                 "usb" => {

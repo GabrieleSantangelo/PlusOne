@@ -17,6 +17,7 @@ by the tablet, or the session over).
 No dependencies: the standard library's socket (file descriptors come
 with the answers, SCM_RIGHTS).
 """
+import array
 import json
 import os
 import select
@@ -138,6 +139,17 @@ class Link:
         self.path = path or socket_path()
         self._sock = _connect(self.path)
         self._lock = threading.Lock()
+
+    def stream(self, kind, sock):
+        """A path on a stream socket made here (a Bluetooth one BlueZ gave:
+        kind "bt"); the device whose session goes on it."""
+        with self._lock:
+            self._sock.sendmsg([json.dumps({"op": "stream", "kind": kind}).encode()],
+                               [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [sock.fileno()]))])
+            reply, _fd = _receive(self._sock)
+        if not reply.get("ok"):
+            raise LinkError(reply.get("error", "refused"))
+        return reply["device"]
 
     def _request(self, message):
         with self._lock:
