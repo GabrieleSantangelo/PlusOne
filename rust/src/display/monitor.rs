@@ -7,7 +7,7 @@
 //! Mutter, the next finger's position is on its way at once.
 
 use crate::log;
-use glib::variant::{ObjectPath, ToVariant};
+use glib::variant::ToVariant;
 use glib::Variant;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -104,7 +104,9 @@ impl VirtualMonitor {
         }
     }
 
-    /// One input event to the session, no reply awaited.
+    /// One input event to the session, no reply awaited (so a wrong
+    /// signature is dropped without a word: Mutter's take the stream as a
+    /// string, "s", not an object path).
     fn notify(&self, method: &str, args: Variant) {
         let session = self.session.lock().unwrap();
         let Some(rd) = &session.rd else { return };
@@ -121,11 +123,11 @@ impl VirtualMonitor {
 
 impl Injector for VirtualMonitor {
     fn touch_down(&self, slot: u32, x: f64, y: f64) {
-        self.notify("NotifyTouchDown", (ObjectPath::try_from(self.stream()).unwrap(), slot, x, y).to_variant());
+        self.notify("NotifyTouchDown", touch(&self.stream(), slot, x, y));
     }
 
     fn touch_motion(&self, slot: u32, x: f64, y: f64) {
-        self.notify("NotifyTouchMotion", (ObjectPath::try_from(self.stream()).unwrap(), slot, x, y).to_variant());
+        self.notify("NotifyTouchMotion", touch(&self.stream(), slot, x, y));
     }
 
     fn touch_up(&self, slot: u32) {
@@ -133,7 +135,7 @@ impl Injector for VirtualMonitor {
     }
 
     fn pointer_move(&self, x: f64, y: f64) {
-        self.notify("NotifyPointerMotionAbsolute", (ObjectPath::try_from(self.stream()).unwrap(), x, y).to_variant());
+        self.notify("NotifyPointerMotionAbsolute", motion(&self.stream(), x, y));
     }
 
     fn pointer_button(&self, button: i32, pressed: bool) {
@@ -141,13 +143,25 @@ impl Injector for VirtualMonitor {
     }
 
     fn pointer_axis(&self, dx: f64, dy: f64, finish: bool) {
-        let flags = AXIS_SOURCE_FINGER | if finish { AXIS_FINISH } else { 0 };
-        self.notify("NotifyPointerAxis", (dx, dy, flags).to_variant());
+        self.notify("NotifyPointerAxis", axis(dx, dy, finish));
     }
 
     fn keysym(&self, keysym: u32, pressed: bool) {
         self.notify("NotifyKeyboardKeysym", (keysym, pressed).to_variant());
     }
+}
+
+// The arguments as Mutter's RemoteDesktop.Session methods take them.
+fn touch(stream: &str, slot: u32, x: f64, y: f64) -> Variant {
+    (stream, slot, x, y).to_variant()
+}
+
+fn motion(stream: &str, x: f64, y: f64) -> Variant {
+    (stream, x, y).to_variant()
+}
+
+fn axis(dx: f64, dy: f64, finish: bool) -> Variant {
+    (dx, dy, AXIS_SOURCE_FINGER | if finish { AXIS_FINISH } else { 0 }).to_variant()
 }
 
 /// Mutter's monitors: [(connector, vendor, product, serial), its modes
@@ -229,4 +243,21 @@ pub fn set_virtual_monitor_scale(scale: f64) -> Result<bool, glib::Error> {
          Some(&(serial, 1u32, config, HashMap::<String, Variant>::new()).to_variant()), None)?;
     log!("display: the tablet's monitor at scale {scale}");
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_goes_with_the_signatures_mutter_takes() {
+        // org.gnome.Mutter.RemoteDesktop.Session (Mutter 46): anything else
+        // is dropped without a word, as no reply is awaited.
+        assert_eq!(touch("/s", 1, 2.0, 3.0).type_().as_str(), "(sudd)");
+        assert_eq!(motion("/s", 2.0, 3.0).type_().as_str(), "(sdd)");
+        assert_eq!(axis(1.0, 2.0, true).type_().as_str(), "(ddu)");
+        assert_eq!((0x110i32, true).to_variant().type_().as_str(), "(ib)");
+        assert_eq!((0xffebu32, true).to_variant().type_().as_str(), "(ub)");
+        assert_eq!((1u32,).to_variant().type_().as_str(), "(u)");
+    }
 }
