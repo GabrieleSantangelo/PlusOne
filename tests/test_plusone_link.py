@@ -141,8 +141,10 @@ def test_watch_sees_the_tablet_come_and_go(world):
     link.connect(address)
     channel = link.open(tablet_id, "echo", "x", REALTIME)
     tablet.kill()
-    assert gone.wait(6), events
-    assert [e["event"] for e in events] == ["up", "gone"] and events[0]["device"] == tablet_id
+    # Its path lost: the session waits for another (15 s), then is over.
+    assert gone.wait(25), events
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "up" and kinds[-1] == "gone" and "detached" in kinds and events[0]["device"] == tablet_id
     assert channel.recv(timeout=1) == b""
     watcher.close()
 

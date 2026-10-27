@@ -3,8 +3,8 @@
 Status (branch `link`): the core, plus-one-link, plusone_link and the
 core in the app work, measured with the tablet; the desktop, the
 speakers, the camera and the microphone go over it when plus-one-link
-runs, by cable too (USB). Not yet: signing and updates (they need bulk
-channels), Bluetooth, paths changing during a session.
+runs, by cable too (USB), moving between the cable and the Wi-Fi without
+ending. Not yet: signing and updates (they need bulk channels), Bluetooth.
 
 The connection to the tablet becomes a layer of its own, in Rust, the same
 code on both sides: on the PC a program of its own (`plus-one-link`), in
@@ -253,6 +253,13 @@ median from capture to decoded, 34-36 ms at 90%, none lost, the bitrate
 kept; the home Wi-Fi 41-52 ms, 81-106 ms, frames lost, the bitrate down
 to 2-4 Mbit/s. On battery the PC's encoding is slower (13 ms from capture
 to sent, 9 on mains).
+
+Paths changing during a session (2026-10-27; the state machines:
+docs/LINK-STATES.md): with the tablet by cable, realtime every 20 ms and
+control every 200 ms on "echo", the cable pulled: the session went on over
+the Wi-Fi 1.6 s later (realtime's and control's gap), and every one of the
+1500 control messages came back, in order; plugged in again, the session
+went back to the cable and the Wi-Fi path was let go.
 
 ## Phases
 

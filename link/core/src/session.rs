@@ -1,27 +1,33 @@
-//! A session with a paired device: one TLS 1.3 stream (the session's own
-//! messages and the control channels), one UDP socket (input and realtime,
-//! sealed with keys from the TLS exporter), and the channels.
+//! A session with a paired device: its keys, its channels and their
+//! reliable messages, over one path at a time, which may change while the
+//! session lasts (the cable plugged in or pulled, the Wi-Fi lost and back).
+//!
+//! A path: a TLS 1.3 stream (the session's messages, the control
+//! channels; input and realtime too while there is no UDP), and a UDP
+//! socket when there is IP under it (input and realtime, sealed with the
+//! session's keys from the first TLS exporter). A path lost, the session
+//! waits RESUME_WAIT for another (the dialer makes one: plus-one-link);
+//! a better one coming (the cable) takes over. Each side numbers its
+//! reliable frames (the session's messages, the control channels'); a ping
+//! says up to which the other's came, and what a lost path did not
+//! deliver is sent again on the next, the duplicates dropped.
 //!
 //! Threads, none of them busy while nothing moves:
-//! - the stream's: it alone touches the TLS connection; reads, writes what
-//!   the others queued (woken by an eventfd), pings each second, and ends
-//!   the session after SILENCE without a word from the other side;
-//! - the datagrams': opens what arrives and hands it to its channel;
+//! - the session's: it alone touches the path's TLS connection; reads,
+//!   writes what the others queued (woken by an eventfd), pings each
+//!   second, takes a path handed over, waits for one when it is lost;
+//! - the path's datagrams': opens what arrives and hands it to its channel;
 //! - one per channel: what the feature writes, to the other side.
-//!
-//! Input and realtime go as datagrams once a ping has come back over UDP
-//! (both directions work), else over the stream: a network that drops UDP
-//! still works, only less well.
 
 use crate::frame::{self, Decoder};
 use crate::node::NodeInner;
 use crate::seal::{Opener, Sealer};
+use crate::stream::Stream;
 use crate::sys::{self, Wake};
 use crate::{log, Class};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use crate::stream::Stream;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -30,12 +36,18 @@ use std::time::{Duration, Instant};
 
 /// A ping each this long, on the stream and over UDP.
 pub const PING_EVERY: Duration = Duration::from_secs(1);
-/// Nothing from the other side this long: the session is over.
-pub const SILENCE: Duration = Duration::from_millis(3500);
+/// Nothing from the other side on a path this long (its stream and its
+/// datagrams alike): the path is lost.
+pub const PATH_SILENCE: Duration = Duration::from_secs(5);
+/// No path this long: the session is over.
+pub const RESUME_WAIT: Duration = Duration::from_secs(15);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
 const UDP_PROBE: Duration = Duration::from_millis(200);
+/// No room in the UDP socket: this long for some, then the packet is lost
+/// (a keyframe's tail where the system caps the socket's room).
+const UDP_STALL: Duration = Duration::from_millis(20);
 const HANDSHAKE: Duration = Duration::from_secs(5);
 const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// An input or realtime message's largest size: with the seal (30 bytes),
@@ -51,13 +63,25 @@ const CHANNEL_BUFFER: usize = 1 << 20;
 /// A control message with no room in its channel: this long for the
 /// feature to read, then the channel is closed (it holds up the stream).
 const CONTROL_STALL: Duration = Duration::from_secs(1);
-const EXPORTER_LABEL: &[u8] = b"EXPORTER-plus-one-link datagrams";
-const PATH: u16 = 0;  // the datagrams' own channel: pings and pongs
+/// Reliable frames taken since the last ping that make one go at once.
+const ACK_AFTER: u64 = 32;
+const KEYS_LABEL: &[u8] = b"EXPORTER-plus-one-link datagrams";
+const ID_LABEL: &[u8] = b"EXPORTER-plus-one-link session";
+const DATAGRAM_PATH: u16 = 0;  // the datagrams' own channel: pings and pongs
 const PING: u8 = 1;
 const PONG: u8 = 2;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// How good a path is: a better one takes over from a worse.
+fn rank(kind: &str) -> u8 {
+    match kind {
+        "usb" => 3,
+        "lan" => 2,
+        _ => 1,
+    }
 }
 
 /// A channel's end, the feature's: a message socket. Close it (drop) and
@@ -118,60 +142,116 @@ struct End {
     newest: AtomicU64,
 }
 
+/// The reliable frames: ours numbered, kept until acknowledged; the
+/// other side's newest taken.
+#[derive(Default)]
+struct Reliable {
+    next: u64,
+    unacked: VecDeque<(u64, Vec<u8>)>,
+    heard: u64,
+    acknowledged: u64,  // the newest of theirs we said we have
+}
+
+/// A path the session runs on now.
+struct Path {
+    kind: String,
+    stream: Box<dyn Stream>,  // a clone of the session thread's, to shut it down
+    udp: Option<UdpSocket>,
+    udp_peer: Mutex<Option<SocketAddr>>,
+    started: Instant,
+    heard_us: AtomicU64,   // since started: the stream's last frame, or an authenticated datagram
+    proven_us: AtomicU64,  // a pong's (0: none yet)
+    rtt_us: AtomicU64,
+    gone: AtomicBool,
+}
+
+impl Path {
+    fn us(&self) -> u64 {
+        self.started.elapsed().as_micros() as u64
+    }
+
+    fn heard(&self) {
+        self.heard_us.store(self.us().max(1), Ordering::Relaxed);
+    }
+
+    fn udp_works(&self) -> bool {
+        let proven = self.proven_us.load(Ordering::Relaxed);
+        self.udp.is_some() && proven != 0 && self.us().saturating_sub(proven) < UDP_PROOF.as_micros() as u64
+    }
+}
+
 pub struct Session {
     /// The other side's certificate's fingerprint, and what its hello said.
     pub peer: String,
     pub name: String,
-    /// What it runs on: "lan", "usb", "bluetooth".
-    pub path: String,
+    /// The session's, the same on both sides: a path for it names it.
+    pub id: String,
     features: Mutex<Value>,
     node: Weak<NodeInner>,
-    started: Instant,
     closed: AtomicBool,
+    /// Said "bye": the path's end that follows is not a path lost.
+    closing: AtomicBool,
     channels: Mutex<HashMap<u16, Arc<End>>>,
     pending: Mutex<HashMap<u16, mpsc::Sender<Result<(), String>>>>,
     next_id: AtomicU16,
     outbox: Mutex<Vec<u8>>,
+    reliable: Mutex<Reliable>,
     wake: Wake,
-    stream: Box<dyn Stream>,
-    udp: Option<UdpSocket>,
-    udp_peer: Mutex<Option<SocketAddr>>,
+    path: Mutex<Option<Arc<Path>>>,
+    arriving: Mutex<Option<Established>>,
     sealer: Sealer,
-    proven_us: AtomicU64,
-    rtt_us: AtomicU64,
+    opener: Mutex<Opener>,
     dropped: AtomicU64,
 }
 
-/// What the TLS handshake and the hellos left: the session starts from it.
+/// What a connection's TLS handshake and hellos left: a new session
+/// starts from it, or a session takes it as its path.
 pub(crate) struct Established {
     conn: rustls::Connection,
     stream: Box<dyn Stream>,
     decoder: Decoder,
-    peer: String,
+    pub(crate) peer: String,
     hello: Value,
     udp: Option<UdpSocket>,
     udp_peer: Option<SocketAddr>,
     sealer: Sealer,
     opener: Opener,
     dialer: bool,
-    path: String,
+    kind: String,
+    id: String,
+    /// The session both hellos named (the same one): this is a path for it.
+    pub(crate) resumes: Option<String>,
+}
+
+impl Established {
+    pub(crate) fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn close(&self) {
+        self.stream.shutdown();
+    }
 }
 
 /// The TLS handshake, the keys and the hellos, on a new connection. The
-/// verifier has checked the other side is paired. path: what it runs on.
+/// verifier has checked the other side is paired. kind: what it runs on;
+/// ours: the id of the session we have with that device, if any (to go on
+/// with it: both hellos name it, or a new one starts).
 pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream>, dialer: bool, hello: Value,
-                        path: &str) -> io::Result<Established> {
+                        kind: &str, ours: &dyn Fn(&str) -> Option<String>) -> io::Result<Established> {
     stream.set_timeouts(Some(HANDSHAKE))?;
     while conn.is_handshaking() {
         conn.complete_io(&mut stream)?;
     }
     let peer = conn.peer_certificates().and_then(|c| c.first()).map(|c| crate::fingerprint(c))
         .ok_or_else(|| invalid("no certificate"))?;
-    let keys = conn.export_keying_material([0u8; 64], EXPORTER_LABEL, None).map_err(|e| invalid(e.to_string()))?;
-    let (ours, theirs) = if dialer { (0, 32) } else { (32, 0) };
+    let keys = conn.export_keying_material([0u8; 64], KEYS_LABEL, None).map_err(|e| invalid(e.to_string()))?;
+    let id_bytes = conn.export_keying_material([0u8; 16], ID_LABEL, None).map_err(|e| invalid(e.to_string()))?;
+    let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let (mine, theirs) = if dialer { (0, 32) } else { (32, 0) };
     let (send_direction, receive_direction) =
         if dialer { (crate::seal::DIALER, crate::seal::LISTENER) } else { (crate::seal::LISTENER, crate::seal::DIALER) };
-    let sealer = Sealer::new(keys[ours..ours + 32].try_into().unwrap(), send_direction);
+    let sealer = Sealer::new(keys[mine..mine + 32].try_into().unwrap(), send_direction);
     let opener = Opener::new(keys[theirs..theirs + 32].try_into().unwrap(), receive_direction);
 
     // Datagrams as UDP when there is IP under the stream.
@@ -185,12 +265,16 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
         }
         None => None,
     };
+    let resume = ours(&peer);
     let mut hello = hello;
     if let Some(udp) = &udp {
         hello["udp"] = json!(udp.local_addr()?.port());
     }
+    hello["resume"] = json!(resume);
     let mut bytes = Vec::new();
-    frame::encode(frame::SESSION, 0, hello.to_string().as_bytes(), &mut bytes);
+    let mut body = 0u64.to_be_bytes().to_vec();  // numbered 0: before the session's own
+    body.extend_from_slice(hello.to_string().as_bytes());
+    frame::encode(frame::SESSION, 0, &body, &mut bytes);
     conn.writer().write_all(&bytes)?;
     while conn.wants_write() {
         conn.write_tls(&mut stream)?;
@@ -198,10 +282,10 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
     let mut decoder = Decoder::default();
     let theirs = loop {
         if let Some((kind, _, body)) = read_frame(&mut conn, &mut stream, &mut decoder)? {
-            if kind != frame::SESSION {
+            if kind != frame::SESSION || body.len() < 8 {
                 return Err(invalid("a frame before the hello"));
             }
-            let message: Value = serde_json::from_slice(&body).map_err(|e| invalid(e.to_string()))?;
+            let message: Value = serde_json::from_slice(&body[8..]).map_err(|e| invalid(e.to_string()))?;
             if message["t"] != "hello" {
                 return Err(invalid("no hello"));
             }
@@ -214,8 +298,23 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
         _ => None,
     };
     let udp = if udp_peer.is_some() { udp } else { None };
+    let resumes = resume.filter(|r| theirs["resume"].as_str() == Some(r.as_str()));
     Ok(Established { conn, stream, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer,
-                     path: path.to_owned() })
+                     kind: kind.to_owned(), id, resumes })
+}
+
+/// A connection made ready to be a path: non-blocking from now on, its
+/// UDP socket (if any) taken into the path.
+fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
+    established.stream.set_timeouts(None)?;
+    established.stream.set_nonblocking(true)?;
+    let udp = established.udp.take();
+    if let Some(udp) = &udp {
+        udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+    }
+    Ok(Arc::new(Path { kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
+                       udp_peer: Mutex::new(established.udp_peer), started: Instant::now(), heard_us: AtomicU64::new(1),
+                       proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), gone: AtomicBool::new(false) }))
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
@@ -242,49 +341,55 @@ fn read_frame(conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>, decod
 }
 
 impl Session {
-    pub(crate) fn start(node: &Arc<NodeInner>, established: Established) -> io::Result<Arc<Session>> {
-        let Established { conn, stream, decoder, peer, hello, udp, udp_peer, sealer, opener, dialer, path } = established;
-        stream.set_timeouts(None)?;
-        stream.set_nonblocking(true)?;
-        if let Some(udp) = &udp {
-            udp.set_read_timeout(Some(Duration::from_millis(500)))?;
-        }
+    /// A new session on its first path.
+    pub(crate) fn start(node: &Arc<NodeInner>, mut established: Established) -> io::Result<Arc<Session>> {
+        let hello = std::mem::take(&mut established.hello);
         let session = Arc::new(Session {
-            peer,
+            peer: established.peer.clone(),
             name: hello["name"].as_str().unwrap_or("").to_owned(),
-            path,
+            id: established.id.clone(),
             features: Mutex::new(hello["features"].clone()),
             node: Arc::downgrade(node),
-            started: Instant::now(),
             closed: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             channels: Mutex::default(),
             pending: Mutex::default(),
             // Ours odd if we connected, even if we listened: never the same.
-            next_id: AtomicU16::new(if dialer { 1 } else { 2 }),
+            next_id: AtomicU16::new(if established.dialer { 1 } else { 2 }),
             outbox: Mutex::default(),
+            reliable: Mutex::new(Reliable { next: 1, ..Default::default() }),
             wake: Wake::new()?,
-            stream: stream.try_clone()?,
-            udp,
-            udp_peer: Mutex::new(udp_peer),
-            sealer,
-            proven_us: AtomicU64::new(0),
-            rtt_us: AtomicU64::new(0),
+            path: Mutex::default(),
+            arriving: Mutex::default(),
+            sealer: std::mem::replace(&mut established.sealer, Sealer::new(&[0; 32], 0)),
+            opener: Mutex::new(std::mem::replace(&mut established.opener, Opener::new(&[0; 32], 0))),
             dropped: AtomicU64::new(0),
         });
+        // Its first path ready before anyone sees the session.
+        let path = prepare(&mut established)?;
+        *session.path.lock().unwrap() = Some(path.clone());
         let me = session.clone();
-        std::thread::Builder::new().name("link-stream".into()).spawn(move || {
-            let reason = me.run_stream(conn, stream, decoder).err().unwrap_or_else(|| "closed".into());
-            me.end(&reason);
-        })?;
-        if session.udp.is_some() {
-            let me = session.clone();
-            std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(opener))?;
-        }
+        std::thread::Builder::new().name("link-session".into()).spawn(move || me.run(established, path))?;
         Ok(session)
     }
 
-    fn us(&self) -> u64 {
-        self.started.elapsed().as_micros() as u64
+    /// Another path for this session (both hellos named it): it takes over
+    /// if it is better than the one now, or if there is none; else closed.
+    pub(crate) fn adopt(&self, established: Established) -> bool {
+        if self.is_closed() {
+            established.close();
+            return false;
+        }
+        let now = self.path.lock().unwrap().clone();
+        if now.is_some_and(|path| !path.gone.load(Ordering::SeqCst) && rank(&path.kind) >= rank(&established.kind)) {
+            established.close();
+            return false;
+        }
+        if let Some(before) = self.arriving.lock().unwrap().replace(established) {
+            before.close();
+        }
+        self.wake.wake();
+        true
     }
 
     /// What the other side serves now: {feature: version}.
@@ -301,9 +406,18 @@ impl Session {
         self.closed.load(Ordering::SeqCst)
     }
 
+    fn current(&self) -> Option<Arc<Path>> {
+        self.path.lock().unwrap().clone()
+    }
+
+    /// What it runs on now: "lan", "usb"; None while it waits for a path.
+    pub fn path(&self) -> Option<String> {
+        self.current().map(|path| path.kind.clone())
+    }
+
     /// The last round trip over UDP, if it works.
     pub fn rtt(&self) -> Option<Duration> {
-        self.udp_works().then(|| Duration::from_micros(self.rtt_us.load(Ordering::Relaxed)))
+        self.current().filter(|path| path.udp_works()).map(|path| Duration::from_micros(path.rtt_us.load(Ordering::Relaxed)))
     }
 
     /// Bytes sent and not yet on the air (the UDP socket's, the queue's,
@@ -311,7 +425,7 @@ impl Session {
     /// the stream's backlog: how far behind the network is.
     pub fn queued(&self) -> usize {
         let mut queued: libc::c_int = 0;
-        if let Some(udp) = &self.udp {
+        if let Some(udp) = self.current().as_ref().and_then(|path| path.udp.as_ref()) {
             unsafe { libc::ioctl(udp.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
         }
         queued.max(0) as usize + self.outbox.lock().unwrap().len()
@@ -322,19 +436,26 @@ impl Session {
         self.channels.lock().unwrap().len()
     }
 
-    /// Input and realtime messages dropped (no room on the way).
+    /// Input and realtime messages dropped (no room on the way, or no path).
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    fn udp_works(&self) -> bool {
-        let proven = self.proven_us.load(Ordering::Relaxed);
-        proven != 0 && self.us().saturating_sub(proven) < UDP_PROOF.as_micros() as u64
-    }
-
     /// The session over, for every channel at once; the other side told
-    /// (as far as the stream still goes).
+    /// (a moment for "bye" to go, if there is a path: else it hears
+    /// nothing, and gives up after RESUME_WAIT).
     pub fn close(&self) {
+        if self.is_closed() || self.closing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.current().is_some() {
+            self.send_message(json!({"t": "bye"}));
+            let until = Instant::now() + Duration::from_millis(300);
+            while !self.outbox.lock().unwrap().is_empty() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(20));  // from rustls to the socket
+        }
         self.end("closed here");
     }
 
@@ -343,7 +464,12 @@ impl Session {
             return;
         }
         log!("{}: the session is over ({reason})", self.label());
-        self.stream.shutdown();
+        if let Some(path) = self.current() {
+            path.stream.shutdown();
+        }
+        if let Some(arriving) = self.arriving.lock().unwrap().take() {
+            arriving.close();
+        }
         self.wake.wake();
         for (_, waiting) in self.pending.lock().unwrap().drain() {
             let _ = waiting.send(Err("the session is over".into()));
@@ -398,7 +524,8 @@ impl Session {
         let refuse = |reason: &str| self.send_message(json!({"t": "refuse", "id": id, "reason": reason}));
         let Some(class) = message["class"].as_str().and_then(Class::parse) else { return refuse("unknown class") };
         let Some(handler) = handler else { return refuse("not served") };
-        if id == PATH || id % 2 == self.next_id.load(Ordering::Relaxed) % 2 || self.channels.lock().unwrap().contains_key(&id) {
+        if id == DATAGRAM_PATH || id % 2 == self.next_id.load(Ordering::Relaxed) % 2
+            || self.channels.lock().unwrap().contains_key(&id) {
             return refuse("bad id");
         }
         let (ours, theirs) = match sys::seqpacket_pair(CHANNEL_BUFFER) {
@@ -433,7 +560,7 @@ impl Session {
                     continue;
                 }
                 match end.class {
-                    Class::Control => me.queue(frame::MESSAGE, end.id, &buf[..length]),
+                    Class::Control => me.queue_reliable(frame::MESSAGE, end.id, &buf[..length]),
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
                 }
             }
@@ -480,10 +607,27 @@ impl Session {
         }
     }
 
-    // -- the stream ------------------------------------------------------------------
+    // -- the queue -------------------------------------------------------------------
 
     fn send_message(&self, message: Value) {
-        self.queue(frame::SESSION, 0, message.to_string().as_bytes());
+        self.queue_reliable(frame::SESSION, 0, message.to_string().as_bytes());
+    }
+
+    /// A frame numbered, kept until the other side says it has it, queued.
+    fn queue_reliable(&self, kind: u8, channel: u16, body: &[u8]) {
+        let mut bytes = Vec::with_capacity(frame::HEADER + 8 + body.len());
+        {
+            let mut reliable = self.reliable.lock().unwrap();
+            let number = reliable.next;
+            reliable.next += 1;
+            let mut numbered = number.to_be_bytes().to_vec();
+            numbered.extend_from_slice(body);
+            frame::encode(kind, channel, &numbered, &mut bytes);
+            reliable.unacked.push_back((number, bytes.clone()));
+            // In the queue under the same lock: in the order of their numbers.
+            self.outbox.lock().unwrap().extend_from_slice(&bytes);
+        }
+        self.wake.wake();
     }
 
     fn queue(&self, kind: u8, channel: u16, body: &[u8]) {
@@ -498,20 +642,102 @@ impl Session {
         self.wake.wake();
     }
 
-    fn run_stream(self: &Arc<Self>, mut conn: rustls::Connection, mut stream: Box<dyn Stream>, mut decoder: Decoder)
-                  -> Result<(), String> {
+    // -- the session's thread --------------------------------------------------------
+
+    /// Path after path, until the session is over.
+    fn run(self: Arc<Self>, first: Established, path: Arc<Path>) {
+        let mut next = Some((first, Some(path)));
+        let mut resumed = false;
+        while let Some((established, path)) = next.take() {
+            let kind = established.kind.clone();
+            let reason = self.run_path(established, path, resumed);
+            resumed = true;
+            if self.is_closed() || self.closing.load(Ordering::SeqCst) {
+                return;  // close() ends it
+            }
+            if let Some(better) = self.arriving.lock().unwrap().take() {
+                log!("{}: from {kind} to {}", self.label(), better.kind);
+                next = Some((better, None));
+                continue;
+            }
+            log!("{}: the {kind} path is lost ({reason}); waiting for another", self.label());
+            *self.path.lock().unwrap() = None;
+            if let Some(node) = self.node.upgrade() {
+                node.detached(&self);
+            }
+            let until = Instant::now() + RESUME_WAIT;
+            while next.is_none() {
+                if self.is_closed() {
+                    return;
+                }
+                next = self.arriving.lock().unwrap().take().map(|established| (established, None));
+                if next.is_some() {
+                    break;
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    self.end(&format!("no path for {} s", RESUME_WAIT.as_secs()));
+                    return;
+                }
+                let _ = sys::readable(self.wake.fd(), Some(left.min(Duration::from_millis(500))));
+                self.wake.clear();
+            }
+            if let Some((established, _)) = &next {
+                log!("{}: on again, by {}", self.label(), established.kind);
+            }
+        }
+    }
+
+    /// One path, until it is lost, a better one is handed over, or the
+    /// session is over: why it ended.
+    fn run_path(self: &Arc<Self>, mut established: Established, path: Option<Arc<Path>>, resumed: bool) -> String {
+        let path = match path.map(Ok).unwrap_or_else(|| prepare(&mut established)) {
+            Ok(path) => path,
+            Err(e) => return e.to_string(),
+        };
+        let Established { mut conn, mut stream, mut decoder, .. } = established;
+        if resumed {
+            // What the path before did not deliver goes first; datagrams
+            // waiting for it are stale now.
+            let reliable = self.reliable.lock().unwrap();
+            let mut outbox = self.outbox.lock().unwrap();
+            outbox.clear();
+            for (_, bytes) in &reliable.unacked {
+                outbox.extend_from_slice(bytes);
+            }
+        }
+        *self.path.lock().unwrap() = Some(path.clone());
+        if resumed {
+            if let Some(node) = self.node.upgrade() {
+                node.moved(self);
+            }
+        }
+        if path.udp.is_some() {
+            let (me, path) = (self.clone(), path.clone());
+            let _ = std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(path));
+        }
         conn.set_buffer_limit(None);
+        let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err().unwrap_or_else(|| "a better path".into());
+        path.gone.store(true, Ordering::SeqCst);
+        path.stream.shutdown();
+        reason
+    }
+
+    fn drive(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,
+             decoder: &mut Decoder) -> Result<(), String> {
         let mut plain = vec![0u8; 64 << 10];
-        let mut heard = Instant::now();
         let mut next_ping = Instant::now();
         let mut next_udp_ping = Instant::now();
         // Frames that came with the hello.
         while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
-            self.frame(kind, channel, body);
+            self.frame(path, kind, channel, body);
         }
         loop {
             if self.is_closed() {
                 return Ok(());
+            }
+            if self.arriving.lock().unwrap().is_some() {
+                return Ok(());  // a better path: the session's thread takes it
             }
             // Out: what was queued, once the last of it left (the queue's
             // length is what realtime's budget looks at).
@@ -523,7 +749,7 @@ impl Session {
             }
             let mut blocked = false;
             while conn.wants_write() {
-                match conn.write_tls(&mut stream) {
+                match conn.write_tls(stream) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         blocked = true;
@@ -533,27 +759,37 @@ impl Session {
                 }
             }
             let now = Instant::now();
-            if now.duration_since(heard) > SILENCE {
-                return Err(format!("nothing heard for {:.1} s", SILENCE.as_secs_f64()));
+            let silent = path.us().saturating_sub(path.heard_us.load(Ordering::Relaxed));
+            if silent > PATH_SILENCE.as_micros() as u64 {
+                return Err(format!("nothing heard for {:.1} s", silent as f64 / 1e6));
             }
-            if now >= next_ping {
+            let ack_due = {
+                let reliable = self.reliable.lock().unwrap();
+                reliable.heard >= reliable.acknowledged + ACK_AFTER
+            };
+            if now >= next_ping || ack_due {
                 next_ping = now + PING_EVERY;
-                self.send_message(json!({"t": "ping"}));
+                let heard = {
+                    let mut reliable = self.reliable.lock().unwrap();
+                    reliable.acknowledged = reliable.heard;
+                    reliable.heard
+                };
+                self.queue(frame::PING, 0, &heard.to_be_bytes());
                 continue;
             }
-            if self.udp.is_some() && now >= next_udp_ping {
-                let early = self.started.elapsed() < UDP_PROOF;
-                next_udp_ping = now + if self.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
+            if path.udp.is_some() && now >= next_udp_ping {
+                let early = path.started.elapsed() < UDP_PROOF;
+                next_udp_ping = now + if path.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
                 let mut ping = vec![PING];
-                ping.extend_from_slice(&self.us().to_be_bytes());
-                self.send_datagram_now(PATH, &ping, &mut Vec::new());
+                ping.extend_from_slice(&path.us().to_be_bytes());
+                self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
             }
-            let wait = if self.udp.is_some() { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
+            let wait = if path.udp.is_some() { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
             let mut fds = [
                 libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 }, revents: 0 },
                 libc::pollfd { fd: self.wake.fd(), events: libc::POLLIN, revents: 0 },
             ];
-            sys::poll(&mut fds, Some(wait)).map_err(|e| e.to_string())?;
+            sys::poll(&mut fds, Some(wait.min(PING_EVERY))).map_err(|e| e.to_string())?;
             if fds[1].revents != 0 {
                 self.wake.clear();
             }
@@ -561,7 +797,7 @@ impl Session {
                 continue;
             }
             loop {
-                match conn.read_tls(&mut stream) {
+                match conn.read_tls(stream) {
                     Ok(0) => return Err("the other side closed".into()),
                     Ok(_) => {
                         conn.process_new_packets().map_err(|e| e.to_string())?;
@@ -580,19 +816,43 @@ impl Session {
                 }
             }
             while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
-                heard = Instant::now();
-                self.frame(kind, channel, body);
+                path.heard();
+                self.frame(path, kind, channel, body);
             }
         }
     }
 
-    fn frame(self: &Arc<Self>, kind: u8, channel: u16, body: Vec<u8>) {
+    fn frame(self: &Arc<Self>, _path: &Arc<Path>, kind: u8, channel: u16, body: Vec<u8>) {
         match kind {
-            frame::SESSION => match serde_json::from_slice::<Value>(&body) {
-                Ok(message) => self.message(&message),
-                Err(e) => log!("{}: a bad message: {e}", self.label()),
-            },
-            frame::MESSAGE | frame::DATAGRAM => self.deliver(channel, &body, None),
+            frame::SESSION | frame::MESSAGE => {
+                if body.len() < 8 {
+                    return;
+                }
+                let number = u64::from_be_bytes(body[..8].try_into().unwrap());
+                {
+                    let mut reliable = self.reliable.lock().unwrap();
+                    if number <= reliable.heard {
+                        return;  // had it: sent again after a path was lost
+                    }
+                    reliable.heard = number;
+                }
+                if kind == frame::MESSAGE {
+                    self.deliver(channel, &body[8..], None);
+                } else {
+                    match serde_json::from_slice::<Value>(&body[8..]) {
+                        Ok(message) => self.message(&message),
+                        Err(e) => log!("{}: a bad message: {e}", self.label()),
+                    }
+                }
+            }
+            frame::DATAGRAM => self.deliver(channel, &body, None),
+            frame::PING if body.len() >= 8 => {
+                let acknowledged = u64::from_be_bytes(body[..8].try_into().unwrap());
+                let mut reliable = self.reliable.lock().unwrap();
+                while reliable.unacked.front().is_some_and(|(number, _)| *number <= acknowledged) {
+                    reliable.unacked.pop_front();
+                }
+            }
             _ => log!("{}: a frame of kind {kind}", self.label()),
         }
     }
@@ -600,7 +860,6 @@ impl Session {
     fn message(self: &Arc<Self>, message: &Value) {
         let id = message["id"].as_u64().unwrap_or(0) as u16;
         match message["t"].as_str().unwrap_or("") {
-            "ping" => {}
             "open" => self.incoming(message),
             "accept" | "refuse" => {
                 if let Some(waiting) = self.pending.lock().unwrap().remove(&id) {
@@ -613,6 +872,7 @@ impl Session {
                 }
             }
             "close" => self.close_channel(id, false),
+            "bye" => self.end("closed by the other side"),
             "features" => *self.features.lock().unwrap() = message["features"].clone(),
             other => log!("{}: a message of type {other:?}", self.label()),
         }
@@ -620,60 +880,68 @@ impl Session {
 
     // -- the datagrams ---------------------------------------------------------------
 
-    /// Input and realtime: a datagram once UDP is proven, else over the stream.
+    /// Input and realtime: a datagram once UDP is proven, else over the
+    /// stream; no path: lost.
     fn send_datagram(&self, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
         if body.len() > MAX_DATAGRAM {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if self.udp_works() {
-            self.send_datagram_now(channel, body, sealed);
-        } else {
-            self.queue(frame::DATAGRAM, channel, body);
-        }
-    }
-
-    fn send_datagram_now(&self, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
-        let (Some(udp), Some(to)) = (&self.udp, *self.udp_peer.lock().unwrap()) else { return };
-        self.sealer.seal(channel, body, sealed);
-        if let Err(e) = sys::send_to(udp.as_raw_fd(), sealed, &to) {
-            if e.kind() == io::ErrorKind::WouldBlock {
+        match self.current() {
+            Some(path) if path.udp_works() => self.send_datagram_now(&path, channel, body, sealed),
+            Some(_) => self.queue(frame::DATAGRAM, channel, body),
+            None => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
-    fn run_datagrams(self: Arc<Self>, mut opener: Opener) {
-        let Some(udp) = &self.udp else { return };
+    fn send_datagram_now(&self, path: &Path, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
+        let (Some(udp), Some(to)) = (&path.udp, *path.udp_peer.lock().unwrap()) else { return };
+        self.sealer.seal(channel, body, sealed);
+        let mut result = sys::send_to(udp.as_raw_fd(), sealed, &to);
+        // No room: a moment for some (a keyframe's tail), then lost.
+        if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+            && sys::writable(udp.as_raw_fd(), UDP_STALL).unwrap_or(false) {
+            result = sys::send_to(udp.as_raw_fd(), sealed, &to);
+        }
+        if result.is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn run_datagrams(self: Arc<Self>, path: Arc<Path>) {
+        let Some(udp) = &path.udp else { return };
         let mut buf = vec![0u8; 2048];
         let mut sealed = Vec::with_capacity(64);
-        while !self.is_closed() {
+        while !self.is_closed() && !path.gone.load(Ordering::SeqCst) {
             let (length, from) = match udp.recv_from(&mut buf) {
                 Ok(got) => got,
                 Err(_) => continue,  // the timeout: look at closed again
             };
-            let Some((count, channel, body)) = opener.open(&mut buf[..length]) else { continue };
+            let Some((count, channel, body)) = self.opener.lock().unwrap().open(&mut buf[..length])
+                .map(|(count, channel, body)| (count, channel, body.to_vec())) else { continue };
+            path.heard();
             // Where it came from is where the other side is now (its
             // address may change; only a sealed packet can say so).
             {
-                let mut peer = self.udp_peer.lock().unwrap();
+                let mut peer = path.udp_peer.lock().unwrap();
                 if *peer != Some(from) {
                     *peer = Some(from);
                 }
             }
-            if channel != PATH {
-                self.deliver(channel, body, Some(count));
+            if channel != DATAGRAM_PATH {
+                self.deliver(channel, &body, Some(count));
             } else if body.len() == 9 && body[0] == PING {
-                let mut pong = body.to_vec();
+                let mut pong = body.clone();
                 pong[0] = PONG;
-                self.send_datagram_now(PATH, &pong, &mut sealed);
+                self.send_datagram_now(&path, DATAGRAM_PATH, &pong, &mut sealed);
             } else if body.len() == 9 && body[0] == PONG {
                 let sent = u64::from_be_bytes(body[1..9].try_into().unwrap());
-                let now = self.us();
-                self.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
-                self.proven_us.store(now.max(1), Ordering::Relaxed);
+                let now = path.us();
+                path.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
+                path.proven_us.store(now.max(1), Ordering::Relaxed);
             }
         }
     }
 }
-

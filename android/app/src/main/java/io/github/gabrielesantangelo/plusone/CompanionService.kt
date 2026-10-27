@@ -193,7 +193,9 @@ class CompanionService : Service(), LinkServer.Host {
     private fun idleCheck() {
         // PDFs whose PC stopped looking for the tablet.
         for (job in Jobs.expire()) if (job.ownsFile) job.file.delete()
-        if (!Options.alwaysReady(this) && busy.get() == 0 && Jobs.ids.isEmpty() &&
+        // A PC using the link's core (a channel open) is as busy as a link of before.
+        val linkInUse = try { link?.devices()?.any { it.optInt("channels") > 0 } == true } catch (e: Exception) { false }
+        if (!Options.alwaysReady(this) && busy.get() == 0 && !linkInUse && Jobs.ids.isEmpty() &&
             System.currentTimeMillis() - lastUse > IDLE_STOP) {
             stopSelf()
             return

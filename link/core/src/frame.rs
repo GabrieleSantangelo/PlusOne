@@ -3,12 +3,17 @@
 
 use std::io;
 
-/// A message of the session's own (JSON): hello, open, accept, ping...
+/// A message of the session's own (JSON): hello, open, accept, close...
+/// Reliable: its body starts with its number (8 bytes), and it is sent
+/// again on the next path if the one it went on was lost unacknowledged.
 pub const SESSION: u8 = 0;
-/// A control channel's message.
+/// A control channel's message; reliable, numbered as SESSION's.
 pub const MESSAGE: u8 = 1;
 /// An input or realtime channel's packet, while there is no datagram path.
 pub const DATAGRAM: u8 = 2;
+/// The path's own: a ping, with the number of the last reliable frame heard
+/// (8 bytes), which acknowledges it and all before it.
+pub const PING: u8 = 3;
 
 pub const HEADER: usize = 7;
 /// The largest frame: a control message up to this.

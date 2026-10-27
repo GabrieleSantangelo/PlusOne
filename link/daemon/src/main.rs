@@ -53,7 +53,6 @@ const REQUEST: usize = 64 << 10;
 const SERVICE: &str = "_plusone-link._tcp.local";
 /// A session with no channel this long: closed.
 const IDLE: Duration = Duration::from_secs(60);
-const FIND: Duration = Duration::from_secs(4);
 
 struct Daemon {
     node: Node,
@@ -94,7 +93,7 @@ impl Daemon {
                 "connected": session.is_some(),
                 "features": session.map(|s| s.features()).unwrap_or(json!({})),
                 "rtt_ms": session.and_then(|s| s.rtt()).map(|r| r.as_secs_f64() * 1000.0),
-                "path": session.map(|s| s.path.as_str()),
+                "path": session.and_then(|s| s.path()),
                 "dropped": session.map(|s| s.dropped()).unwrap_or(0),
             }));
         }
@@ -134,55 +133,61 @@ impl Daemon {
     /// was last reached and wherever mDNS finds it, at once (the first to
     /// answer wins).
     fn session(&self, device: &str) -> Result<Arc<plusone_link::Session>, String> {
-        if let Some(session) = self.node.session(device) {
+        // One up, or waiting for its next path (what is opened on it waits too).
+        if let Some(session) = self.node.session(device).filter(|s| !s.is_closed()) {
             return Ok(session);
         }
+        self.reach(device)
+    }
+
+    /// The tablet, reached anew: where it was last reached, else wherever
+    /// mDNS finds it (looked for meanwhile, connected to only if the first
+    /// failed: never two at once). A session it has with us goes on there.
+    fn reach(&self, device: &str) -> Result<Arc<plusone_link::Session>, String> {
         if !paired(&self.config).contains_key(device) {
             return Err("not a paired tablet".into());
         }
         let _one_at_a_time = self.finding.lock().unwrap();
-        if let Some(session) = self.node.session(device) {
-            return Ok(session);  // made while this waited
+        if let Some(session) = self.node.session(device).filter(|s| !s.is_closed() && s.path().is_some()) {
+            return Ok(session);  // reached while this waited
         }
-        let (found, first) = std::sync::mpsc::channel();
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Some(address) = self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok()) {
-            let (node, found) = (self.node.clone(), found.clone());
-            std::thread::spawn(move || {
-                let _ = found.send(node.connect(address, Duration::from_millis(1500)).map(|s| (s, address)));
-            });
-        }
-        {
-            let (node, found, done, id) = (self.node.clone(), found.clone(), done.clone(), device.to_owned());
-            std::thread::spawn(move || {
-                let mine = |f: &plusone_link::mdns::Found| f.txt.get("id").is_some_and(|i| i.len() >= 8 && id.starts_with(i.as_str()));
-                let result = plusone_link::mdns::browse(SERVICE, Duration::from_secs(3), mine)
-                    .map_err(|e| e.to_string())
-                    .and_then(|all| all.into_iter().find(|f| mine(f)).ok_or_else(|| "not found nearby".to_owned()))
-                    .and_then(|f| {
-                        if done.load(Ordering::SeqCst) {
-                            return Err("reached already".into());
-                        }
-                        node.connect(f.address, Duration::from_secs(2)).map(|s| (s, f.address))
-                    });
-                let _ = found.send(result);
-            });
-        }
-        drop(found);
+        let id = device.to_owned();
+        let looking = std::thread::spawn(move || {
+            let mine = |f: &plusone_link::mdns::Found| f.txt.get("id").is_some_and(|i| i.len() >= 8 && id.starts_with(i.as_str()));
+            plusone_link::mdns::browse(SERVICE, Duration::from_secs(3), mine).map_err(|e| e.to_string())
+                .and_then(|all| all.into_iter().find(|f| mine(f)).map(|f| f.address).ok_or_else(|| "not found nearby".to_owned()))
+        });
         let mut why = Vec::new();
-        let until = std::time::Instant::now() + FIND;
-        while let Ok(result) = first.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
-            match result {
-                Ok((session, address)) if session.peer == device => {
-                    done.store(true, Ordering::SeqCst);
-                    self.reached(device, address);
+        let remembered: Option<std::net::SocketAddr> =
+            self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok());
+        let attempt = |address: std::net::SocketAddr, why: &mut Vec<String>| match self.node.connect(address, Duration::from_millis(1500)) {
+            Ok(session) if session.peer == device => {
+                self.reached(device, address);
+                Some(session)
+            }
+            Ok(session) => {
+                why.push(format!("{} answered at {address}", &session.peer[..8]));
+                None
+            }
+            Err(e) => {
+                why.push(e);
+                None
+            }
+        };
+        if let Some(session) = remembered.and_then(|address| attempt(address, &mut why)) {
+            return Ok(session);
+        }
+        match looking.join() {
+            Ok(Ok(address)) if Some(address) != remembered => {
+                if let Some(session) = attempt(address, &mut why) {
                     return Ok(session);
                 }
-                Ok((session, _)) => why.push(format!("{} answered there", &session.peer[..8])),
-                Err(e) => why.push(e),
             }
+            Ok(Ok(_)) => {}  // where the first try was
+            Ok(Err(e)) => why.push(e),
+            Err(_) => why.push("mDNS failed".into()),
         }
-        Err(if why.is_empty() { "not reached in time".into() } else { why.join("; ") })
+        Err(if why.is_empty() { "not reached".into() } else { why.join("; ") })
     }
 
     fn browse(&self, request: &Value) -> Result<Value, String> {
@@ -204,9 +209,17 @@ impl Daemon {
                 if let Some(serial) = me.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
                     me.remember_usb(&serial);
                 }
-                // Until it is over: then the cable may carry the next.
+                // While it runs on the cable (it may take a moment to move
+                // over): then the cable may carry the next.
+                let since = std::time::Instant::now();
+                let mut on_it = false;
                 while !session.is_closed() {
-                    std::thread::sleep(Duration::from_millis(500));
+                    if session.path().as_deref() == Some("usb") {
+                        on_it = true;
+                    } else if on_it || since.elapsed() > Duration::from_secs(5) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
                 }
                 Ok(session.peer.clone())
             });
@@ -253,11 +266,13 @@ impl Daemon {
         loop {
             std::thread::sleep(IDLE / 4);
             let now = std::time::Instant::now();
+            // Forgotten by the user meanwhile: over now.
+            self.node.check_paired();
             let sessions = self.node.sessions();
             idle.retain(|peer, _| sessions.iter().any(|s| &s.peer == peer));
             for session in sessions {
                 // By cable: kept (the tablet charges; its Wi-Fi is not woken).
-                if session.channels() > 0 || session.path == "usb" {
+                if session.channels() > 0 || session.path().as_deref() == Some("usb") {
                     idle.remove(&session.peer);
                 } else if now.duration_since(*idle.entry(session.peer.clone()).or_insert(now)) >= IDLE {
                     log!("{}: idle, closed", session.name);
@@ -291,13 +306,35 @@ impl Daemon {
         Ok(feature)
     }
 
-    fn event(&self, event: Event) {
+    fn event(self: &Arc<Self>, event: Event) {
         let message = match event {
             Event::Up(session) => json!({"event": "up", "device": session.peer, "name": session.name,
-                                         "features": session.features()}),
+                                         "features": session.features(), "path": session.path()}),
+            Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path()}),
+            Event::Detached(session) => {
+                self.come_back(session.clone());
+                json!({"event": "detached", "device": session.peer})
+            }
             Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),
         };
-        self.watchers.lock().unwrap().retain(|watcher| api::send(watcher.as_raw_fd(), &message, None).is_ok());
+        // Never waiting on an app: one that does not read loses its events.
+        self.watchers.lock().unwrap().retain(|watcher| api::send_now(watcher.as_raw_fd(), &message).is_ok());
+    }
+
+    /// A session's path lost: another made at once, the network's (the
+    /// cable's, if it is plugged in, comes by itself: usb.rs), until it
+    /// is on again or over.
+    fn come_back(self: &Arc<Self>, session: Arc<plusone_link::Session>) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("link-come-back".into()).spawn(move || {
+            while !session.is_closed() && session.path().is_none() {
+                match me.reach(&session.peer) {
+                    Ok(_) => return,
+                    Err(e) => log!("{}: not reached yet ({e})", session.name),
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
     }
 
     /// One app's connection: its requests, until it goes.

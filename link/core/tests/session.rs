@@ -183,15 +183,71 @@ fn the_tablet_hears_the_pc_go() {
 }
 
 #[test]
-fn a_new_session_replaces_the_one_before() {
+fn a_second_connection_goes_on_with_the_session() {
     let (pc, tablet, address) = pair();
     let first = pc.connect(address, Duration::from_secs(2)).unwrap();
     std::thread::sleep(Duration::from_millis(100));
     let second = pc.connect(address, Duration::from_secs(2)).unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    assert!(first.is_closed());
-    assert!(!second.is_closed());
+    assert!(Arc::ptr_eq(&first, &second), "the same session");
+    assert!(!first.is_closed());
     assert_eq!(tablet.sessions().len(), 1);
+}
+
+fn until(what: &str, done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(8), "{what}: not in time");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_session_goes_on_over_another_path() {
+    let (pc, tablet, address) = pair();
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let cable = a.try_clone().unwrap();
+    let accepter = tablet.clone();
+    let accepting = std::thread::spawn(move || accepter.accept_stream(Box::new(b), "usb").map(|s| s.id.clone()));
+    let session = pc.connect_stream(Box::new(a), "usb").unwrap();
+    assert_eq!(accepting.join().unwrap().unwrap(), session.id);
+    assert_eq!(session.path().as_deref(), Some("usb"));
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let video = session.open("echo", "v", Class::Realtime).unwrap();
+    let mut buf = vec![0u8; 4096];
+    control.send(b"by cable").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(8));
+
+    // The cable pulled: the session waits; what is said meanwhile waits too.
+    cable.shutdown(std::net::Shutdown::Both).unwrap();
+    until("the path lost", || session.path().is_none());
+    control.send(b"while away").unwrap();
+    let again = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
+    until("on the network", || session.path().as_deref() == Some("lan"));
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(10));
+    assert_eq!(&buf[..10], b"while away");
+    video.send(&[7u8; 1000]).unwrap();
+    assert_eq!(video.recv(&mut buf, WAIT).unwrap(), Some(1000));
+    assert!(!session.is_closed());
+    assert_eq!(tablet.sessions().len(), 1);
+}
+
+#[test]
+fn a_better_path_takes_over() {
+    let (pc, tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert_eq!(session.path().as_deref(), Some("lan"));
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let accepter = tablet.clone();
+    std::thread::spawn(move || accepter.accept_stream(Box::new(b), "usb").map(|_| ()));
+    let by_cable = pc.connect_stream(Box::new(a), "usb").unwrap();
+    assert!(Arc::ptr_eq(&by_cable, &session));
+    until("on the cable", || session.path().as_deref() == Some("usb"));
+    let mut buf = vec![0u8; 64];
+    control.send(b"moved").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
 }
 
 #[test]
@@ -225,10 +281,10 @@ fn a_session_on_a_stream_with_no_ip_carries_everything() {
     let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
     let accepter = tablet.clone();
-    let accepting = std::thread::spawn(move || accepter.accept_stream(Box::new(b), "usb").map(|s| s.path.clone()));
+    let accepting = std::thread::spawn(move || accepter.accept_stream(Box::new(b), "usb").map(|s| s.path()));
     let session = pc.connect_stream(Box::new(a), "usb").unwrap();
-    assert_eq!(accepting.join().unwrap().unwrap(), "usb");
-    assert_eq!(session.path, "usb");
+    assert_eq!(accepting.join().unwrap().unwrap().as_deref(), Some("usb"));
+    assert_eq!(session.path().as_deref(), Some("usb"));
     let control = session.open("echo", "c", Class::Control).unwrap();
     let video = session.open("echo", "v", Class::Realtime).unwrap();
     let mut buf = vec![0u8; 1 << 20];

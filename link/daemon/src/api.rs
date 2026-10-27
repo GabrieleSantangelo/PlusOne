@@ -69,6 +69,14 @@ pub fn receive(client: RawFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
     Ok(Some(length))
 }
 
+/// One message to an app, never waiting for room (an event: an app that
+/// does not read loses it).
+pub fn send_now(client: RawFd, message: &serde_json::Value) -> io::Result<()> {
+    let bytes = message.to_string().into_bytes();
+    let sent = unsafe { libc::send(client, bytes.as_ptr() as *const libc::c_void, bytes.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    if sent < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
 /// One message to an app, with a descriptor if there is one (ours closes
 /// once sent: the app has its own).
 pub fn send(client: RawFd, message: &serde_json::Value, fd: Option<OwnedFd>) -> io::Result<()> {

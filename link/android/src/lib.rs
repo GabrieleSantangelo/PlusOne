@@ -94,7 +94,8 @@ impl Signer for Keystore {
 // -- requests ---------------------------------------------------------------------------
 
 fn session_json(session: &plusone_link::Session) -> Value {
-    json!({"id": session.peer, "name": session.name, "features": session.features(), "path": session.path,
+    json!({"id": session.peer, "name": session.name, "features": session.features(), "path": session.path(),
+           "channels": session.channels(),
            "rtt_ms": session.rtt().map(|r| r.as_secs_f64() * 1000.0), "dropped": session.dropped()})
 }
 
@@ -127,9 +128,9 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
                 std::thread::spawn(move || {
                     let step = std::time::Duration::from_millis(50);
                     loop {
-                        if writer.write_all(&ready).is_err() {
-                            return;
-                        }
+                        // Not written (the cable out for a moment, the PC
+                        // switching it back): again, as long as nobody answered.
+                        let _ = writer.write_all(&ready);
                         let mut waited = std::time::Duration::ZERO;
                         while waited < plusone_link::stream::USB_AGAIN {
                             if answered.load(std::sync::atomic::Ordering::SeqCst) {
@@ -236,6 +237,8 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
                 message["device"] = json!(session.peer);
                 message
             }
+            Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path()}),
+            Event::Detached(session) => json!({"event": "detached", "device": session.peer}),
             Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),
         };
         let _ = on_event.lock().unwrap().send(message);
@@ -257,6 +260,8 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
         }
     }
     *core.paired.write().unwrap() = paired;
+    // Forgotten by the user: its sessions over at once.
+    core.node.check_paired();
 }
 
 #[no_mangle]
