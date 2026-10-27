@@ -71,6 +71,7 @@ pub fn bridge(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'sta
               mut write: impl FnMut(&[u8]) -> io::Result<()> + Send + 'static, chunk: usize)
               -> io::Result<UnixStream> {
     let (ours, theirs) = UnixStream::pair()?;
+    little_room(&theirs);
     let (mut inbound, mut outbound) = (ours.try_clone()?, ours);
     // Either side over: both are (the device's reads only time out, and a
     // socket pair's end cannot be seen from the side that only writes).
@@ -116,6 +117,26 @@ pub fn bridge(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'sta
         let _ = outbound.shutdown(Shutdown::Both);
     })?;
     Ok(theirs)
+}
+
+/// The system's room for what the session writes to a stream it does not
+/// own the far end of (a bridge to the cable): no more than this waits in
+/// the kernel, where nothing can go ahead of it (the session's urgent
+/// frames go ahead in its own queue). The kernel doubles it.
+pub const KERNEL_ROOM: libc::c_int = 8 << 10;
+
+/// The session's end of a bridge: KERNEL_ROOM.
+pub fn little_room(session_end: &impl std::os::fd::AsRawFd) {
+    crate::sys::set_int(session_end.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, KERNEL_ROOM);
+}
+
+/// A TCP path: no Nagle, and no more than KERNEL_ROOM not yet sent waits
+/// in the kernel (TCP_NOTSENT_LOWAT; what is sent and not yet
+/// acknowledged is the network's, as it has to be).
+pub fn tune_tcp(tcp: &std::net::TcpStream) {
+    let _ = tcp.set_nodelay(true);
+    const TCP_NOTSENT_LOWAT: libc::c_int = 25;  // linux/tcp.h (Android's too)
+    crate::sys::set_int(std::os::fd::AsRawFd::as_raw_fd(tcp), libc::IPPROTO_TCP, TCP_NOTSENT_LOWAT, KERNEL_ROOM);
 }
 
 /// On a USB accessory, before the session: the app says it is there (this

@@ -108,6 +108,7 @@ fn cable(node: Node, file: std::fs::File, kind: &str) {
             return;
         }
         let Ok((ours, theirs)) = UnixStream::pair() else { return };
+        plusone_link::stream::little_room(&theirs);
         let Ok(inward) = ours.try_clone() else { return };
         {
             // What came after GO (the PC's first TLS bytes) first, then the rest directly.
@@ -122,8 +123,9 @@ fn cable(node: Node, file: std::fs::File, kind: &str) {
             let (writer, sink) = (writer.clone(), sink.clone());
             let mut ours = ours;
             std::thread::Builder::new().name("link-cable-out".into()).spawn(move || {
-                // A byte short of the accessory's transfer: a full one goes as one (usb_pieces).
-                let mut buf = vec![0u8; (16 << 10) - 1];
+                // Four of the accessory's transfers at once (it queues them), a
+                // byte short: a full read goes as one transfer (usb_pieces).
+                let mut buf = vec![0u8; (64 << 10) - 1];
                 loop {
                     let n = match ours.read(&mut buf) {
                         Ok(0) | Err(_) => break,

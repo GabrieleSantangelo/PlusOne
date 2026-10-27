@@ -19,6 +19,13 @@
   seconds apart (16 MB in a minute); now 16 MB take a second, both ways
   at about 18 MB/s each. What was queued while the cable was full waited
   for the next keepalive instead of going as soon as there was room.
+  Both ways at once the cable carries about 37 MB/s, near what USB 2.0
+  gives.
+- **The desktop, the sound and the pen go ahead of a big transfer**: with
+  a PDF or the app going over the cable, a realtime packet went and came
+  back in 28 ms; now in 9 ms (3 ms with the cable idle). The link sends
+  them ahead of what waits, hands the rest to TLS a little at a time, and
+  keeps the system's own queues short (on Wi-Fi's TCP too).
 - **A big transfer never chokes the cable**: plus-one-link feeds a PDF or
   the app to the link only as fast as it goes, so the desktop and the sound
   sharing the cable go on meanwhile.

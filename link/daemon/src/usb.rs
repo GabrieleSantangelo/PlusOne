@@ -29,7 +29,11 @@ const START: u8 = 53;
 /// What the app's accessory filter matches (res/xml/accessory_filter.xml).
 const STRINGS: [&str; 6] = ["Plus One", "Plus One", "The tablet as the PC's second screen", "1",
                             "https://github.com/GabrieleSantangelo/PlusOne", ""];
-const CHUNK: usize = 16 << 10;  // the accessory's own transfers (f_accessory's BULK_BUFFER_SIZE)
+/// A transfer each way: four of the accessory's own (f_accessory's
+/// BULK_BUFFER_SIZE, 16 KiB), which it takes one after the other, so a
+/// quarter of the calls for the same bytes (a call costs about as much as
+/// a 16 KiB transfer).
+const CHUNK: usize = 64 << 10;
 const USBDEVFS_CONTROL: libc::c_ulong = 0xC018_5500;
 const USBDEVFS_BULK: libc::c_ulong = 0xC018_5502;
 const USBDEVFS_CLAIMINTERFACE: libc::c_ulong = 0x8004_550F;

@@ -224,7 +224,7 @@ impl Node {
                 // Each on its own: a slow or hostile one holds up no other.
                 let _ = std::thread::Builder::new().name("link-accept".into()).spawn(move || {
                     let from = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                    let _ = tcp.set_nodelay(true);
+                    crate::stream::tune_tcp(&tcp);
                     let done = Arc::new(AtomicBool::new(false));
                     if let Ok(watched) = tcp.try_clone() {
                         let done = done.clone();
@@ -283,7 +283,7 @@ impl Node {
     /// at address.
     pub fn connect(&self, address: SocketAddr, timeout: Duration) -> Result<Arc<Session>, String> {
         let tcp = TcpStream::connect_timeout(&address, timeout).map_err(|e| format!("{address}: {e}"))?;
-        tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+        crate::stream::tune_tcp(&tcp);
         self.connect_stream(Box::new(tcp), "lan").map_err(|e| format!("{address}: {e}"))
     }
 }

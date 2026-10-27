@@ -56,8 +56,11 @@ const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// An input or realtime message's largest size: with the seal (30 bytes),
 /// UDP and IPv6 (48), a datagram of 1500 bytes, which any network carries.
 pub const MAX_DATAGRAM: usize = 1422;
-/// Realtime over the stream: dropped while this much waits to be sent.
+/// Realtime over the stream: dropped while this much urgent waits to be sent.
 const STREAM_BUDGET: usize = 256 << 10;
+/// Reliable frames handed to TLS at a time: an urgent frame (input,
+/// realtime, a ping) queued meanwhile waits behind no more than this.
+const WRITE_SLICE: usize = 16 << 10;
 /// Room in the UDP socket, each way: a keyframe's packets at once.
 const UDP_BUFFER: libc::c_int = 4 << 20;
 /// Room in a channel's socket, each way (the system caps it: a control
@@ -153,6 +156,48 @@ struct End {
     newest: AtomicU64,
 }
 
+/// What waits to go on the stream, in two queues: the urgent (input and
+/// realtime frames, pings) never wait behind the reliable (control
+/// messages, a big transfer's), which go to TLS frame by frame, a slice at
+/// a time; between two slices the urgent go first.
+#[derive(Default)]
+struct Outbox {
+    urgent: Vec<u8>,
+    reliable: VecDeque<Vec<u8>>,
+    reliable_bytes: usize,
+}
+
+impl Outbox {
+    fn len(&self) -> usize {
+        self.urgent.len() + self.reliable_bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn push_reliable(&mut self, frame: Vec<u8>) {
+        self.reliable_bytes += frame.len();
+        self.reliable.push_back(frame);
+    }
+
+    fn clear(&mut self) {
+        *self = Outbox::default();
+    }
+
+    /// The next for TLS: every urgent frame, then whole reliable frames
+    /// up to WRITE_SLICE.
+    fn take(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.urgent);
+        while out.len() < WRITE_SLICE {
+            let Some(frame) = self.reliable.pop_front() else { break };
+            self.reliable_bytes -= frame.len();
+            out.extend_from_slice(&frame);
+        }
+        out
+    }
+}
+
 /// The reliable frames: ours numbered, kept until acknowledged; the
 /// other side's newest taken.
 #[derive(Default)]
@@ -205,7 +250,7 @@ pub struct Session {
     channels: Mutex<HashMap<u16, Arc<End>>>,
     pending: Mutex<HashMap<u16, mpsc::Sender<Result<(), String>>>>,
     next_id: AtomicU16,
-    outbox: Mutex<Vec<u8>>,
+    outbox: Mutex<Outbox>,
     reliable: Mutex<Reliable>,
     wake: Wake,
     path: Mutex<Option<Arc<Path>>>,
@@ -656,7 +701,7 @@ impl Session {
             frame::encode(kind, channel, &numbered, &mut bytes);
             reliable.unacked.push_back((number, bytes.clone()));
             // In the queue under the same lock: in the order of their numbers.
-            self.outbox.lock().unwrap().extend_from_slice(&bytes);
+            self.outbox.lock().unwrap().push_reliable(bytes);
         }
         self.wake.wake();
     }
@@ -664,11 +709,11 @@ impl Session {
     fn queue(&self, kind: u8, channel: u16, body: &[u8]) {
         {
             let mut outbox = self.outbox.lock().unwrap();
-            if kind == frame::DATAGRAM && outbox.len() > STREAM_BUDGET {
+            if kind == frame::DATAGRAM && outbox.urgent.len() > STREAM_BUDGET {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            frame::encode(kind, channel, body, &mut outbox);
+            frame::encode(kind, channel, body, &mut outbox.urgent);
         }
         self.wake.wake();
     }
@@ -735,7 +780,7 @@ impl Session {
             let mut outbox = self.outbox.lock().unwrap();
             outbox.clear();
             for (_, bytes) in &reliable.unacked {
-                outbox.extend_from_slice(bytes);
+                outbox.push_reliable(bytes.clone());
             }
         }
         *self.path.lock().unwrap() = Some(path.clone());
@@ -771,10 +816,10 @@ impl Session {
             if self.arriving.lock().unwrap().is_some() {
                 return Ok(());  // a better path: the session's thread takes it
             }
-            // Out: what was queued, once the last of it left (the queue's
-            // length is what realtime's budget looks at).
+            // Out: what was queued, once the last of it left: the urgent
+            // first, then a slice of the reliable (Outbox::take).
             if !conn.wants_write() {
-                let out = std::mem::take(&mut *self.outbox.lock().unwrap());
+                let out = self.outbox.lock().unwrap().take();
                 if !out.is_empty() {
                     conn.writer().write_all(&out).map_err(|e| e.to_string())?;
                 }

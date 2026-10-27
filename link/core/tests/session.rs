@@ -270,6 +270,71 @@ fn a_transfer_one_way_on_a_stream_goes_as_fast_as_the_stream() {
 }
 
 #[test]
+fn realtime_goes_ahead_of_a_big_transfer_on_a_stream() {
+    // A cable of about 20 MB/s one way (the PC's writes), a big transfer
+    // on it: realtime and input go ahead of it, not behind its queue.
+    let (pc, tablet, _address) = pair();
+    tablet.serve("sink", 1, |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    let (cable, far) = std::os::unix::net::UnixStream::pair().unwrap();
+    cable.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let (mut reading, mut writing) = (cable.try_clone().unwrap(), cable);
+    let pcs_end = plusone_link::stream::bridge(
+        move |buf| {
+            use std::io::Read;
+            reading.read(buf).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock {
+                std::io::Error::from(std::io::ErrorKind::TimedOut)
+            } else { e })
+        },
+        move |data| {
+            use std::io::Write;
+            std::thread::sleep(Duration::from_micros(data.len() as u64 / 20));  // 20 MB/s
+            writing.write_all(data)
+        },
+        64 << 10).unwrap();
+    let accepter = tablet.clone();
+    std::thread::spawn(move || accepter.accept_stream(Box::new(far), "usb").map(|_| ()));
+    let session = pc.connect_stream(Box::new(pcs_end), "usb").unwrap();
+    let bulk = session.open("sink", "control", Class::Control).unwrap();
+    let realtime = session.open("echo", "rt", Class::Realtime).unwrap();
+    let sending = std::thread::spawn(move || {
+        let chunk = vec![7u8; 64 << 10];
+        for _ in 0..256 {
+            if bulk.send(&chunk).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(200));  // the transfer under way
+    let mut rtts = Vec::new();
+    let mut buf = vec![0u8; 2048];
+    for i in 0..60u32 {
+        let started = Instant::now();
+        let mut packet = vec![0u8; 1000];
+        packet[..4].copy_from_slice(&i.to_be_bytes());
+        realtime.send(&packet).unwrap();
+        while let Ok(Some(n)) = realtime.recv(&mut buf, Some(Duration::from_millis(500))) {
+            if n >= 4 && buf[..4] == i.to_be_bytes() {
+                rtts.push(started.elapsed());
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    sending.join().unwrap();
+    rtts.sort();
+    assert!(rtts.len() >= 50, "{} of 60 came back", rtts.len());
+    let p90 = rtts[rtts.len() * 9 / 10];
+    assert!(p90 < Duration::from_millis(10), "realtime behind the transfer: p90 {p90:?}");
+}
+
+#[test]
 fn a_session_goes_on_over_another_path() {
     let (pc, tablet, address) = pair();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
