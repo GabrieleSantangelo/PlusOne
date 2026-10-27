@@ -31,6 +31,16 @@
   arrives waits in a queue of its own until the feature takes it; before,
   a feature that did not read for a second had its channel closed, and
   the whole link waited that second.
+- **On Wi-Fi, a big transfer gives way to the desktop and the sound**:
+  the access point's queue (a phone's hotspot's) is not ours to reorder,
+  so while realtime goes the link watches the delay its pings see and
+  slows the transfer down when the network starts queueing (as LEDBAT
+  does). With a transfer both ways at full speed, realtime went from
+  41-57 ms to 12-14 ms (9 ms idle); the transfer then goes at about
+  4 MB/s, and at full speed again as soon as nothing realtime goes.
+- **A paused video no longer keeps the tablet's speakers on**: a stream
+  paused (still open, linked) is no program playing; the speakers stop
+  after their 3 s, and start again when it plays.
 - **On Wi-Fi, the desktop and the sound marked as video** (DSCP AF41, WMM's
   video queue): ahead of bulk traffic on the air.
 - **A big transfer never chokes the cable**: plus-one-link feeds a PDF or

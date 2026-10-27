@@ -484,3 +484,20 @@ def test_pw_dump_s_arrays_after_the_first_are_what_changed():
     objects = devices.pw_objects(first + "\n" + then + "\n")
     assert sorted(o["id"] for o in objects) == [1, 3]
     assert devices.pw_objects("") == []
+
+
+def test_a_paused_stream_is_no_program_playing():
+    # A video paused in a tab still open: its stream stays linked, "idle".
+    objects = [
+        {"id": 40, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": devices.SPEAKERS_NAME}}},
+        {"id": 41, "type": "PipeWire:Interface:Node",
+         "info": {"state": "idle", "props": {"application.name": "Firefox"}}},
+        {"id": 44, "type": "PipeWire:Interface:Node",
+         "info": {"state": "running", "props": {"application.name": "Chrome"}}},
+        {"type": "PipeWire:Interface:Link", "info": {"output-node-id": 41, "input-node-id": 40}},
+        {"type": "PipeWire:Interface:Link", "info": {"output-node-id": 44, "input-node-id": 40}},
+    ]
+    assert devices.players(objects) == ["Chrome"]
+    objects[3]["info"]["output-node-id"] = 41  # only Firefox, paused
+    objects[4]["info"]["output-node-id"] = 41
+    assert devices.players(objects) == []

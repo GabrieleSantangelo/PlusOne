@@ -10,6 +10,7 @@ pub mod frame;
 pub mod identity;
 pub mod mdns;
 pub mod node;
+pub mod pace;
 pub mod seal;
 pub mod session;
 pub mod stream;

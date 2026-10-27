@@ -588,12 +588,16 @@ class AudioDevice(Device):
     NAME = CLASS = DESCRIPTION = None
     CHANNELS = ("1", "mono")
     NEEDS = "webrtc"  # what else it needs: WebRTC for GStreamer, or python3-cryptography
+    # Programs' streams that pause and play again while linked to it (a
+    # paused video): watched (pactl subscribe), so a paused one stops using it.
+    WATCH_PAUSES = False
 
     def __init__(self, app, kind):
         super().__init__(app, kind)
         self.module = None
         self.links = set()
         self.watch = None
+        self.pauses = None  # pactl subscribe, when WATCH_PAUSES
         self._asked = 0  # the last look at who uses it (pw-dump), its number
 
     def enable(self):
@@ -633,6 +637,9 @@ class AudioDevice(Device):
         if self.watch:
             self.watch.force_exit()
             self.watch = None
+        if self.pauses:
+            self.pauses.force_exit()
+            self.pauses = None
         if self.module:
             try:
                 subprocess.run(["pactl", "unload-module", self.module], capture_output=True, timeout=5)
@@ -659,6 +666,28 @@ class AudioDevice(Device):
                                         Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
         self._lines = Gio.DataInputStream.new(self.watch.get_stdout_pipe())
         self._lines.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line, self.watch)
+        if self.WATCH_PAUSES:
+            # Events only (nothing polled): a stream made, changed (paused,
+            # played again) or gone; who uses it is looked at again then.
+            try:
+                self.pauses = Gio.Subprocess.new(["pactl", "subscribe"],
+                                                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+            except GLib.Error as e:
+                log(f"{self.kind}: pauses not watched:", e.message)
+                return
+            events = Gio.DataInputStream.new(self.pauses.get_stdout_pipe())
+            events.read_line_async(GLib.PRIORITY_DEFAULT, None, self._event, self.pauses)
+
+    def _event(self, stream, result, pauses):
+        try:
+            line, _length = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            line = None
+        if line is None or pauses is not self.pauses:
+            return  # switched off, or PipeWire went (the links' watch handles that)
+        if "sink-input" in line and self.links:
+            self._who_records()
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._event, pauses)
 
     def _line(self, stream, result, watch):
         try:
@@ -822,6 +851,7 @@ class Speakers(AudioDevice):
     NAME, CLASS, DESCRIPTION = SPEAKERS_NAME, "Audio/Sink", "Tablet speakers (Plus One)"
     CHANNELS = ("2", "front-left,front-right")
     NEEDS = "cryptography"
+    WATCH_PAUSES = True
 
     def __init__(self, app):
         super().__init__(app, "speakers")
@@ -870,15 +900,21 @@ def pw_objects(text):
 
 def players(objects):
     """The programs whose streams play into the speakers' sink, in pw-dump's
-    objects (links to it), by name; one entry per stream."""
-    nodes = {o.get("id"): (o.get("info") or {}).get("props") or {}
-             for o in objects if o.get("type") == "PipeWire:Interface:Node"}
-    sink = {id for id, props in nodes.items() if props.get("node.name") == SPEAKERS_NAME}
+    objects (links to it), by name; one entry per stream. A stream linked
+    but paused (a video paused, its tab still open: node state "idle") is
+    no program playing: the tablet need not stay awake for it. The sink
+    drives itself (node.driver), so a stream playing runs whether the
+    tablet takes its sound yet or not."""
+    nodes = {o.get("id"): o.get("info") or {} for o in objects if o.get("type") == "PipeWire:Interface:Node"}
+    sink = {id for id, info in nodes.items() if (info.get("props") or {}).get("node.name") == SPEAKERS_NAME}
     found = []
     for o in objects:
         info = o.get("info") or {}
         if o.get("type") == "PipeWire:Interface:Link" and info.get("input-node-id") in sink:
-            props = nodes.get(info.get("output-node-id"), {})
+            node = nodes.get(info.get("output-node-id"), {})
+            if node.get("state", "running") != "running":
+                continue
+            props = node.get("props") or {}
             found.append(str(props.get("application.name") or props.get("node.name") or "?"))
     return found
 

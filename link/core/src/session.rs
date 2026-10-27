@@ -86,6 +86,11 @@ const GRANT_EVERY: u64 = 64 << 10;
 /// the stream goes, never ahead of it, so what shares the stream (the
 /// cable's realtime packets, under STREAM_BUDGET) never waits behind more.
 const CONTROL_BACKLOG: usize = 128 << 10;
+/// Realtime counts as going this long after its last datagram (pace.rs).
+const REALTIME_GOING: Duration = Duration::from_millis(500);
+/// The path's pings this often while realtime and bulk go together
+/// (pace.rs's samples), not each PING_EVERY.
+const PROBE_BUSY: Duration = Duration::from_millis(40);
 /// How often a control message waiting for room looks again: only while
 /// a transfer is ahead of the path.
 const ROOM_POLL: Duration = Duration::from_millis(2);
@@ -214,15 +219,17 @@ impl Outbox {
     }
 
     /// The next for TLS: every urgent frame, then whole reliable frames
-    /// up to WRITE_SLICE.
-    fn take(&mut self) -> Vec<u8> {
+    /// up to reliable bytes (0: none now); and how many of those.
+    fn take(&mut self, reliable: usize) -> (Vec<u8>, usize) {
         let mut out = std::mem::take(&mut self.urgent);
-        while out.len() < WRITE_SLICE {
+        let urgent = out.len();
+        while out.len() - urgent < reliable {
             let Some(frame) = self.reliable.pop_front() else { break };
             self.reliable_bytes -= frame.len();
             out.extend_from_slice(&frame);
         }
-        out
+        let taken = out.len() - urgent;
+        (out, taken)
     }
 }
 
@@ -246,6 +253,7 @@ struct Path {
     heard_us: AtomicU64,   // since started: the stream's last frame, or an authenticated datagram
     proven_us: AtomicU64,  // a pong's (0: none yet)
     rtt_us: AtomicU64,
+    realtime_us: AtomicU64,  // since started: the last realtime or input datagram sent (0: none)
     gone: AtomicBool,
 }
 
@@ -256,6 +264,12 @@ impl Path {
 
     fn heard(&self) {
         self.heard_us.store(self.us().max(1), Ordering::Relaxed);
+    }
+
+    /// Realtime or input went on it within the last REALTIME_GOING.
+    fn realtime_going(&self) -> bool {
+        let last = self.realtime_us.load(Ordering::Relaxed);
+        last != 0 && self.us().saturating_sub(last) < REALTIME_GOING.as_micros() as u64
     }
 
     fn udp_works(&self) -> bool {
@@ -280,6 +294,8 @@ pub struct Session {
     next_id: AtomicU16,
     /// The other side has flow control on control channels (WINDOW).
     flow: bool,
+    /// The reliable frames' pace on the current path (pace.rs).
+    pace: Mutex<crate::pace::Pace>,
     outbox: Mutex<Outbox>,
     reliable: Mutex<Reliable>,
     wake: Wake,
@@ -416,7 +432,8 @@ fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
     }
     Ok(Arc::new(Path { kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
                        udp_peer: Mutex::new(established.udp_peer), started: Instant::now(), heard_us: AtomicU64::new(1),
-                       proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), gone: AtomicBool::new(false) }))
+                       proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
+                       gone: AtomicBool::new(false) }))
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
@@ -459,6 +476,7 @@ impl Session {
             // Ours odd if we connected, even if we listened: never the same.
             next_id: AtomicU16::new(if established.dialer { 1 } else { 2 }),
             flow: hello["flow"].as_u64() == Some(1),
+            pace: Mutex::new(crate::pace::Pace::new(Instant::now())),
             outbox: Mutex::default(),
             reliable: Mutex::new(Reliable { next: 1, ..Default::default() }),
             wake: Wake::new()?,
@@ -883,6 +901,7 @@ impl Session {
             }
         }
         *self.path.lock().unwrap() = Some(path.clone());
+        *self.pace.lock().unwrap() = crate::pace::Pace::new(Instant::now());
         if resumed {
             if let Some(node) = self.node.upgrade() {
                 node.moved(self);
@@ -917,8 +936,16 @@ impl Session {
             }
             // Out: what was queued, once the last of it left: the urgent
             // first, then a slice of the reliable (Outbox::take).
+            let mut paced = None;
             if !conn.wants_write() {
-                let out = self.outbox.lock().unwrap().take();
+                let reliable = {
+                    let mut pace = self.pace.lock().unwrap();
+                    if pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
+                };
+                let (out, taken) = self.outbox.lock().unwrap().take(reliable);
+                let mut pace = self.pace.lock().unwrap();
+                pace.spent(taken);
+                paced = pace.wait();
                 if !out.is_empty() {
                     conn.writer().write_all(&out).map_err(|e| e.to_string())?;
                 }
@@ -937,7 +964,10 @@ impl Session {
             // All out, and more queued meanwhile (its wake taken already, while
             // the stream was full): round again at once, after a look at what
             // came, not at the next ping (a transfer went a burst a second).
-            let more = !blocked && !self.outbox.lock().unwrap().is_empty();
+            let more = !blocked && {
+                let outbox = self.outbox.lock().unwrap();
+                !outbox.urgent.is_empty() || (outbox.reliable_bytes > 0 && paced.is_none())
+            };
             let now = Instant::now();
             let silent = path.us().saturating_sub(path.heard_us.load(Ordering::Relaxed));
             if silent > PATH_SILENCE.as_micros() as u64 {
@@ -959,12 +989,17 @@ impl Session {
             }
             if path.udp.is_some() && now >= next_udp_ping {
                 let early = path.started.elapsed() < UDP_PROOF;
-                next_udp_ping = now + if path.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
+                let busy = path.realtime_going() && self.outbox.lock().unwrap().reliable_bytes > 0;
+                next_udp_ping = now + if busy && path.udp_works() { PROBE_BUSY }
+                    else if path.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
                 let mut ping = vec![PING];
                 ping.extend_from_slice(&path.us().to_be_bytes());
                 self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
             }
-            let wait = if path.udp.is_some() { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
+            let mut wait = if path.udp.is_some() { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
+            if let Some(paced) = paced.filter(|_| self.outbox.lock().unwrap().reliable_bytes > 0) {
+                wait = wait.min(paced);  // the reliable frames' next turn
+            }
             let mut fds = [
                 libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 }, revents: 0 },
                 libc::pollfd { fd: self.wake.fd(), events: libc::POLLIN, revents: 0 },
@@ -1072,6 +1107,9 @@ impl Session {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if let Some(path) = self.current() {
+            path.realtime_us.store(path.us().max(1), Ordering::Relaxed);
+        }
         match self.current() {
             Some(path) if path.udp_works() => self.send_datagram_now(&path, channel, body, sealed),
             Some(_) => self.queue(frame::DATAGRAM, channel, body),
@@ -1126,6 +1164,7 @@ impl Session {
                 let now = path.us();
                 path.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
                 path.proven_us.store(now.max(1), Ordering::Relaxed);
+                self.pace.lock().unwrap().sample(now.saturating_sub(sent), path.realtime_going(), Instant::now());
             }
         }
     }
