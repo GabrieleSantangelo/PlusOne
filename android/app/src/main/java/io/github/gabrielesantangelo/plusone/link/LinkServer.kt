@@ -157,7 +157,7 @@ class LinkServer(
                     Paired.add(context, fingerprint, pcName)
                 }
                 guard.cancel(false)
-                val opened = Link(socket, wire, pcName, fingerprint)
+                val opened = SocketLink(socket, wire, pcName, fingerprint)
                 link = opened
                 // Its links, closed the moment the user forgets it (disconnect()).
                 links.computeIfAbsent(fingerprint) { ConcurrentHashMap.newKeySet() }.add(opened)

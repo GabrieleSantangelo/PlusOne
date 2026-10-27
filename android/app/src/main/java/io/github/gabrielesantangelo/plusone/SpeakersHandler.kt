@@ -1,7 +1,9 @@
 package io.github.gabrielesantangelo.plusone
 
 import android.util.Log
+import io.github.gabrielesantangelo.plusone.link.Datagrams
 import io.github.gabrielesantangelo.plusone.link.Handler
+import io.github.gabrielesantangelo.plusone.link.LinkPackets
 import io.github.gabrielesantangelo.plusone.link.Link
 import org.json.JSONObject
 
@@ -16,14 +18,22 @@ class SpeakersHandler(private val service: CompanionService) : Handler {
             link.refuse("off")
             return false
         }
+        // Over the link's core its packets come on the "pcm" channel; over
+        // the link of before, as Datagrams, the key and port in the offer.
+        val pcm = link.channel("pcm")
+        var datagrams: Datagrams? = null
         val playback = try {
             val offer = JSONObject(request.optString("sdp"))
             val key = offer.optString("key").chunked(2).mapNotNull { it.toIntOrNull(16)?.toByte() }.toByteArray()
             val port = offer.optInt("port")
-            require(key.size == 32 && port in 1..65535 && offer.optInt("channels") == PcmPlayback.CHANNELS &&
+            require((pcm != null || (key.size == 32 && port in 1..65535)) && offer.optInt("channels") == PcmPlayback.CHANNELS &&
                 offer.optInt("rate") in 8000..96000 && offer.optInt("frames") in 48..480) { "bad speakers request" }
-            PcmPlayback(key, link.address, port, offer.optInt("rate"), offer.optInt("frames"))
+            val packets = if (pcm != null) LinkPackets(pcm, null, 0)
+                else Datagrams(key, link.address, port, receiveBuffer = 1 shl 20).also { datagrams = it }
+            PcmPlayback(packets, offer.optInt("rate"), offer.optInt("frames"))
         } catch (e: Exception) {
+            pcm?.close()
+            datagrams?.close()
             Log.w(CompanionService.TAG, "speakers not available: $e")
             link.refuse("unavailable")
             return false
@@ -32,7 +42,7 @@ class SpeakersHandler(private val service: CompanionService) : Handler {
         try {
             playback.start()
             link.send(JSONObject().put("type", "answer")
-                .put("sdp", JSONObject().put("port", playback.port).toString()))
+                .put("sdp", JSONObject().apply { datagrams?.let { put("port", it.port) } }.toString()))
             service.showSessions()
             service.lowLatency(true)
             link.hold()

@@ -55,7 +55,7 @@ class RequestsTest {
 
     private fun serve(otherVersion: Boolean = false): Thread = Thread {
         try {
-            Requests(handlers).serve(Link(app, Wire(app), "PC", "fp"), otherVersion)
+            Requests(handlers).serve(SocketLink(app, Wire(app), "PC", "fp"), otherVersion)
         } catch (e: Exception) {
             log.add("ended: ${e.javaClass.simpleName}")
         } finally {

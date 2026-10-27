@@ -11,7 +11,9 @@ the app pauses meanwhile and starts again with its little wait.
 
 Shaped for devices.Feed as an rtc.Receiver is: offer() and answer() carry
 the session's key and ports (JSON) where WebRTC's carry SDP; failed(),
-losses() (here: the sound captured) and close().
+losses() (here: the sound captured) and close(). Over the link
+(plus-one-link, docs/LINK.md) the packets go on its "pcm" channel instead
+(use_link), and the offer carries no key nor port.
 """
 import json
 import struct
@@ -65,18 +67,29 @@ class PcmSender:
         self._sink = self.pipeline.get_by_name("out")
         self._handler = self._sink.connect("new-sample", self._send)
         self._listener = threading.Thread(target=self._listen, daemon=True)
+        self._over_link = False
+
+    def use_link(self, tablet):
+        """The packets on the link's "pcm" channel (tablet: a
+        channels.ChannelLink), not this session's own UDP socket."""
+        self.channel.close()
+        self.channel = tablet.packets("pcm")
+        self._over_link = True
 
     def offer(self):
+        if self._over_link:
+            return json.dumps({"rate": RATE, "channels": CHANNELS, "frames": FRAMES})
         return json.dumps({"key": self.key.hex(), "port": self.channel.port, "rate": RATE,
                            "channels": CHANNELS, "frames": FRAMES})
 
     def answer(self, text):
-        """The app's answer: its port (JSON)."""
-        reply = json.loads(text)
-        port = int(reply["port"])
-        if not self.peer or not 0 < port < 65536:
-            raise ValueError("the app's answer is not one")
-        self.channel.app = (self.peer, port)
+        """The app's answer: its port (JSON), over the link of before."""
+        if not self._over_link:
+            reply = json.loads(text)
+            port = int(reply["port"])
+            if not self.peer or not 0 < port < 65536:
+                raise ValueError("the app's answer is not one")
+            self.channel.app = (self.peer, port)
         self.pipeline.set_state(Gst.State.PLAYING)
         self._listener.start()
 

@@ -19,28 +19,50 @@ interface Handler {
     fun closed(link: Link) {}
 }
 
-/** A paired PC's link: pc its name, fingerprint its certificate's. */
-class Link(private val socket: Socket, private val wire: Wire, val pc: String, val fingerprint: String) {
-    /** The PC's address. */
-    val address: InetAddress get() = socket.inetAddress
+/** A paired PC's link: pc its name, fingerprint its certificate's. The
+ * link of before's TLS socket (SocketLink), or a feature's control channel
+ * on the link's core (ChannelLink): the handlers are the same for both. */
+abstract class Link(val pc: String, val fingerprint: String) {
+    /** The PC's address, where packets go over the link of before. */
+    abstract val address: InetAddress
 
-    fun send(message: JSONObject) = wire.send(message)
+    abstract fun send(message: JSONObject)
 
-    fun receive(maxHeader: Int = Wire.MAX_HEADER): JSONObject = wire.receive(maxHeader)
+    abstract fun receive(maxHeader: Int = Wire.MAX_HEADER): JSONObject
 
-    fun readPayload(size: Long, out: OutputStream) = wire.readPayload(size, out)
+    abstract fun readPayload(size: Long, out: OutputStream)
 
     fun refuse(reason: String) = send(JSONObject().put("type", "refused").put("reason", reason))
 
     /** A session held: until the PC says "stop" or the link goes, or
      * nothing comes for silentMs (the PC pings while it holds one). */
-    fun hold(silentMs: Int = LinkServer.SILENT_PC) {
+    abstract fun hold(silentMs: Int = LinkServer.SILENT_PC)
+
+    /** From any thread: the link ends (whatever waits on it wakes). */
+    abstract fun close()
+
+    /** The channel the PC opened for this session's packets (name: "media",
+     * "input", "pcm"), if this is the link's core: else null, Datagrams then. */
+    open fun channel(name: String): LinkChannel? = null
+}
+
+/** The link of before: a TLS socket. */
+class SocketLink(private val socket: Socket, private val wire: Wire, pc: String, fingerprint: String)
+    : Link(pc, fingerprint) {
+    override val address: InetAddress get() = socket.inetAddress
+
+    override fun send(message: JSONObject) = wire.send(message)
+
+    override fun receive(maxHeader: Int): JSONObject = wire.receive(maxHeader)
+
+    override fun readPayload(size: Long, out: OutputStream) = wire.readPayload(size, out)
+
+    override fun hold(silentMs: Int) {
         socket.soTimeout = silentMs
         while (wire.receive().optString("type") != "stop") continue
     }
 
-    /** From any thread: the link ends (whatever waits on it wakes). */
-    fun close() {
+    override fun close() {
         runCatching { socket.close() }
     }
 }

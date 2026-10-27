@@ -5,27 +5,36 @@ import android.provider.Settings
 import io.github.gabrielesantangelo.plusone.link.Datagrams
 import io.github.gabrielesantangelo.plusone.link.Handler
 import io.github.gabrielesantangelo.plusone.link.Link
+import io.github.gabrielesantangelo.plusone.link.LinkPackets
 import org.json.JSONObject
 
 /** The PC's desktop on this screen (DisplaySession, DisplayActivity), until
- * the PC hangs up or says stop. The key for its packets comes over the
- * link, fresh for each session (plusone/appdisplay.py). Over the link's
- * core it is LinkDisplay's; both show it with [show]. */
+ * the PC hangs up or says stop. Over the link of before its packets are
+ * Datagrams, the key for them coming with the request, fresh for each
+ * session (plusone/appdisplay.py); over the link's core, the channels the
+ * PC opened for them ("media", "input"). */
 class DisplayHandler(private val service: CompanionService) : Handler {
     override val types = setOf("display")
 
     override fun handle(link: Link, request: JSONObject, size: Long): Boolean {
+        val media = link.channel("media")
+        val input = if (media != null) link.channel("input") else null
+        if (media != null && input == null) media.close()
+        val overCore = media != null && input != null
         val key = request.optString("key").chunked(2).mapNotNull { it.toIntOrNull(16)?.toByte() }.toByteArray()
         val port = request.optInt("port")
-        require(key.size == 32 && port in 1..65535) { "bad display request" }
+        require(overCore || (key.size == 32 && port in 1..65535)) { "bad display request" }
         if (!canShow(service)) {
+            media?.close()
+            input?.close()
             link.refuse("background")
             return false
         }
         // Room for a keyframe's packets at once.
-        val datagrams = Datagrams(key, link.address, port, receiveBuffer = 4 shl 20)
-        show(service, DisplaySession(datagrams), link.pc,
-            ready = { link.send(it.put("port", datagrams.port)) },
+        val datagrams = if (overCore) null else Datagrams(key, link.address, port, receiveBuffer = 4 shl 20)
+        val packets = datagrams ?: LinkPackets(media!!, input, DisplaySession.INPUT)
+        show(service, DisplaySession(packets), link.pc,
+            ready = { link.send(if (datagrams != null) it.put("port", datagrams.port) else it) },
             hold = { link.hold() },
             end = { link.close() })
         return false

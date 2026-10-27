@@ -26,6 +26,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gio, GLib, Gst  # noqa: E402
 
 from . import link, log, once  # noqa: E402
+from .link import channels  # noqa: E402
 
 CAMERA_LABEL = "Plus One tablet camera"  # data/plus-one-camera-options.conf
 MIC_NAME = "plusone_mic"
@@ -172,12 +173,16 @@ class Feed:
             if not where or not where[0]:
                 self.on_problem("away")
                 return RETRY
-            tablet = self._link = link.connect(where[0], where[1])
+            # Over the link (plus-one-link) when it runs and the app serves
+            # this there; else the link of before.
+            tablet = self._link = channels.connect(where[1], kind) or link.connect(where[0], where[1])
             if not self._wanted.is_set():
                 return None  # stopped while it connected: stop() had no link to close
             receiver = self.receiver()
             if hasattr(receiver, "peer"):
                 receiver.peer = tablet.peer  # where pcm.PcmSender sends: the paired app's address
+            if isinstance(tablet, channels.ChannelLink) and hasattr(receiver, "use_link"):
+                receiver.use_link(tablet)  # its packets on the link's channels too
             reply = tablet.request(dict(self.request, sdp=receiver.offer()))
             if reply.get("type") != "answer":
                 raise ValueError(f"the app answered {reply.get('type')!r}")

@@ -5,9 +5,8 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.SystemClock
 import android.util.Log
-import java.net.InetAddress
 import java.nio.ByteBuffer
-import io.github.gabrielesantangelo.plusone.link.Datagrams
+import io.github.gabrielesantangelo.plusone.link.Packets
 
 /**
  * The PC's sound on the speakers as it is (plusone/pcm.py): 16-bit stereo PCM
@@ -36,8 +35,7 @@ import io.github.gabrielesantangelo.plusone.link.Datagrams
  * cushion for a whole second is the excess skipped, faded out and in. After
  * any gap (the track played out, a packet lost) the sound fades in: no click.
  */
-class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
-                  private val rate: Int, private val frames: Int) {
+class PcmPlayback(private val datagrams: Packets, private val rate: Int, private val frames: Int) {
     private val bytes = frames * CHANNELS * 2
     private val packets = HashMap<Int, ByteArray>()  // by number, under the lock
     private val lock = Object()
@@ -73,14 +71,6 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
         .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT), bytes * 4))
         .build()
-    private val datagrams = try {
-        Datagrams(key, pc, pcPort, receiveBuffer = 1 shl 20)
-    } catch (e: Exception) {
-        track.release()
-        throw e
-    }
-    /** This end's port, for the PC. */
-    val port get() = datagrams.port
     private val receiver = Thread(::receive, "plusone-speakers-in")
     private val player = Thread(::play, "plusone-speakers-out")
 

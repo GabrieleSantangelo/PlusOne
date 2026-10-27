@@ -219,6 +219,17 @@ about 24 s each, from the PC's capture to the frame decoded on the tablet:
 (The 6 lost and 161 ms: one second of the second run, the hotspot's, it
 seems; to be watched.)
 
+Speakers, camera and microphone over it (2026-10-27): devices.Feed asks
+plus-one-link first (plusone/link/channels.py: ChannelLink, the link of
+before's surface on a control channel); the speakers' sound goes on a
+"pcm" channel, the camera and the microphone keep WebRTC for their media.
+In the app, LinkFeatures serves each feature with its handler of before
+(Link is abstract: SocketLink or ChannelLink). Every channel at once on
+the tablet, the desktop through the link: 60 fps, 24-27 ms median, 30-31
+ms at 90%, as over the link of before at 14:45 (60 fps, 26-28, 30-31).
+The speakers alone, 40 s twice each way: the tablet held 40-80 ms over
+either, a few packets missed on both, no gap heard.
+
 ## Phases
 
 1. The core (`link/`): session, channels, keys, liveness over TCP and UDP;

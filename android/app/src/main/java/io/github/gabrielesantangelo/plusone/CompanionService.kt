@@ -93,8 +93,8 @@ class CompanionService : Service(), LinkServer.Host {
                 }
             }
         }
-        val display = LinkDisplay(this)
-        core.serve("display") { display.handle(it) }
+        // The features moved over so far: their handlers of the link of before.
+        LinkFeatures(this, core, listOf(DisplayHandler(this), SpeakersHandler(this), CaptureHandler(this)))
         Thread({
             try {
                 // The same port each time, if free: where the PC reached it
