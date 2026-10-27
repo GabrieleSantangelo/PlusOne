@@ -19,10 +19,14 @@ a signing tablet, a webcam, a microphone and speakers, through Plus One's small 
 
 - **Real extended display.** A virtual monitor appears in *Settings → Displays*;
   drag windows onto the tablet like onto any other screen.
-- **Low latency, over your Wi-Fi.** About 25 ms from the PC's screen to the
-  tablet's decoder at 1920×1200@60, hardware H.264 (Intel's low-power encoder
-  first, then NVENC, VA-API) or x264, encrypted. The bitrate follows what
-  the Wi-Fi takes, so a weak network makes the picture softer, not late.
+- **Low latency, over your Wi-Fi or a cable.** About 25 ms from the PC's
+  screen to the tablet's decoder at 1920×1200@60, hardware H.264 (Intel's
+  low-power encoder first, then NVENC, VA-API) or x264, encrypted. The
+  bitrate follows what the network takes, so a weak one makes the picture
+  softer, not late. Plug the tablet in and it goes by the cable (USB), the
+  fastest way; pull it out and the desktop goes on over the Wi-Fi, about
+  two seconds later, without closing. Plus One and the tablet always say
+  which way they are connected.
 - **Touch and S Pen.** The fingers work as a laptop's touchpad, where they
   touch: tap, drag, two to scroll with momentum, pinch to zoom, three to
   swipe. The S Pen becomes a real Linux drawing tablet with pressure (4096
@@ -348,6 +352,7 @@ system's language.
 | Second screen → Touch and S Pen | The fingers and the pen from the tablet. |
 | Tablets → Keep the tablet's app up to date | The PC hands the app its own version while nothing is in use. On by default. |
 | General → Quick Settings toggle | Turns the *Tablet* GNOME Shell extension on or off (Plus One offers it once, after the first pairing). Shown when the extension is installed (the `.deb`, or the zip for Flatpak users) and GNOME Shell knows it, which is after the next login. |
+| General → Use the cable | The tablet plugged in goes by the cable (Android asks once whether Plus One opens it). Its file transfer (MTP) is off while Plus One has the cable: turn this off to copy files by cable. On by default. |
 | General → Ready in the background | Start at login and keep running after the window closes, so the Quick Settings toggle connects at once. Costs nothing while idle. |
 
 ### S Pen

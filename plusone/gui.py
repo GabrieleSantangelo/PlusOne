@@ -385,6 +385,12 @@ class Window(Adw.ApplicationWindow):
         shell_extension_state(self._show_extension_state)
         group.add(background)
         group.add(self.extension_row)
+        # The tablet by cable (docs/LINK.md): its file transfer is off while Plus One has it.
+        cable = Adw.SwitchRow(title=_("Use the cable"), active=s.cable,
+                              subtitle=_("The tablet plugged in goes by the cable, the fastest way; its file "
+                                         "transfer is off meanwhile"))
+        cable.connect("notify::active", lambda row, _p: self.app.set_cable(row.get_active()))
+        group.add(cable)
         page.add(group)
         group = Adw.PreferencesGroup()
         for title, subtitle, action in ((_("Log"), _("What Plus One did, to send along with a problem"), "win.log"),

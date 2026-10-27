@@ -23,10 +23,13 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match __version__ $version"; exit 1; }
       - name: Build test container
         run: docker build -f Dockerfile.ci -t plus-one-ci .
+      - name: The link's program, for the package
+        run: tools/link-docker.sh fetch && tools/link-docker.sh build --release -p plus-one-link-daemon
       - name: Tests and package (the release is only made if they pass)
         run: |
           mkdir -p dist
-          docker run --rm -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" -v "$PWD/dist:/src/dist" plus-one-ci
+          docker run --rm -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" -v "$PWD/dist:/src/dist" \
+            -v "$PWD/link/target/release/plus-one-link:/src/link/target/release/plus-one-link:ro" plus-one-ci
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: deb

@@ -12,6 +12,7 @@ import os
 import shutil
 import signal
 import sys
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -30,6 +31,11 @@ from .signing import Signing  # noqa: E402
 from .devices import SPEAKERS_NAME, Devices, make_default_sink  # noqa: E402
 from .link import Discovery, Nearby, Tablets  # noqa: E402
 from .link.paths import Paths  # noqa: E402
+
+try:
+    import plusone_link
+except ImportError:  # a Plus One without the link (docs/LINK.md)
+    plusone_link = None
 from .updates import UPDATED_FROM, SelfUpdate, TabletUpdates  # noqa: E402
 
 APP_ID = "io.github.gabrielesantangelo.PlusOne"
@@ -115,6 +121,21 @@ def exec_arg(command):
     escaped again as a key file's string value (a backslash doubled)."""
     escaped = "".join("\\" + c if c in '"`$\\' else c for c in command).replace("%", "%%")
     return '"' + escaped.replace("\\", "\\\\") + '"'
+
+
+def start_link():
+    """plus-one-link's socket in this session, if it is installed and not
+    there yet (a session opened before the package was: its socket is
+    enabled from the next login on)."""
+    if IN_FLATPAK or plusone_link is None or os.path.exists(plusone_link.socket_path()):
+        return
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.call_sync("org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                      "StartUnit", GLib.Variant("(ss)", ("plus-one-link.socket", "replace")), None,
+                      Gio.DBusCallFlags.NONE, 5000, None)
+    except GLib.Error as e:
+        log("link: plus-one-link's socket not started:", e.message)
 
 
 def set_autostart(enabled, config_dir=None):
@@ -224,7 +245,7 @@ class PlusOneApp(Adw.Application):
         self.discovery = Discovery([Nearby(on_change=self._on_nearby)])
         self.tablets = Tablets(self.settings, self.save_settings, self.discovery)
         # What the tablet is connected by (the link's events): in the status.
-        self.paths = Paths(self._path_changed)
+        self.paths = Paths(self._path_changed, on_link=self._link_up)
         self.controller = Controller(self.settings, self._on_state, self.tablets)
         self.listeners = []      # windows following the state
         self.log_listeners = []  # windows showing the log
@@ -261,6 +282,7 @@ class PlusOneApp(Adw.Application):
         if self.settings.background:
             set_autostart(True)
         set_sign_entry(self.settings.sign_on_tablet)
+        start_link()
         # Which tablets have the app, and where: for pairing, the desktop,
         # signing and the devices. Avahi listens anyway.
         self.discovery.start()
@@ -387,6 +409,27 @@ class PlusOneApp(Adw.Application):
         if by is None and self.controller.state == State.STREAMING:
             return "Wi-Fi"  # the link of before goes over the network only
         return by
+
+    def _link_up(self, link):
+        """plus-one-link there (again: it may have restarted): our settings to it."""
+        try:
+            link.use_usb(self.settings.cable)
+        except (OSError, ValueError, plusone_link.LinkError):
+            pass
+
+    def set_cable(self, enabled):
+        if enabled == self.settings.cable:
+            return
+        self.settings.cable = enabled
+        save_settings(self.settings)
+        if plusone_link is not None:
+            def tell():
+                try:
+                    with plusone_link.Link() as link:
+                        link.use_usb(enabled)
+                except (OSError, ValueError, plusone_link.LinkError):
+                    pass  # not there: told when it comes (_link_up)
+            threading.Thread(target=tell, daemon=True).start()
 
     def _path_changed(self):
         self._emit_properties()

@@ -38,6 +38,9 @@ class Settings:
     # Its noise taken out: "off", "light" (the tablet's libwebrtc) or "neural"
     # (DeepFilterNet's plugin, on this PC: devices.py).
     microphone_noise: str = "neural"
+    # The tablet by cable when it is plugged in (docs/LINK.md): plus-one-link
+    # asks it to be Plus One's accessory (its file transfer off meanwhile).
+    cable: bool = True
     # The Quick Settings toggle offered once, after the first pairing (gui.py).
     toggle_offered: bool = False
     # The desktop's size: "auto" (about 1920x1200) or "WxH" at the tablet's

@@ -1,5 +1,8 @@
 #!/bin/sh
-# Build dist/plus-one_<version>_all.deb from this checkout (no root needed).
+# Build dist/plus-one_<version>_<arch>.deb from this checkout (no root
+# needed). The link's program, plus-one-link, built before (tools/link-docker.sh
+# build --release, or PLUSONE_LINK_BIN): the package is this machine's
+# architecture's.
 set -e
 umask 022
 here="$(dirname "$(readlink -f "$0")")"
@@ -8,16 +11,20 @@ version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$top/plusone/__init__.py")"
 app_id=io.github.gabrielesantangelo.PlusOne
 pkg=plus-one
 maintainer="santal1210 <sant.nino02@gmail.com>"
-root="$top/build/deb/${pkg}_${version}_all"
+arch="$(dpkg --print-architecture)"
+link_bin="${PLUSONE_LINK_BIN:-$top/link/target/release/plus-one-link}"
+[ -x "$link_bin" ] || { echo "no $link_bin: tools/link-docker.sh build --release first" >&2; exit 1; }
+root="$top/build/deb/${pkg}_${version}_${arch}"
 
 rm -rf "$root"
 install -d "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/$pkg" \
     "$root/usr/share/applications" "$root/usr/share/icons/hicolor/scalable/apps" \
     "$root/usr/share/metainfo" "$root/usr/share/doc/$pkg" "$root/usr/share/dbus-1/services" \
     "$root/usr/lib/modules-load.d" "$root/usr/lib/modprobe.d" \
-    "$root/usr/share/dbus-1/system-services" "$root/usr/share/dbus-1/system.d" "$root/usr/share/polkit-1/actions"
+    "$root/usr/share/dbus-1/system-services" "$root/usr/share/dbus-1/system.d" "$root/usr/share/polkit-1/actions" \
+    "$root/usr/lib/systemd/user"
 
-cp -r "$top/plusone" "$root/usr/lib/$pkg/"
+cp -r "$top/plusone" "$top/plusone_link" "$root/usr/lib/$pkg/"
 find "$root/usr/lib/$pkg" -name __pycache__ -prune -exec rm -rf {} +
 chmod -R u=rwX,go=rX "$root/usr/lib/$pkg"
 cat > "$root/usr/bin/$pkg" <<LAUNCHER
@@ -31,6 +38,10 @@ install -m 644 "$top/data/$app_id.desktop" "$top/data/$app_id.Sign.desktop" "$ro
 install -m 644 "$top/data/$app_id.svg" "$root/usr/share/icons/hicolor/scalable/apps/"
 install -m 644 "$top/data/$app_id.metainfo.xml" "$root/usr/share/metainfo/"
 install -m 644 "$top/data/$app_id.service" "$root/usr/share/dbus-1/services/"
+# The link (docs/LINK.md): its program, started by its socket for each user
+# (enabled for all by postinst; Plus One starts it in a session already open).
+install -m 755 "$link_bin" "$root/usr/lib/$pkg/plus-one-link"
+install -m 644 "$top/data/systemd/plus-one-link.socket" "$top/data/systemd/plus-one-link.service" "$root/usr/lib/systemd/user/"
 # "Sign on Tablet" in Nautilus' context menu (needs python3-nautilus).
 install -Dm 644 "$top/data/nautilus/plus-one-sign.py" "$root/usr/share/nautilus-python/extensions/plus-one-sign.py"
 # Quick Settings toggle, off until the user turns it on.
@@ -82,24 +93,27 @@ chmod 644 "$root/usr/share/doc/$pkg/"*
 
 install -m 755 "$here/debian/postinst" "$here/debian/postrm" "$root/DEBIAN/"
 size="$(du -sk --exclude=DEBIAN "$root" | cut -f1)"
+# What plus-one-link links against (glibc...), as dpkg-shlibdeps says.
+shlibs="$(tmp="$(mktemp -d)" && mkdir "$tmp/debian" && printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "$pkg" "$pkg" > "$tmp/debian/control" \
+    && cd "$tmp" && dpkg-shlibdeps -O -e "$root/usr/lib/$pkg/plus-one-link" 2>/dev/null | sed -n 's/^shlibs:Depends=//p'; rm -rf "$tmp")"
 cat > "$root/DEBIAN/control" <<CONTROL
 Package: $pkg
 Version: $version
 Section: utils
 Priority: optional
-Architecture: all
+Architecture: $arch
 Maintainer: $maintainer
 Installed-Size: $size
-Depends: python3 (>= 3.11), python3-gi, python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1 (>= 1.5), gir1.2-gstreamer-1.0, gir1.2-poppler-0.18, python3-pypdf, python3-cryptography, openssl, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-nice, gir1.2-gst-plugins-bad-1.0, swh-plugins, pulseaudio-utils, pipewire-bin, avahi-daemon, kmod, udev, acl, dbus, polkitd | policykit-1
+Depends: ${shlibs:+$shlibs, }python3 (>= 3.11), python3-gi, python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1 (>= 1.5), gir1.2-gstreamer-1.0, gir1.2-poppler-0.18, python3-pypdf, python3-cryptography, openssl, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-nice, gir1.2-gst-plugins-bad-1.0, swh-plugins, pulseaudio-utils, pipewire-bin, avahi-daemon, kmod, udev, acl, dbus, polkitd | policykit-1
 Recommends: gstreamer1.0-vaapi, gstreamer1.0-plugins-ugly, gstreamer1.0-x, gnome-shell (>= 45), python3-nautilus
 Homepage: https://github.com/GabrieleSantangelo/PlusOne
 Description: Samsung Galaxy Tab as a second screen, signing tablet and more
  With Plus One's app on the tablet: the GNOME desktop extended onto it over
- the Wi-Fi (Mutter virtual monitor, low-latency H.264, the fingers as a
- touchpad, the S Pen with pressure and tilt), "Sign on Tablet" for PDFs
- from Nautilus or Open With, and the tablet's camera, microphone and
- speakers as the PC's.
+ the Wi-Fi or the cable, moving between them as they come and go (Mutter
+ virtual monitor, low-latency H.264, the fingers as a touchpad, the S Pen
+ with pressure and tilt), "Sign on Tablet" for PDFs from Nautilus or Open
+ With, and the tablet's camera, microphone and speakers as the PC's.
 CONTROL
 
 mkdir -p "$top/dist"
-dpkg-deb --root-owner-group -Zxz --build "$root" "$top/dist/${pkg}_${version}_all.deb"
+dpkg-deb --root-owner-group -Zxz --build "$root" "$top/dist/${pkg}_${version}_${arch}.deb"

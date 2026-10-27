@@ -170,6 +170,12 @@ class Link:
         "name", "version", "address"}]."""
         return self._request({"op": "browse", "wait": wait})[0]["tablets"]
 
+    def use_usb(self, on=True):
+        """Whether an Android tablet plugged in is asked to be Plus One's
+        accessory (its file transfer off meanwhile); one reached by cable
+        before always is."""
+        self._request({"op": "usb", "use": bool(on)})
+
     def queued(self, device):
         """Bytes on their way to the tablet not yet sent: how far behind the
         network is."""

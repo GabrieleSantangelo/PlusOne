@@ -18,6 +18,9 @@ _IT = {
     "Bluetooth": "Bluetooth",
     "the internet": "internet",
     "reconnecting…": "riconnessione…",
+    "Use the cable": "Usa il cavo",
+    "The tablet plugged in goes by the cable, the fastest way; its file transfer is off meanwhile":
+        "Il tablet collegato passa dal cavo, la via più veloce; il suo trasferimento file resta spento intanto",
     "Problem": "Problema",
     "Connect": "Collega",
     "Disconnect": "Scollega",

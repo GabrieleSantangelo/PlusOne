@@ -841,9 +841,13 @@ class Speakers(AudioDevice):
 
     def _sender(self):
         from .pcm import PcmSender
-        # What plays into the sink, from its monitor, 5 ms at a time.
+        # What plays into the sink, from its monitor, at the graph's own
+        # pace (PcmSender cuts it in 5 ms packets whatever comes). Not 5 ms
+        # forced on the whole graph: Chrome's playback, writing in larger
+        # pieces, stopped itself after about 10 s at that (Firefox did not),
+        # and every program's sound woke the CPU four times as often.
         return PcmSender(f"pipewiresrc target-object={SPEAKERS_NAME} do-timestamp=true "
-                         f"stream-properties=\"props,stream.capture.sink=true,node.latency=240/48000,"
+                         f"stream-properties=\"props,stream.capture.sink=true,"
                          f"node.name=plusone-speakers-feed\"")
 
 

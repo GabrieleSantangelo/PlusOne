@@ -1,0 +1,11 @@
+# Plus One's link: the sessions with the paired tablets, over the Wi-Fi or
+# the cable, moving between them (docs/LINK.md). Started by its socket.
+[Unit]
+Description=Plus One's link to the paired tablets
+Requires=plus-one-link.socket
+After=plus-one-link.socket
+
+[Service]
+ExecStart=/usr/lib/plus-one/plus-one-link
+Restart=on-failure
+NoNewPrivileges=yes

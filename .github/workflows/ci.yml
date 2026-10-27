@@ -30,10 +30,13 @@ jobs:
           load: true
           cache-from: type=gha,scope=ci
           cache-to: type=gha,mode=max,scope=ci
+      - name: The link's program, for the package
+        run: tools/link-docker.sh fetch && tools/link-docker.sh build --release -p plus-one-link-daemon
       - name: Tests, package build and lintian
         run: |
           mkdir -p dist
-          docker run --rm -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" -v "$PWD/dist:/src/dist" plus-one-ci
+          docker run --rm -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" -v "$PWD/dist:/src/dist" \
+            -v "$PWD/link/target/release/plus-one-link:/src/link/target/release/plus-one-link:ro" plus-one-ci
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: deb

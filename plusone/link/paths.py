@@ -25,8 +25,9 @@ class Paths:
     waits for one, or None (no session over the link: the link of before,
     or none at all)."""
 
-    def __init__(self, on_change):
+    def __init__(self, on_change, on_link=None):
         self.on_change = on_change
+        self.on_link = on_link or (lambda link: None)  # plus-one-link there (again): told our settings
         self._paths = {}  # device id -> kind, or None (waiting)
         self._watcher = None
         self._stopped = threading.Event()
@@ -75,6 +76,7 @@ class Paths:
         while not self._stopped.is_set():
             try:
                 link = plusone_link.Link()
+                self.on_link(link)
                 self._watcher = link.watch(self._event)
                 for device in link.devices():
                     if device.get("connected"):

@@ -24,6 +24,11 @@ if [ "$1" = "configure" ]; then
         # v4l2loopback-dkms brings it); Plus One says so in its window otherwise.
         modprobe v4l2loopback 2>/dev/null || true
     fi
+    # The link's socket for every user, from their next login (Plus One
+    # starts it in a session already open).
+    if command -v deb-systemd-helper >/dev/null; then
+        deb-systemd-helper --user enable plus-one-link.socket >/dev/null 2>&1 || true
+    fi
     if [ -n "$2" ] && dpkg --compare-versions "$2" lt 0.6 && getent group plus-one >/dev/null; then
         echo "Plus One: the S Pen no longer needs the plus-one group (a helper makes it);"
         echo "    sudo groupdel plus-one    removes it, if nothing else of yours uses it."

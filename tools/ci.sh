@@ -19,4 +19,4 @@ kill $weston
 packaging/build-deb.sh
 # This version's package only: ./dist may keep older ones.
 version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' plusone/__init__.py)"
-lintian --fail-on error "dist/plus-one_${version}_all.deb"
+lintian --fail-on error "dist/plus-one_${version}_$(dpkg --print-architecture).deb"

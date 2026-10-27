@@ -1,8 +1,60 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
-The app only.
+The link: the tablet by the Wi-Fi or the cable, moving between them
+without losing the desktop; and the app only (Samsung's Second Screen
+gone).
+
+- **The link** (docs/LINK.md): the connection to the tablet is a layer of
+  its own, in Rust, the same code on the PC (plus-one-link, started by
+  its socket when Plus One first needs it) and in the app (through JNI).
+  The desktop, the speakers, the camera and the microphone go over it; the
+  link of before stays beside it for signing and updates, and for a PC or
+  an app without it.
+- **The tablet by cable**: plugged in, it goes by USB (Android Open
+  Accessory), the fastest way: round trips of about 4 ms instead of 9-11
+  over a good Wi-Fi, nothing lost, the picture's bitrate kept. Android
+  asks once whether Plus One opens the accessory. "Use the cable" in the
+  preferences turns it off (the tablet's file transfer is off while Plus
+  One has the cable).
+- **Moving without ending**: the cable pulled, the session goes on over
+  the Wi-Fi about 1.6 s later; plugged in again, back on the cable; both
+  devices moved to another network (the home Wi-Fi to a phone's hotspot),
+  the desktop comes back on it by itself, within a minute. What the PC
+  said meanwhile arrives, once and in order.
+- **What it is connected by**, everywhere: in GNOME's Quick Settings and
+  in the window ("Connected · cable"); on the tablet, a small pill over
+  the desktop and, at each change, a screen that says what was lost and
+  what it is on now, until the picture comes again; on the app's main
+  screen, "Connected to <PC> · via cable".
+- **The tablet found without multicast too**: where it was last reached,
+  then mDNS, which plus-one-link reads itself.
+- **Chrome's sound no longer stops after about 10 s** on the tablet's
+  speakers: Plus One no longer forces a 5 ms cycle on all the PC's sound
+  (Chrome, writing in larger pieces, paused itself at that; Firefox did
+  not), which also wakes the CPU four times less often.
+- **The speakers bridge the Wi-Fi's stalls**: a stall's packets coming
+  at once no longer grow the tablet's wait for good, and a hole is
+  covered (up to 200 ms) instead of heard; no click between sounds.
+- **The desktop's bitrate drops sooner** when frames are not encoded for
+  what waits to go out, and climbs back carefully under where a queue
+  showed.
+- **Samsung's Second Screen is gone**: the desktop goes only through Plus
+  One's app, which does all it did and better (about 22 ms instead of
+  45-50, the picture following the network, the fingers as a touchpad).
+  With it go Wi-Fi Direct, RTSP, MPEG-TS, UIBC, the adb option, the
+  "Second screen through" choice, signing full screen on the tablet's
+  monitor through it, and NetworkManager as a dependency (the Flatpak no
+  longer builds libnm). When the app cannot show the desktop, Plus One
+  says why (not on the network, not answering, not allowed to come to the
+  front, another version, the pairing forgotten) instead of trying Second
+  Screen; when it cannot sign, the notification offers signing on this
+  PC. Settings of Second Screen in settings.json are ignored.
+- The command line runs the desktop in the app (`--size` one of the
+  tablet's sizes, `--test` a test pattern).
+- The package is now amd64 (plus-one-link is a compiled program). The
+  Flatpak keeps the link of before for now.
 
 - **Samsung's Second Screen is gone**: the desktop goes only through Plus
   One's app, which does all it did and better (about 22 ms instead of

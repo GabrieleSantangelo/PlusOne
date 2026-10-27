@@ -1,6 +1,10 @@
 #!/bin/sh
 set -e
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    # The link's socket: no longer enabled for anyone.
+    if command -v deb-systemd-helper >/dev/null; then
+        deb-systemd-helper --user "$([ "$1" = purge ] && echo purge || echo disable)" plus-one-link.socket >/dev/null 2>&1 || true
+    fi
     # Without the rule /dev/uhid goes back to root's alone: udev keeps the
     # group and mode a rule set, so they are put back by hand too.
     udevadm control --reload 2>/dev/null || true

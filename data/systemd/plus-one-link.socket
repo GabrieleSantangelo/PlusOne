@@ -1,0 +1,13 @@
+# Plus One's link (docs/LINK.md): the socket Plus One and other programs
+# ask plus-one-link through. plus-one-link starts with the first request
+# (nothing runs before); this user's alone.
+[Unit]
+Description=Plus One's link: its socket
+
+[Socket]
+ListenSequentialPacket=%t/plus-one/link
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
