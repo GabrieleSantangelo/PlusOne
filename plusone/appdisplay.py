@@ -65,6 +65,9 @@ KEY_PAGE_UP, KEY_PAGE_DOWN = 0xff55, 0xff56
 # growing, up again slowly while it does not.
 MIN_KBPS = 1500
 QUEUE_MS = 60    # data waiting to go out past this many ms of the bitrate: the next frames are not encoded
+# The kernel counts a packet waiting to go out with its buffers (TIOCOUTQ:
+# about 2.3 KB for 1472 bytes), not its bytes alone.
+TRUESIZE = 3 / 2
 
 
 # Widths offered for the desktop in the app, each at the tablet's proportions
@@ -384,6 +387,14 @@ class RateControl:
     by a tenth after a few clean seconds, never above the one set (most)
     nor below MIN_KBPS. A frame or two not encoded (after a keyframe, say)
     is not clean either: no going up into a queue.
+
+    Where a queue showed (ceiling: not a frame lost now and then, which
+    any Wi-Fi does) is remembered for CEILING_FOR reports: up to NEAR of it
+    the bitrate goes back quickly, past that only by PROBE every few clean
+    seconds (it went back to the most, and gave up again, every 30 s on a
+    phone's hotspot: the picture stuttered each time). Past the ceiling
+    with no trouble, or once it is old, it is forgotten. A drop well under
+    it (the same queue, a second later) leaves it where it was.
     The delay through the network: the app's capture-to-decoded less its
     first-packet-to-decoded (decoding, which does not change with the
     network), against the least of the last seconds; only from a second
@@ -395,11 +406,17 @@ class RateControl:
     HISTORY = 10    # reports the least is taken over
     FRAMES = 10     # shown in the second, for its delay to count
     SKIPPED = 3     # frames not encoded in the second: the network behind
+    NEAR = 0.85     # of the ceiling: up to here quickly
+    PROBE = 1.03    # past it, up by this...
+    PROBE_EVERY = 10  # ...after this many clean reports
+    CEILING_FOR = 60  # reports (seconds) a ceiling holds
 
     def __init__(self, most):
         self.most = most
         self.kbps = most
         self.clean = 0
+        self.ceiling = None  # where a queue last showed
+        self.ceiling_age = 0  # reports since
         self.delays = collections.deque(maxlen=self.HISTORY)
 
     def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0):
@@ -409,16 +426,34 @@ class RateControl:
         if delay is not None:
             self.delays.append(delay)
         grown = delay is not None and len(self.delays) >= 3 and delay > min(self.delays) + self.GROWN_MS
-        if lost or grown or skipped >= self.SKIPPED:
+        self.ceiling_age += 1
+        if self.ceiling and self.ceiling_age > self.CEILING_FOR:
+            self.ceiling = None
+        queue = grown or skipped >= self.SKIPPED
+        if lost or queue:
             self.clean = 0
+            if queue and (self.ceiling is None or self.kbps >= self.ceiling * self.NEAR):
+                self.ceiling, self.ceiling_age = self.kbps, 0
             return self._set(self.kbps * 2 // 3)
         if skipped:
-            self.clean = 0
-            return None
+            return None  # not clean, but not a reason to count again from naught
         self.clean += 1
-        if self.clean >= self.CLEAN and self.kbps < self.most:
+        if self.kbps >= self.most:
+            return None
+        if self.ceiling and self.kbps >= self.ceiling * self.NEAR:
+            if self.clean < self.PROBE_EVERY:
+                return None
             self.clean = 0
-            return self._set(self.kbps * 11 // 10 + 100)
+            kbps = self._set(int(self.kbps * self.PROBE))
+            if self.kbps >= self.ceiling:
+                self.ceiling = None  # it takes as much now
+            return kbps
+        if self.clean >= self.CLEAN:
+            self.clean = 0
+            up = self.kbps * 11 // 10 + 100
+            if self.ceiling:
+                up = min(up, int(self.ceiling * self.NEAR))
+            return self._set(max(up, self.kbps + 1))
         return None
 
     def _set(self, kbps):
@@ -522,7 +557,7 @@ class AppStreamer:
         # bitrate): this frame is not encoded, rather than queued after the
         # others (the delay would grow, and grow). A frame that never went
         # in breaks nothing; the next one is encoded against the last.
-        if self.channel.queued() > max(64 << 10, self.rate.kbps * QUEUE_MS // 8):
+        if self.channel.queued() > max(64 << 10, self.rate.kbps * QUEUE_MS // 8 * TRUESIZE):
             self.skipped += 1
             return Gst.PadProbeReturn.DROP
         # pipewiresrc and a live test source stamp buffers with the running
@@ -664,6 +699,8 @@ class AppDisplay:
             if self._stopped.is_set():
                 return
             self.channel = Datagrams()
+            if self._stopped.is_set():
+                return  # stop() came meanwhile: its teardown may not have seen the channel
             reply = self.link.request({"type": "display", "key": self.channel.key.hex(), "port": self.channel.port})
             if reply.get("type") != "display-ready":
                 raise ValueError(f"the app answered {reply.get('type')!r}")
@@ -688,6 +725,8 @@ class AppDisplay:
         finally:
             if self.link is not None:
                 self.link.close()
+            if self._stopped.is_set() and self.channel is not None:
+                self.channel.close()  # stopped before teardown could see it (twice is harmless)
             if not self._stopped.is_set():
                 GLib.idle_add(once(self._ended, error))
 

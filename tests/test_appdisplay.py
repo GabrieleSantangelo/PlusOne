@@ -310,7 +310,7 @@ def test_the_bitrate_follows_the_network():
     for _ in range(2):
         assert rate.report(60, 0, 30, 20) is None
     assert rate.report(60, 0, 30, 20) == 6617  # clean for a while: up by a tenth
-    rate.kbps = 19950
+    rate.kbps, rate.ceiling = 19950, None
     for _ in range(3):
         result = rate.report(60, 0, 30, 20)
     assert result == 20000 and rate.kbps == 20000  # never past the one set
@@ -323,12 +323,49 @@ def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():
     rate.kbps = 10000
     for _ in range(2):
         assert rate.report(60, 0, 30, 20) is None
-    assert rate.report(60, 0, 30, 20, skipped=2) is None  # after a keyframe, say: stays...
-    for _ in range(2):
-        assert rate.report(60, 0, 30, 20) is None  # ...but does not count as clean
-    assert rate.report(60, 0, 30, 20) == 11100
+    assert rate.report(60, 0, 30, 20, skipped=2) is None  # after a keyframe, say: not clean...
+    assert rate.report(60, 0, 30, 20) == 11100  # ...nor a reason to count the clean ones again
     # Nothing lost yet, the delay as low as ever: the queue only shows here.
     assert rate.report(45, 0, 30, 20, skipped=14) == 7400
+
+
+def test_the_bitrate_goes_back_slowly_where_the_network_gave_up():
+    rate = appdisplay.RateControl(20000)
+    assert rate.report(40, 0, 30, 20, skipped=15) == 13333  # gave up at 20000
+    ups = [rate.report(60, 0, 30, 20) for _ in range(9)]
+    assert [k for k in ups if k] == [14766, 16342, 17000]  # quickly, up to 85 % of it
+    ups = [rate.report(60, 0, 30, 20) for _ in range(30)]
+    assert [k for k in ups if k] == [17510, 18035, 18576]  # past that, 3 % every 10 s
+    rate.kbps = 19500
+    for _ in range(10):
+        result = rate.report(60, 0, 30, 20)
+    assert result == 20000 and rate.ceiling is None  # past it, no trouble: forgotten
+
+
+def test_a_frame_lost_now_and_then_is_no_ceiling():
+    """Any Wi-Fi loses a frame now and then: down, but no ceiling, so back
+    up quickly (a ceiling for each drove the bitrate to the least)."""
+    rate = appdisplay.RateControl(20000)
+    kbps = []
+    for second in range(300):
+        rate.report(60, 1 if second % 30 == 29 else 0, 30, 20)
+        kbps.append(rate.kbps)
+    assert rate.ceiling is None and sum(kbps[-120:]) / 120 > 15000
+
+
+def test_one_queue_over_two_reports_is_one_ceiling():
+    rate = appdisplay.RateControl(20000)
+    rate.report(40, 0, 30, 20, skipped=15)
+    rate.report(40, 0, 30, 20, skipped=6)  # the same queue, a second later: lower still...
+    assert rate.kbps == 8888 and rate.ceiling == 20000  # ...but where it showed stays
+
+
+def test_a_keyframe_s_skipped_frame_does_not_keep_the_bitrate_down():
+    rate = appdisplay.RateControl(20000)
+    rate.report(40, 0, 30, 20, skipped=15)
+    for second in range(120):  # a frame skipped with each keyframe, every 10 s
+        rate.report(60, 0, 30, 20, skipped=1 if second % 10 == 9 else 0)
+    assert rate.kbps == 20000 and rate.ceiling is None  # the ceiling went old, and it went back
 
 
 def test_a_still_desktop_s_few_frames_do_not_move_the_bitrate():

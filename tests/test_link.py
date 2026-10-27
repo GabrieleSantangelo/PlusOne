@@ -345,6 +345,20 @@ def test_the_app_is_handed_its_update_whatever_its_protocol(tmp_path, pc):
         sign_jobs.sign(app.target, str(apk), paired=paired)
 
 
+def test_only_updating_is_an_update(tmp_path, pc):
+    _path, paired = pc
+
+    def answers(wire):
+        receive(wire)
+        wire.send({"type": "pong"})  # not what an app installing it says
+    app = FakeApp(tmp_path, [answers])
+    fp = link.fingerprint(app.der)
+    paired.add(fp, "Tab")
+    apk = tmp_path / "app.apk"
+    apk.write_bytes(b"an app")
+    assert updates.update_app([app.target], fp[:16], str(apk), 800, paired) == "pong"
+
+
 def test_marks_that_make_no_sense_are_left_out():
     marks = sign_jobs.to_marks({"pages": [
         {"page": -1, "marks": [{"type": "text", "x": 1, "y": 1, "text": "x"}]},

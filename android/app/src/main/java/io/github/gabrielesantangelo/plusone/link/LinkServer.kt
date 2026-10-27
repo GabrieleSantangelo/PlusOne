@@ -85,13 +85,12 @@ class LinkServer(
     }
 
     private fun announce(kind: String, where: Int) {
-        val id = Identity.fingerprint(Identity.certificate.encoded)
-        for (announcer in announcers) {
-            try {
-                announcer.announce(kind, where, id, host.deviceName(), host.appVersion())
-            } catch (e: Exception) {
-                Log.e(TAG, "not announced (the PC still finds the app where it was): $e")
-            }
+        try {
+            val id = Identity.fingerprint(Identity.certificate.encoded)
+            for (announcer in announcers) announcer.announce(kind, where, id, host.deviceName(), host.appVersion())
+        } catch (e: Exception) {
+            // On the listener's thread: never its end. The PC still finds the app where it was.
+            Log.e(TAG, "not announced: $e")
         }
     }
 

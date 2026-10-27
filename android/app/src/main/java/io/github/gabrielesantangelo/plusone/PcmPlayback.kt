@@ -19,7 +19,8 @@ import io.github.gabrielesantangelo.plusone.link.Datagrams
  * two clocks drift apart (the PC's and the tablet's sound chip, tens of parts
  * per million): the playback rate follows by at most RATE_TRIM, which no ear
  * hears, so the wait neither grows nor runs dry. A packet that does not come
- * is the last one again, fading out.
+ * is the last one backwards, fading out (one, then silence), keeping time;
+ * more than MAX_HOLE missing, the sound is taken up where it is now.
  *
  * No gap heard is worth more than a few ms less. The Wi-Fi stalling, then
  * handing over what it held at once, grew the wait by as much, every time
@@ -37,9 +38,6 @@ import io.github.gabrielesantangelo.plusone.link.Datagrams
  */
 class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
                   private val rate: Int, private val frames: Int) {
-    private val datagrams = Datagrams(key, pc, pcPort, receiveBuffer = 1 shl 20)
-    /** This end's port, for the PC. */
-    val port get() = datagrams.port
     private val bytes = frames * CHANNELS * 2
     private val packets = HashMap<Int, ByteArray>()  // by number, under the lock
     private val lock = Object()
@@ -50,7 +48,11 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
     private var late = 0
     private var dropped = 0      // nearly silent packets left out, the wait too long
     private var written = 0L     // frames given to the track since it started
-    private var quietSince = 0L  // uptime ms since nothing was there to play (0: something was)
+    private var arrived = 0L       // uptime ms the last packet came (under the lock)
+    // What came at once after nothing for STALL_MS: its start, and how many in BURST_MS (under the lock).
+    private var burstAt = 0L
+    private var burst = 0
+    private var underrunsSeen = 0  // the track's underruns the player knows of
     private var held = PREFILL.toDouble()  // packets waiting, smoothed
     // The player's thread's: the cushion a stall asked for, and what the wait is brought to.
     private var target = PREFILL
@@ -71,6 +73,14 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
         .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT), bytes * 4))
         .build()
+    private val datagrams = try {
+        Datagrams(key, pc, pcPort, receiveBuffer = 1 shl 20)
+    } catch (e: Exception) {
+        track.release()
+        throw e
+    }
+    /** This end's port, for the PC. */
+    val port get() = datagrams.port
     private val receiver = Thread(::receive, "plusone-speakers-in")
     private val player = Thread(::play, "plusone-speakers-out")
 
@@ -103,8 +113,21 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
             synchronized(lock) {
                 if (started && number - next < 0) {
                     late++
-                } else if (packets.size < MAX_HELD) {
+                } else {
+                    // Full (the Wi-Fi held back more than a second): the oldest
+                    // go, they are the most out of date.
+                    if (packets.size >= MAX_HELD) {
+                        packets.remove(oldest())
+                        late++
+                    }
                     packets[number] = body.copyOfRange(5, body.size)
+                    val now = SystemClock.uptimeMillis()
+                    if (now - arrived >= STALL_MS) {
+                        burstAt = now
+                        burst = 0
+                    }
+                    if (now - burstAt <= BURST_MS) burst++
+                    arrived = now
                     lock.notifyAll()
                 }
             }
@@ -114,8 +137,11 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
     private fun play() {
         var last = ByteArray(bytes)
         var played = 0
-        var fadeIn = false  // the next packet starts from silence (after any gap)
-        var over = 0        // packets in a row the wait has been far over the cushion
+        var fadeIn = false     // the next packet starts from silence (after any gap)
+        var concealed = false  // what was written last stood in for a lost packet
+        var over = 0           // packets in a row the wait has been far over the cushion
+        var refilling = false  // the track ran dry: the wait fills up again before it plays
+        var skip = false       // what a stall held back is late: to be left out
         while (running) {
             val data: ByteArray = synchronized(lock) {
                 if (!started) {
@@ -126,65 +152,86 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
                     held = packets.size.toDouble()
                     started = true
                     fadeIn = true
+                    underrunsSeen = track.underrunCount
                     track.play()
                 }
-                // Once the track played out, it starts again from a full wait,
-                // not from the first packet back (the next unevenness of the
-                // Wi-Fi would be another gap).
-                val enough = if (quietSince != 0L) aim else 1
+                val underruns = track.underrunCount
+                if (underruns > underrunsSeen) {
+                    // A gap was heard (the track ran dry): it starts again from
+                    // a full wait, not from the next packet (the next
+                    // unevenness of the Wi-Fi would be another gap).
+                    underrunsSeen = underruns
+                    refilling = true
+                    fadeIn = true
+                }
+                val enough = if (refilling) aim else 1
                 if (packets.size < enough) {
                     // Nothing yet, the Wi-Fi slow: the track still plays what it
-                    // holds (tens of ms), so nothing is written meanwhile. (It
-                    // was flushed after 30 ms: what it held, thrown away, was
-                    // the sound that jumped.)
+                    // holds, so nothing is written meanwhile. (It was flushed
+                    // after 30 ms: what it held, thrown away, was the sound
+                    // that jumped.)
                     lock.wait(WAIT_MS)
-                    if (packets.size < enough) {
-                        val now = SystemClock.uptimeMillis()
-                        if (quietSince == 0L) {
-                            quietSince = now  // WAIT_MS with nothing: the track plays out
-                        } else if (now - quietSince >= STOPPED_MS) {
-                            // The PC stopped (a player paused, its silence not
-                            // sent): rest, and start from a full wait when it comes
-                            // back. Nothing thrown away: the track has played it all.
-                            quietSince = 0
-                            started = false
-                            track.pause()
-                        }
-                        return@synchronized null
+                    if (packets.size < enough && SystemClock.uptimeMillis() - arrived >= STOPPED_MS) {
+                        // The PC stopped (a player paused, its silence not sent):
+                        // rest, and start from a full wait when it comes back.
+                        // What little came is old by then; the track played the rest.
+                        late += packets.size
+                        packets.clear()
+                        refilling = false
+                        started = false
+                        track.pause()
                     }
+                    return@synchronized null
                 }
-                if (quietSince != 0L) {
-                    // What the Wi-Fi held comes at once, but a packet at a
-                    // time: all of it in, before saying how much it was.
-                    val until = SystemClock.uptimeMillis() + BURST_MS
-                    while (running && SystemClock.uptimeMillis() < until) lock.wait(maxOf(1, until - SystemClock.uptimeMillis()))
-                    quietSince = 0
-                    stalled()
+                if (refilling) {
+                    refilling = false
                     val first = oldest()
                     if (first - next > 0) missed += first - next  // lost meanwhile
                     next = first
                     held = packets.size.toDouble()
-                    fadeIn = true
                 }
-                val got = packets.remove(next)
+                if (stalled()) skip = true
+                if (skip && fadeIn) {
+                    // At a gap (the sound starts from silence): left out as is.
+                    skipTo(target)
+                    skip = false
+                }
+                var got = packets.remove(next)
+                if (got == null) {
+                    // Missing, and later ones here: stood in for (keeping time,
+                    // so the wait stays as it is), unless so many are missing
+                    // that the sound is better taken up where it is now.
+                    val first = oldest()
+                    if (first - next > MAX_HOLE) {
+                        missed += first - next
+                        next = first
+                        got = packets.remove(next)
+                        fadeIn = true
+                    }
+                }
                 next++
                 held = held * 0.99 + packets.size * 0.01
-                over = if (packets.size > target + OVER) over + 1 else 0
-                if (got != null && over >= OVER_FOR) {
-                    // Far over the cushion for a second, no stall seen: back to it now.
+                over = if (packets.size > minOf(target + OVER, MAX_TARGET + SLACK)) over + 1 else 0
+                if (got != null && (skip || over >= OVER_FOR)) {
+                    // What the Wi-Fi held back is late (or far over the cushion
+                    // for a second, no stall seen): back to the cushion now,
+                    // this packet faded out, the next faded in.
                     over = 0
+                    skip = false
                     skipTo(target)
                     fadeIn = true
-                    return@synchronized fade(got)
+                    concealed = true  // faded out to silence: a packet lost next stays silent
+                    return@synchronized fadeOut(got)
                 }
                 if (got != null && held > aim + SLACK && packets.size > aim && quiet(got)) {
                     dropped++
                     return@synchronized null  // the wait too long: a silence a packet shorter
                 }
                 when {
-                    got == null -> fade(last).also { missed++; fadeIn = true }
-                    fadeIn -> rampUp(got).also { fadeIn = false }
-                    else -> got
+                    got == null -> (if (concealed) ByteArray(bytes) else conceal(last))
+                        .also { missed++; fadeIn = true; concealed = true }
+                    fadeIn -> rampUp(got).also { fadeIn = false; concealed = false }
+                    else -> got.also { concealed = false }
                 }
             } ?: continue
             last = data
@@ -197,17 +244,16 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
     /** The oldest packet's number (under the lock, with some there). */
     private fun oldest() = packets.keys.minWithOrNull { a, b -> a - b }!!
 
-    /** After the track played out for want of packets (under the lock): if
-     * more came than the wait aims at, the Wi-Fi held them back. The
-     * cushion grows to bridge the next such stall; what came later than it
-     * can is late. */
-    private fun stalled() {
-        if (packets.size <= aim) return  // nothing held back: the PC was silent, say
-        // As long as what was held back, a little more for the Wi-Fi's unevenness.
-        target = maxOf(target, minOf(MAX_TARGET, packets.size + SLACK))
+    /** Once what came at once after a stall is all in (under the lock): the
+     * stall was as long as it held back. The cushion grows to bridge the
+     * next one like it; whether more waits than that, which is late now. */
+    private fun stalled(): Boolean {
+        if (burst <= BURST_PACKETS || SystemClock.uptimeMillis() - burstAt <= BURST_MS) return false
+        target = maxOf(target, minOf(MAX_TARGET, burst + SLACK))
         aim = target
         lastStall = SystemClock.uptimeMillis()
-        skipTo(target)
+        burst = 0
+        return packets.size > target + SLACK
     }
 
     /** The oldest packets left out (counted late), but the newest n (under the lock). */
@@ -279,13 +325,28 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
         return out
     }
 
-    /** The last packet again, fading out: a lost one is barely heard. */
-    private fun fade(last: ByteArray): ByteArray {
+    /** A packet fading out, to silence. */
+    private fun fadeOut(packet: ByteArray): ByteArray {
         val out = ByteArray(bytes)
-        val samples = ByteBuffer.wrap(last).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val samples = ByteBuffer.wrap(packet).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
         val faded = ByteBuffer.wrap(out).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
         val n = samples.limit()
         for (i in 0 until n) faded.put(i, (samples.get(i) * (n - i) / n).toShort())
+        return out
+    }
+
+    /** For a lost packet: the last one backwards, fading out. Backwards, it
+     * goes on from where the last one ended (no click), into silence. */
+    private fun conceal(last: ByteArray): ByteArray {
+        val out = ByteArray(bytes)
+        val samples = ByteBuffer.wrap(last).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val faded = ByteBuffer.wrap(out).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        for (f in 0 until frames) {
+            val from = frames - 1 - f
+            for (c in 0 until CHANNELS) {
+                faded.put(f * CHANNELS + c, (samples.get(from * CHANNELS + c) * (frames - f) / frames).toShort())
+            }
+        }
         return out
     }
 
@@ -296,7 +357,10 @@ class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
         const val PREFILL = 8         // packets of 5 ms: 40 ms
         const val MAX_HELD = 200      // a second: more is a stuck clock, not jitter
         const val WAIT_MS = 30L
-        const val BURST_MS = 20L      // for all of what the Wi-Fi held to come in, after it stalled
+        const val STALL_MS = 30L      // nothing came for this long, then...
+        const val BURST_MS = 20L      // ...in this long...
+        const val BURST_PACKETS = 12  // ...far more than come in it anyway (the PC sends a few at a time): held back
+        const val MAX_HOLE = 40       // packets missing that are stood in for (200 ms); more: a jump
         const val STOPPED_MS = 300L   // nothing for this long more: the PC stopped
         const val TRIM_EVERY = 200    // packets: once a second
         const val RATE_TRIM = 0.002   // at most 0.2 %

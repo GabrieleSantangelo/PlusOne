@@ -16,7 +16,7 @@ try:  # GLib >= 2.80 moved it; the old name warns in newer PyGObject
 except (ValueError, ImportError, AttributeError):
     signal_add = GLib.unix_signal_add
 
-from . import media, once  # noqa: E402
+from . import media  # noqa: E402
 from .engine import Controller, Settings, State, parse_size  # noqa: E402
 
 
@@ -59,7 +59,25 @@ def main():
         if state == State.IDLE or (state == State.ERROR and not controller.running):
             loop.quit()
 
-    controller = Controller(settings, on_state)
+    # Where the tablet's app is: announced (mDNS), else where it was last.
+    from .link import Discovery, Nearby, Tablets
+    tablets = Tablets(settings)
+
+    def go():
+        if not controller.running and controller.state == State.IDLE and not started:
+            started.append(True)
+            controller.start()
+        return False
+
+    def found():
+        tablet = tablets.active()
+        if tablet and tablets.discovery.addresses(tablet.app_id):
+            GLib.idle_add(go)
+
+    started = []
+    tablets.discovery = Discovery([Nearby(on_change=found)])
+    tablets.discovery.start()
+    controller = Controller(settings, on_state, tablets)
 
     def shutdown(*_):
         controller.stop()
@@ -68,7 +86,7 @@ def main():
 
     signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, shutdown)
     signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, shutdown)
-    GLib.idle_add(once(controller.start))
+    GLib.timeout_add_seconds(3, go)  # not announced by then: where it was last
     loop.run()
 
 

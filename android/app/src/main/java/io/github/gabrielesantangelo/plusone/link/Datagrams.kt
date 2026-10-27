@@ -37,7 +37,10 @@ class Datagrams(key: ByteArray, private val pc: InetAddress, @Volatile private v
         }
     }
 
-    /** body to the PC, sealed; throws if it cannot go. From any thread. */
+    /** body to the PC, sealed; throws if it cannot go. From any thread: one
+     * at a time, so they leave in the order of their counts (the PC takes
+     * only one newer than the newest it heard). */
+    @Synchronized
     fun send(body: ByteArray) {
         val sealedBody = sealed.seal(body)
         socket.send(DatagramPacket(sealedBody, sealedBody.size, pc, pcPort))

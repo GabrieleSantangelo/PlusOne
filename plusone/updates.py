@@ -43,11 +43,12 @@ def update_app(targets, expect, apk, version, paired=None):
     with link.connect(targets, expect, paired, any_version=True) as tablet:
         tablet.settimeout(link.IO_TIMEOUT * 4)  # 15 MB over a slow Wi-Fi
         try:
-            tablet.request({"type": "update", "version": version, "sha256": hashlib.sha256(data).hexdigest()},
-                           data, limit=link.UNPAIRED_HEADER)
+            reply = tablet.request({"type": "update", "version": version,
+                                    "sha256": hashlib.sha256(data).hexdigest()}, data, limit=link.UNPAIRED_HEADER)
         except link.Refused as e:
             return str(e) or "invalid"
-    return None
+    # Only "updating" is: anything else is not the app installing it.
+    return None if reply.get("type") == "updating" else str(reply.get("type") or "invalid")
 
 
 def version_code(version):
