@@ -8,7 +8,7 @@ set -e
 cd "$(dirname "$0")/.."
 [ $# -eq 2 ] && [ -n "$PLUSONE_KEYSTORE" ] && [ -n "$PLUSONE_KEYSTORE_PASSWORD" ] || {
     echo "usage: PLUSONE_KEYSTORE=... PLUSONE_KEYSTORE_PASSWORD=... $0 IN.apk OUT.apk" >&2; exit 2; }
-docker build -q -t plus-one-android - < Dockerfile.android > /dev/null
+docker build -q --target android -t plus-one-android - < Dockerfile.android > /dev/null
 key="$(cd "$(dirname "$PLUSONE_KEYSTORE")" && pwd)/$(basename "$PLUSONE_KEYSTORE")"
 in="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 out_dir="$(mkdir -p "$(dirname "$2")" && cd "$(dirname "$2")" && pwd)"

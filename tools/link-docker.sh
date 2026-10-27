@@ -8,7 +8,7 @@
 #                                     came or went (no network: nothing new)
 #   tools/link-docker.sh android      the app's JNI library (link/android),
 #                                     into android/app/src/main/jniLibs, in
-#                                     the Dockerfile.link-android container
+#                                     the Dockerfile.android container (its link-android stage)
 #   tools/link-docker.sh build|test|clippy|... [args]
 #                                     cargo, with no network at all: what the
 #                                     crates' build scripts and tests run
@@ -21,8 +21,8 @@ command="${1:-build}"
 shift || true
 if [ "$command" = android ]; then
     if [ -z "$PLUSONE_IMAGE_BUILT" ]; then  # CI builds them, with its cache
-        docker build -q -t plus-one-android - < Dockerfile.android > /dev/null
-        docker build -q -t plus-one-link-android - < Dockerfile.link-android > /dev/null
+        docker build -q --target android -t plus-one-android - < Dockerfile.android > /dev/null
+        docker build -q --target link-android -t plus-one-link-android - < Dockerfile.android > /dev/null
     fi
     out=android/app/src/main/jniLibs/arm64-v8a
     docker run --rm --network none -v "$PWD:/src" -v plus-one-cargo:/cargo plus-one-link-android \

@@ -139,12 +139,25 @@ def test_watch_sees_the_tablet_come_and_go(world):
             gone.set()
     watcher = link.watch(on_event)
     link.connect(address)
-    channel = link.open(tablet_id, "echo", "x", REALTIME)
     tablet.kill()
     # Its path lost: the session waits for another (15 s), then is over.
     assert gone.wait(25), events
     kinds = [e["event"] for e in events]
     assert kinds[0] == "up" and kinds[-1] == "gone" and "detached" in kinds and events[0]["device"] == tablet_id
+    watcher.close()
+
+
+def test_a_session_in_use_waits_longer(world):
+    link, address, tablet_id, tablet = world
+    gone = threading.Event()
+    watcher = link.watch(lambda event: event["event"] == "gone" and gone.set())
+    link.connect(address)
+    channel = link.open(tablet_id, "echo", "x", REALTIME)
+    tablet.kill()
+    # A channel open: the session waits 60 s for another path, not 15;
+    # once it is over, the channel ends.
+    assert not gone.wait(25)
+    assert gone.wait(45)
     assert channel.recv(timeout=1) == b""
     watcher.close()
 

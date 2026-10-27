@@ -105,18 +105,24 @@ jobs:
         with:
           context: .
           file: Dockerfile.android
+          target: android
           tags: plus-one-android
           load: true
           cache-from: type=gha,scope=android
           cache-to: type=gha,mode=max,scope=android
+      # A stage of the same file: this builder has the android stage from the
+      # step above, and never sees the image that step loaded.
       - name: Build the link's container (the NDK and Rust cached between runs)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
-          file: Dockerfile.link-android
+          file: Dockerfile.android
+          target: link-android
           tags: plus-one-link-android
           load: true
-          cache-from: type=gha,scope=link-android
+          cache-from: |
+            type=gha,scope=android
+            type=gha,scope=link-android
           cache-to: type=gha,mode=max,scope=link-android
       - name: The link's core for the app (link/android, into jniLibs)
         run: tools/link-docker.sh fetch && tools/link-docker.sh android

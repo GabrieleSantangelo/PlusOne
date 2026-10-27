@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build dist/plus-one_<version>_<arch>.deb from this checkout (no root
 # needed). The link's program, plus-one-link, built before (tools/link-docker.sh
-# build --release, or PLUSONE_LINK_BIN): the package is this machine's
+# build --release, or PLUSONE_LINK_PROGRAM): the package is this machine's
 # architecture's.
 set -e
 umask 022
@@ -12,7 +12,7 @@ app_id=io.github.gabrielesantangelo.PlusOne
 pkg=plus-one
 maintainer="santal1210 <sant.nino02@gmail.com>"
 arch="$(dpkg --print-architecture)"
-link_bin="${PLUSONE_LINK_BIN:-$top/link/target/release/plus-one-link}"
+link_bin="${PLUSONE_LINK_PROGRAM:-$top/link/target/release/plus-one-link}"
 [ -x "$link_bin" ] || { echo "no $link_bin: tools/link-docker.sh build --release first" >&2; exit 1; }
 root="$top/build/deb/${pkg}_${version}_${arch}"
 

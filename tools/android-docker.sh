@@ -9,7 +9,7 @@
 # the host), PLUSONE_KEYSTORE_PASSWORD and optionally PLUSONE_KEY_ALIAS.
 set -e
 cd "$(dirname "$0")/.."
-[ -n "$PLUSONE_IMAGE_BUILT" ] || docker build -q -t plus-one-android - < Dockerfile.android > /dev/null
+[ -n "$PLUSONE_IMAGE_BUILT" ] || docker build -q --target android -t plus-one-android - < Dockerfile.android > /dev/null
 gradle="${PLUSONE_GRADLE_CACHE:-plus-one-android-gradle}"
 owned="/src/android"
 [ -z "$PLUSONE_GRADLE_CACHE" ] || owned="$owned /gradle"  # a folder of the host's: the user's again
