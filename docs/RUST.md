@@ -105,6 +105,34 @@ So far, then: Rust sends packets far faster, but the packets are not
 where the time goes. What it buys at Plus One's loads is not speed but a
 single language with types, and no lock between the parts.
 
+## Measured: every channel at once
+
+The way the tablet is used most: the desktop, the speakers, the camera and
+the fingers and pen, all at once. `tools/bench/av.sh IMPL SIZE BITRATE
+SECONDS camera input` adds to the desktop and the speakers a camera's
+frames (1080p, 30 fps) written as the app writes them (taken from an
+appsink, copied, pushed into an appsrc: devices.py `_decoded_frame`), and
+the fake tablet's fingers and pen, 285 packets a second, taken by the
+gestures' code and given to nothing (not the desktop). 20 s, 1920x1200 at
+20 Mbit/s, twice each:
+
+| | Python | Python, every channel | Rust | Rust, every channel |
+|---|---|---|---|---|
+| Frames, p50 (ms) | 9.45 / 9.71 | 9.80 / 10.04 | 9.67 / 9.07 | 9.41 / 10.71 |
+| Frames, p99 (ms) | 12.13 / 11.89 | 12.90 / 12.51 | 13.40 / 11.49 | 11.96 / 19.80 |
+| Sound late, p99 (ms) | 0.39 / 0.42 | 0.37 / 0.46 | 0.32 / 0.29 | 0.32 / 0.29 |
+| Sound late, p99.9 (ms) | 1.08 / 1.21 | 0.98 / 1.13 | 1.09 / 0.98 | 0.65 / 0.77 |
+| Sound: gaps | 0 | 0 | 0 | 0 |
+| CPU in 20 s | 14.2 / 15.0 s | 19.2 / 19.3 | 14.5 / 13.2 | 17.3 / 20.0 |
+
+With every channel Python is 0.3-0.6 ms later a frame, the sound as even
+as before; Rust differs from run to run by more than it differs from
+Python, its sound a little more even (nobody hears a millisecond under a
+40 ms wait). The lock does not bite even then: each Python callback does
+little, and the heavy work (capture, encoder, WebRTC, OpenSSL, copies) is C
+in both. Not in this: the camera's WebRTC (C on either side), and the
+scrolls' D-Bus messages to Mutter (about 100 a second in use).
+
 ## Tried: Wi-Fi Direct (2026-10-27)
 
 `plus-one-rs display --p2p` asks the app over the link it has for a Wi-Fi

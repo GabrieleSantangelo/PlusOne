@@ -58,6 +58,9 @@ pub struct Options {
     pub encoder: String,
     pub touch: bool,
     pub test: bool,
+    /// With the test pattern: the fingers and the pen taken as on the
+    /// desktop, given to nothing (bench.rs measures what they cost).
+    pub bench_input: bool,
 }
 
 #[derive(Default)]
@@ -174,7 +177,12 @@ impl Session {
             drop(state);
             return self.ended(Some("no H.264 encoder available".into()));
         };
-        let input = match (&state.monitor, options.touch) {
+        let input = if options.bench_input && state.monitor.is_none() {
+            let started = Instant::now();
+            Some(Input::new(Arc::new(crate::bench::Nothing), (width, height),
+                            Box::new(|| Some(Box::new(crate::bench::Nothing) as Box<dyn pen::Pen>)),
+                            Box::new(move || started.elapsed().as_secs_f64())))
+        } else { match (&state.monitor, options.touch) {
             (Some(monitor), true) => {
                 let injector: Arc<dyn Injector> = monitor.clone();
                 let for_pen = injector.clone();
@@ -184,7 +192,7 @@ impl Session {
                                 Box::new(move || started.elapsed().as_secs_f64())))
             }
             _ => None,
-        };
+        } };
         let (stats, failed) = (self.clone(), self.clone());
         let callbacks = Callbacks {
             on_stats: Box::new(move |s| stats.stats(s)),

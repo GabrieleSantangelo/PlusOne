@@ -51,10 +51,62 @@ struct Measured {
     packets: u64,
 }
 
+/// Where the fingers and the pen go in a measurement: nowhere (not the desktop).
+pub struct Nothing;
+
+impl crate::display::monitor::Injector for Nothing {
+    fn touch_down(&self, _: u32, _: f64, _: f64) {}
+    fn touch_motion(&self, _: u32, _: f64, _: f64) {}
+    fn touch_up(&self, _: u32) {}
+    fn pointer_move(&self, _: f64, _: f64) {}
+    fn pointer_button(&self, _: i32, _: bool) {}
+    fn pointer_axis(&self, _: f64, _: f64, _: bool) {}
+    fn keysym(&self, _: u32, _: bool) {}
+}
+
+impl crate::display::pen::Pen for Nothing {
+    fn report(&mut self, _: &[u8]) {}
+    fn close(&mut self) {}
+}
+
+/// What the camera costs the PC once its frames are decoded, as the app's
+/// Camera writes them to the webcam (devices.py _decoded_frame): each frame
+/// taken from an appsink, copied, pushed into an appsrc (here to nowhere).
+pub fn camera_load(width: u32, height: u32, fps: u32) -> (gst::Pipeline, gst::Pipeline) {
+    use gst::prelude::*;
+    let caps = format!("video/x-raw,format=YUY2,width={width},height={height},framerate={fps}/1");
+    let decoded = gst::parse::launch(&format!("videotestsrc is-live=true pattern=ball ! {caps} ! \
+                                               appsink name=decoded sync=false max-buffers=2 drop=true"))
+        .unwrap().downcast::<gst::Pipeline>().unwrap();
+    let writer = gst::parse::launch(&format!("appsrc name=frames is-live=true do-timestamp=true format=time caps={caps} ! \
+                                              fakesink sync=false"))
+        .unwrap().downcast::<gst::Pipeline>().unwrap();
+    let frames = writer.by_name("frames").unwrap().downcast::<gst_app::AppSrc>().unwrap();
+    let sink = decoded.by_name("decoded").unwrap().downcast::<gst_app::AppSink>().unwrap();
+    sink.set_callbacks(gst_app::AppSinkCallbacks::builder().new_sample(move |sink| {
+        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+        let mut buffer = sample.buffer().ok_or(gst::FlowError::Error)?.copy_deep().map_err(|_| gst::FlowError::Error)?;
+        {
+            let buffer = buffer.get_mut().unwrap();
+            buffer.set_pts(gst::ClockTime::NONE);
+            buffer.set_dts(gst::ClockTime::NONE);
+        }
+        let _ = frames.push_buffer(buffer);
+        Ok(gst::FlowSuccess::Ok)
+    }).build());
+    writer.set_state(gst::State::Playing).unwrap();
+    decoded.set_state(gst::State::Playing).unwrap();
+    (decoded, writer)
+}
+
+/// The fingers and the pen's packets a second the fake app sends (--input-hz).
+static INPUT_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn fake_app(args: &[String]) {
     let dir = std::path::PathBuf::from(args.first().expect("a directory"));
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let port: u16 = value("--port").and_then(|v| v.parse().ok()).unwrap_or(47999);
+    INPUT_HZ.store(value("--input-hz").and_then(|v| v.parse().ok()).unwrap_or(0), Ordering::Relaxed);
     let (width, height) = value("--screen").and_then(|s| {
         let (w, h) = s.split_once('x')?;
         Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
@@ -126,7 +178,7 @@ fn session(tls: &SslAcceptor, tcp: std::net::TcpStream, screen: (u32, u32)) -> O
                                    "at": "127.0.0.1", "app": 900}), None).ok()?;
     let request = wire::receive(&mut stream, MAX_HEADER).ok()?;
     match request.get("type").and_then(Value::as_str) {
-        Some("display") => Some(display(stream, &request, screen)),
+        Some("display") => Some(display(stream, &request, screen, INPUT_HZ.load(Ordering::Relaxed))),
         Some("speakers") => Some(speakers(stream, &request)),
         _ => None,
     }
@@ -210,7 +262,40 @@ fn speakers(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &
 
 /// The desktop: frames put back together, each one's capture to its last
 /// packet in, reports each second as the app's.
-fn display(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &wire::Message, (width, height): (u32, u32)) -> String {
+/// The app's packets to the PC, sealed and sent in the order of their counts
+/// (the PC takes only one newer than the newest it heard).
+struct Sender {
+    ctx: CipherCtx,
+    sent: u64,
+}
+
+impl Sender {
+    fn new(key: &[u8]) -> Sender {
+        let mut ctx = CipherCtx::new().unwrap();
+        ctx.encrypt_init(Some(Cipher::aes_256_gcm()), Some(key), None).unwrap();
+        Sender { ctx, sent: 0 }
+    }
+
+    fn send(&mut self, udp: &UdpSocket, body: &[u8], to: std::net::SocketAddr) {
+        let mut out = Vec::with_capacity(NONCE + body.len() + TAG);
+        out.extend_from_slice(&FROM_APP.to_be_bytes());
+        out.extend_from_slice(&self.sent.to_be_bytes());
+        self.sent += 1;
+        let nonce: [u8; 12] = out[..12].try_into().unwrap();
+        self.ctx.encrypt_init(None, None, Some(&nonce)).unwrap();
+        let mut sealed = vec![0u8; body.len()];
+        let n = self.ctx.cipher_update(body, Some(&mut sealed)).unwrap();
+        self.ctx.cipher_final(&mut sealed[n..]).unwrap();
+        let mut tag = [0u8; 16];
+        self.ctx.tag(&mut tag).unwrap();
+        out.extend_from_slice(&sealed);
+        out.extend_from_slice(&tag);
+        let _ = udp.send_to(&out, to);
+    }
+}
+
+fn display(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &wire::Message, (width, height): (u32, u32),
+           input_hz: u32) -> String {
     let key = unhex(request.get("key").and_then(Value::as_str).unwrap()).unwrap();
     let pc_port = request.get("port").and_then(Value::as_u64).unwrap() as u16;
     let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -225,25 +310,47 @@ fn display(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &w
 
     let measured = Arc::new(Mutex::new(Measured::default()));
     let mut opener = opener(&key);
-    let mut sealer = CipherCtx::new().unwrap();
-    sealer.encrypt_init(Some(Cipher::aes_256_gcm()), Some(&key), None).unwrap();
-    let mut sent = 0u64;
-    let mut seal = |body: &[u8]| -> Vec<u8> {
-        let mut out = Vec::with_capacity(NONCE + body.len() + TAG);
-        out.extend_from_slice(&FROM_APP.to_be_bytes());
-        out.extend_from_slice(&sent.to_be_bytes());
-        sent += 1;
-        let nonce: [u8; 12] = out[..12].try_into().unwrap();
-        sealer.encrypt_init(None, None, Some(&nonce)).unwrap();
-        let mut sealed = vec![0u8; body.len()];
-        let n = sealer.cipher_update(body, Some(&mut sealed)).unwrap();
-        sealer.cipher_final(&mut sealed[n..]).unwrap();
-        let mut tag = [0u8; 16];
-        sealer.tag(&mut tag).unwrap();
-        out.extend_from_slice(&sealed);
-        out.extend_from_slice(&tag);
-        out
-    };
+    let udp = Arc::new(udp);
+    let sender = Arc::new(Mutex::new(Sender::new(&key)));
+    // The fingers and the pen, as DisplayInput.kt sends them: two fingers
+    // going round (a scroll), lifted every two seconds, and two pen samples
+    // in each packet, input_hz packets a second.
+    if input_hz > 0 {
+        let (udp, sender, done) = (udp.clone(), sender.clone(), done.clone());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut next = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                let t = started.elapsed().as_secs_f64();
+                let mut body = vec![6u8];
+                if t % 2.0 < 1.6 {
+                    body.push(2);
+                    for (id, offset) in [(0u8, 0.0f64), (1, 0.4)] {
+                        let x = (0.2 + offset + 0.1 * (t * 3.0).cos()) * 65535.0;
+                        let y = (0.5 + 0.1 * (t * 3.0).sin()) * 65535.0;
+                        body.push(id);
+                        body.extend_from_slice(&(x.clamp(0.0, 65535.0) as u16).to_be_bytes());
+                        body.extend_from_slice(&(y as u16).to_be_bytes());
+                    }
+                } else {
+                    body.push(0);
+                }
+                body.push(2);
+                for k in 0..2u16 {
+                    body.push(0x11);  // in range, tip down
+                    body.extend_from_slice(&(10000 + k * 10).to_le_bytes());
+                    body.extend_from_slice(&(12000 + (t * 100.0) as u16 % 10000).to_le_bytes());
+                    body.extend_from_slice(&2000u16.to_le_bytes());
+                    body.extend_from_slice(&[10, 0xf6]);
+                }
+                sender.lock().unwrap().send(&udp, &body, pc);
+                next += Duration::from_secs_f64(1.0 / input_hz as f64);
+                if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+            }
+        });
+    }
     let mut frames: BTreeMap<u32, Frame> = BTreeMap::new();
     let mut newest = 0u32;
     let mut packet = [0u8; 2048];
@@ -256,7 +363,7 @@ fn display(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &w
             let mut ping = vec![3u8];
             ping.extend_from_slice(&now_ns().to_be_bytes());
             ping.push(1);
-            let _ = udp.send_to(&seal(&ping), pc);
+            sender.lock().unwrap().send(&udp, &ping, pc);
             let mut m = measured.lock().unwrap();
             let mut s = std::mem::take(&mut m.second);
             s.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -269,7 +376,7 @@ fn display(mut stream: openssl::ssl::SslStream<std::net::TcpStream>, request: &w
                 stats.extend_from_slice(&tenths(v).to_be_bytes());
             }
             drop(m);
-            let _ = udp.send_to(&seal(&stats), pc);
+            sender.lock().unwrap().send(&udp, &stats, pc);
         }
         let Ok((n, _)) = udp.recv_from(&mut packet) else { continue };
         let arrived = now_ns();

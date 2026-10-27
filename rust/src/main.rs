@@ -12,7 +12,9 @@
 //!   plus-one-rs fake-app DIR [--port P] [--screen WxH] [--seconds N]
 //!                             a tablet of pretend, to measure the PC's side (bench.rs)
 //!   plus-one-rs bench-av --at HOST:PORT [--seconds N] [--bitrate KBPS] [--size WxH]
-//!                             a test pattern and a test tone to it at once
+//!                        [--camera] [--input]
+//!                             a test pattern and a test tone to it at once; the
+//!                             camera's frames written, the fingers and the pen taken
 
 // The port is underway: what the next parts use (pairing from the window,
 // a link's shutdown, the GUI's discovery) is here before them.
@@ -111,6 +113,7 @@ fn show_desktop(args: &[String]) {
         encoder: value("--encoder").unwrap_or_else(|| "auto".into()),
         touch: !args.iter().any(|a| a == "--no-input"),
         test: args.iter().any(|a| a == "--test"),
+        bench_input: false,
     };
     let p2p = args.iter().any(|a| a == "--p2p");
     let seconds: Option<u32> = value("--seconds").and_then(|v| v.parse().ok());
@@ -303,7 +306,10 @@ fn bench_av(args: &[String]) {
         Some((w.parse().ok()?, h.parse().ok()?))
     });
     let options = display::Options { size, fps: 60, bitrate: option(args, "--bitrate").and_then(|v| v.parse().ok()).unwrap_or(20000),
-                                     encoder: "auto".into(), touch: false, test: true };
+                                     encoder: "auto".into(), touch: false, test: true,
+                                     bench_input: args.iter().any(|a| a == "--input") };
+    // The camera's frames, as the app writes them to the webcam (--camera).
+    let _camera = args.iter().any(|a| a == "--camera").then(|| bench::camera_load(1920, 1080, 30));
     let session = display::Session::start(targets, id, options, |error, _| {
         if let Some(error) = error {
             log!("app display ended: {error}");
