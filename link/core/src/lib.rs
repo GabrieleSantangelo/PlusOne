@@ -11,6 +11,7 @@ pub mod identity;
 pub mod mdns;
 pub mod node;
 pub mod pace;
+pub mod relay;
 pub mod seal;
 pub mod session;
 pub mod stream;

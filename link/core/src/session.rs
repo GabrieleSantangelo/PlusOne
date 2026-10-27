@@ -128,6 +128,12 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// The same channel, for another thread (one reads while one writes).
+    pub fn try_clone(&self) -> io::Result<Channel> {
+        Ok(Channel { fd: self.fd.try_clone()?, id: self.id, class: self.class, feature: self.feature.clone(),
+                     name: self.name.clone() })
+    }
+
     /// One message, waiting for room.
     pub fn send(&self, data: &[u8]) -> io::Result<()> {
         sys::send(self.fd.as_raw_fd(), data, true).map(|_| ())

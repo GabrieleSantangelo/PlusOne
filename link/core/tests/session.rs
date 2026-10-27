@@ -373,6 +373,67 @@ fn a_slow_channel_is_neither_closed_nor_in_the_others_way() {
 }
 
 #[test]
+fn a_session_through_a_relay() {
+    // Neither reaches the other: both dial a relay (here, on loopback), which
+    // joins them and copies bytes; the session's TLS is end to end.
+    let (pc_id, pc_fp) = identity();
+    let (tablet_id, tablet_fp) = identity();
+    let tablet = Node::new("tablet", &tablet_id, trusting(&pc_fp)).unwrap();
+    tablet.serve("echo", 1, |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 || incoming.channel.send(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+    let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay = listener.local_addr().unwrap();
+    std::thread::spawn(move || plusone_link::relay::serve(listener));
+    let (tablet_side, pc_fingerprint) = (tablet.clone(), pc_fp.clone());
+    std::thread::spawn(move || tablet_side.relay(relay, &pc_fingerprint, false, Duration::from_secs(2)).map(|_| ()));
+    let session = pc.relay(relay, &tablet_fp, true, Duration::from_secs(2)).unwrap();
+    assert_eq!(session.path().as_deref(), Some("relay"));
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let mut buf = vec![0u8; 1 << 17];
+    control.send(b"through the relay").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(17));
+    // As fast as the relay copies: 32 MiB there and back on loopback.
+    let started = Instant::now();
+    let chunk = vec![7u8; 64 << 10];
+    let sending = {
+        let control = session.open("echo", "bulk", Class::Control).unwrap();
+        std::thread::spawn(move || {
+            let mut got = 0;
+            let reader = std::thread::spawn({
+                let control = control.try_clone().unwrap();
+                move || {
+                    let mut buf = vec![0u8; 1 << 17];
+                    let mut got = 0;
+                    while got < 512 * (64 << 10) {
+                        match control.recv(&mut buf, WAIT) {
+                            Ok(Some(n)) if n > 0 => got += n,
+                            _ => break,
+                        }
+                    }
+                    got
+                }
+            });
+            for _ in 0..512 {
+                control.send(&chunk).unwrap();
+            }
+            got += reader.join().unwrap();
+            got
+        })
+    };
+    let got = sending.join().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(got, 512 * (64 << 10));
+    println!("relay on loopback: {:.0} MB/s each way", got as f64 / elapsed.as_secs_f64() / 1e6);
+}
+
+#[test]
 fn a_session_goes_on_over_another_path() {
     let (pc, tablet, address) = pair();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();

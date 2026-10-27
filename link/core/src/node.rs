@@ -38,6 +38,7 @@ pub enum Event {
 
 pub(crate) struct NodeInner {
     name: String,
+    identity_fingerprint: String,  // ours (a relay's rendezvous is made of the two)
     client: Arc<rustls::ClientConfig>,
     server: Arc<rustls::ServerConfig>,
     paired: Paired,
@@ -154,6 +155,7 @@ impl Node {
     pub fn new(name: &str, identity: &Identity, paired: Paired) -> Result<Node, String> {
         Ok(Node(Arc::new(NodeInner {
             name: name.to_owned(),
+            identity_fingerprint: identity.fingerprint(),
             client: identity.client_config(paired.clone())?,
             server: identity.server_config(paired.clone())?,
             paired,
@@ -284,6 +286,21 @@ impl Node {
     /// at address.
     pub fn connect(&self, address: SocketAddr, timeout: Duration) -> Result<Arc<Session>, String> {
         self.connect_as(address, timeout, "lan")
+    }
+
+    /// A session (or a path for the one we have) with the paired device
+    /// whose fingerprint is peer, through the relay at relay (the last path:
+    /// both sides dial it). dialer: this side makes the session's TLS (the
+    /// PC), the other takes it.
+    pub fn relay(&self, relay: SocketAddr, peer: &str, dialer: bool, timeout: Duration) -> Result<Arc<Session>, String> {
+        let ours = self.0.identity_fingerprint.clone();
+        let stream = crate::relay::dial(relay, &crate::relay::rendezvous(&ours, peer), timeout)
+            .map_err(|e| format!("the relay at {relay}: {e}"))?;
+        if dialer {
+            self.connect_stream(Box::new(stream), "relay")
+        } else {
+            self.accept_stream(Box::new(stream), "relay")
+        }
     }
 
     /// As connect(), the path of that kind ("lan", "p2p": a Wi-Fi Direct
