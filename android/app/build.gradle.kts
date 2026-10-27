@@ -60,6 +60,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
+
+    // The link's tests run on the JVM (src/test): Android's classes there
+    // are stubs, which do nothing instead of failing (Log, say).
+    testOptions.unitTests.isReturnDefaultValues = true
 }
 
 dependencies {
@@ -71,4 +75,8 @@ dependencies {
     // camera and the microphone for the PC, with its audio processing,
     // congestion control and retransmissions.
     implementation("io.github.webrtc-sdk:android:125.6422.07")
+
+    testImplementation("junit:junit:4.13.2")
+    // org.json as it is: Android's own is only stubs off the device.
+    testImplementation("org.json:json:20240303")
 }

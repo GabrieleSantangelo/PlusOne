@@ -32,7 +32,7 @@ class SpeakersHandler(private val service: CompanionService) : Handler {
         try {
             playback.start()
             link.send(JSONObject().put("type", "answer")
-                .put("sdp", JSONObject().put("port", playback.socket.localPort).toString()))
+                .put("sdp", JSONObject().put("port", playback.port).toString()))
             service.showSessions()
             service.lowLatency(true)
             link.hold()

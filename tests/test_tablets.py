@@ -1,4 +1,4 @@
-"""The paired tablets, the one in use, and the check of Second Screen's tablet."""
+"""The paired tablets, the one in use, and where to reach its app."""
 import pytest
 
 from plusone import link
@@ -52,7 +52,7 @@ def test_pairings_of_0_5_are_kept(tmp_path):
 
 def test_where_the_app_was_last_is_tried_when_it_is_not_announced(paired):
     nearby = Nearby([("10.0.0.7", 47236, KITCHEN[:16])])
-    tablets = Tablets(Settings(), paired=paired, nearby=nearby)
+    tablets = Tablets(Settings(), paired=paired, discovery=nearby)
     kitchen = tablets.active()
     assert tablets.targets(kitchen) == [("10.0.0.7", 47236)]
     assert paired.entries()[KITCHEN]["app_at"] == "10.0.0.7:47236"  # remembered
@@ -65,3 +65,13 @@ def test_where_the_app_was_last_is_tried_when_it_is_not_announced(paired):
     assert tablets.targets(office) == []  # never seen: nowhere to try
     paired.learn(OFFICE, app_at="nonsense:99999")
     assert tablets.targets(office) == []
+
+
+def test_only_a_network_address_is_remembered(paired):
+    """Another transport's target (USB, say) is not where to try next time."""
+    found = Nearby()
+    found.addresses = lambda app_id: [("usb", "R5CX", 47236), ("10.0.0.8", 47236)]
+    tablets = Tablets(Settings(), paired=paired, discovery=found)
+    kitchen = tablets.active()
+    assert tablets.targets(kitchen) == [("usb", "R5CX", 47236), ("10.0.0.8", 47236)]
+    assert paired.entries()[KITCHEN]["app_at"] == "10.0.0.8:47236"

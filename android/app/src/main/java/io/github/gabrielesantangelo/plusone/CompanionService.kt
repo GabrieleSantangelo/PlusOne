@@ -12,6 +12,8 @@ import android.provider.Settings
 import android.util.Log
 import io.github.gabrielesantangelo.plusone.link.Link
 import io.github.gabrielesantangelo.plusone.link.LinkServer
+import io.github.gabrielesantangelo.plusone.link.MdnsAnnouncer
+import io.github.gabrielesantangelo.plusone.link.TcpListener
 import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
@@ -19,7 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Always ready for the PC: the app's services on the paired PCs' links
- * (link.LinkServer: listening, mDNS, pairing): a PDF to sign (SignHandler),
+ * (link.LinkServer: listeners, announcers, pairing): a PDF to sign (SignHandler),
  * the desktop (DisplayHandler), the speakers (SpeakersHandler), the camera
  * and the microphone (CaptureHandler), the app's update (UpdateHandler). A
  * foreground service (Android shows it as a quiet notification, which says
@@ -48,8 +50,13 @@ class CompanionService : Service(), LinkServer.Host {
         File(cacheDir, "jobs").listFiles()?.forEach { if (it.nameWithoutExtension !in Jobs.ids) it.delete() }
         Jobs.listen(queueChanged)
         queueChanged()  // nor a notification for them
-        server = LinkServer(this, listOf(SignHandler(this), DisplayHandler(this), SpeakersHandler(this),
-            CaptureHandler(this), UpdateHandler(this)), this).also { it.start() }
+        server = LinkServer(this,
+            handlers = listOf(SignHandler(this), DisplayHandler(this), SpeakersHandler(this),
+                CaptureHandler(this), UpdateHandler(this)),
+            host = this,
+            // How the PCs reach the app, and learn where: another way is one more here.
+            listeners = listOf(TcpListener()),
+            announcers = listOf(MdnsAnnouncer(this))).also { it.start() }
         handler.postDelayed(::idleCheck, IDLE_CHECK)
     }
 

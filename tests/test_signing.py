@@ -56,8 +56,8 @@ class FakeApp:
     def __init__(self, paired=True):
         self.controller = FakeController()
         self.settings = Settings()
-        self.nearby = FakeNearby()
-        self.tablets = Tablets(self.settings, nearby=self.nearby,
+        self.discovery = FakeNearby()
+        self.tablets = Tablets(self.settings, discovery=self.discovery,
                                paired=FakePaired({TAB: {"name": "Galaxy Tab"}} if paired else {}))
         self.notes = []
 
@@ -110,7 +110,7 @@ def make(monkeypatch, paired=True):
 def test_asked_again_while_on_the_tablet_is_one_request(monkeypatch, tmp_path):
     # Files was clicked three times while the tablet took its time.
     app, signing, _, _ = make(monkeypatch)
-    app.nearby.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
     sent = []
     monkeypatch.setattr(signing, "_sign_in_app", lambda path, target: (sent.append(path),
                                                                          signing.in_app.update({path: "t"})))
@@ -151,7 +151,7 @@ def spin(until, timeout=5):
 
 def test_the_tablets_app_signs_when_it_is_on_the_network(monkeypatch, tmp_path):
     app, signing, _, _ = make(monkeypatch)
-    app.nearby.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
     marks = {"pages": [{"page": 1, "marks": [
         {"type": "stroke", "width": 1.2, "color": [0, 0, 0], "points": [10, 20, 0.5, 30, 40, 0.6]}]}]}
     asked, saved = [], []
@@ -177,7 +177,7 @@ def test_the_tablets_app_signs_when_it_is_on_the_network(monkeypatch, tmp_path):
 
 def test_an_app_that_does_not_answer_offers_signing_here(monkeypatch, tmp_path):
     app, signing, _, notes = make(monkeypatch)
-    app.nearby.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
 
     def unreachable(*args, **kwargs):
         raise ConnectionRefusedError()
@@ -204,7 +204,7 @@ def test_pen_and_signatures_from_the_tablet_are_kept(monkeypatch, tmp_path):
 def test_only_the_tablet_in_use_signs(monkeypatch, tmp_path):
     # Another tablet's app on the network, paired or not, gets nothing.
     app, signing, _, _ = make(monkeypatch)
-    app.nearby.app_on = ("10.0.0.7", 40000, "Someone's Tab", "ffff" + "0" * 12)
+    app.discovery.app_on = ("10.0.0.7", 40000, "Someone's Tab", "ffff" + "0" * 12)
     monkeypatch.setattr(sign_jobs, "sign", lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
     signing.request(str(tmp_path / "form.pdf"))
     assert not signing.in_app
@@ -212,7 +212,7 @@ def test_only_the_tablet_in_use_signs(monkeypatch, tmp_path):
 
 def test_nothing_is_sent_without_a_paired_tablet(monkeypatch, tmp_path):
     app, signing, _, notes = make(monkeypatch, paired=False)
-    app.nearby.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
     monkeypatch.setattr(sign_jobs, "sign", lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
     signing.request(str(tmp_path / "form.pdf"))
     assert app.notes == ["sign"] and app.controller.starts == 0 and not signing.in_app
@@ -231,15 +231,15 @@ def test_a_dropped_link_finds_the_same_tablet_again(monkeypatch):
     # from whichever would be picked for a new PDF.
     from plusone.link import Nearby
     app, signing, _, _ = make(monkeypatch)
-    app.nearby = Nearby()
-    app.nearby.companions = {"a": ("10.0.0.2", 1000, "Kitchen", "aaaa"), "b": ("10.0.0.9", 2001, "Office", "bbbb")}
+    app.discovery = Nearby()
+    app.discovery.companions = {"a": ("10.0.0.2", 1000, "Kitchen", "aaaa"), "b": ("10.0.0.9", 2001, "Office", "bbbb")}
     assert signing._locate_app("bbbb") == [("10.0.0.9", 2001)]
     assert signing._locate_app("cccc") is None
 
 
 def test_signed_on_the_tablet_is_never_lost_for_a_folder_that_takes_nothing(monkeypatch, tmp_path):
     app, signing, _, _ = make(monkeypatch)
-    app.nearby.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
     marks = {"pages": [{"page": 0, "marks": [
         {"type": "stroke", "width": 1.2, "color": [0, 0, 0], "points": [10, 20, 0.5, 30, 40, 0.6]}]}]}
     monkeypatch.setattr(sign_jobs, "sign", lambda target, path, **kw: marks)

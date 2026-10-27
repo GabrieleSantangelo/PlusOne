@@ -7,8 +7,8 @@ import javax.crypto.spec.SecretKeySpec
 
 /**
  * Packets sealed with AES-GCM under a session's key, which the PC handed over
- * the paired TLS link (plusone/appdisplay.py: Channel): nonce (12 bytes: 4
- * for the direction, 8 counting, never the same twice) | sealed body.
+ * the paired TLS link (Datagrams; plusone/link/datagrams.py): nonce (12
+ * bytes: 4 for the direction, 8 counting, never the same twice) | sealed body.
  */
 class Sealed(key: ByteArray) {
     private val key = SecretKeySpec(key, "AES")
@@ -37,6 +37,9 @@ class Sealed(key: ByteArray) {
     }
 
     companion object {
+        /** A packet's count, from its nonce (opened: the PC's, then). */
+        fun count(packet: ByteArray): Long = ByteBuffer.wrap(packet, 4, 8).long
+
         const val FROM_PC: Byte = 1
         const val FROM_APP: Byte = 2
         const val NONCE = 12

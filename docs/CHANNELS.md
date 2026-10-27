@@ -1,6 +1,24 @@
 # Proposal: one link, many channels (0.8)
 
-Status: a proposal, for discussion. Nothing here is built yet.
+Status: the separation is built, with the wire protocol unchanged; the
+steps below are not.
+
+Connectivity is now a package of its own on each side, under every
+service, which never opens a socket itself:
+
+| Primitive | PC (`plusone/link/`) | App (`link/`) |
+|---|---|---|
+| Discovery | `discovery.py`: every source as one; `nearby.py` (mDNS) | `Announcer.kt`: `MdnsAnnouncer` |
+| Transports | `transport.py`: `Tcp`, targets `(host, port)` or `(kind, ...)` | `Listener.kt`: `TcpListener` |
+| Trust | `trust.py`: identity, paired tablets, pairing code | `Identity.kt`, `Paired.kt`, pairing in `LinkServer.kt` |
+| Links | `link.py`: `connect`, `request`, `hold` | `LinkServer.kt`; `Link.kt`: `Link`, `Requests`, `Handler` |
+| Datagrams | `datagrams.py`: `Datagrams` | `Datagrams.kt` (with a replay window), `Sealed.kt` |
+| Messages | `wire.py` | `Wire.kt` |
+
+A new way of finding a tablet is one more discovery source on the PC and
+one more announcer in the app; a new way of reaching it, a transport and a
+listener; a new service, a `Handler` in the app. The steps below change the
+protocol on top of these.
 
 ## Why
 
@@ -70,15 +88,17 @@ It adds the following:
   - The key is fresh for each link session and handed over the TLS link,
     as now. (Python's `ssl` has no TLS exporter, which would otherwise
     derive it.)
-  - Replay protection becomes a sliding window instead of "higher than the
-    last". Today a reordered packet is dropped as a replay; for media that
-    is a loss.
+  - Replay protection is a sliding window instead of "higher than the
+    last", which dropped a reordered packet as a replay (for media, a
+    loss). The app has it (`Datagrams.kt`, 1024 packets). The PC keeps
+    "higher than the last": the app sends it input as states, and an older
+    one must not undo a newer.
   - QoS per channel: DSCP (voice for audio, video for video), and the
     Wi-Fi low-latency lock only while a realtime channel is open and
     shown.
 
-The `appdisplay.Channel` and `Sealed.kt` of today are most of the
-datagram side already.
+`Datagrams` on both sides (`datagrams.py`, `Datagrams.kt`) are most of the
+datagram side already; the app's has the sliding window.
 
 ### Media
 

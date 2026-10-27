@@ -1,6 +1,6 @@
 """The paired tablets, and the one in use: the only one that gets the
 desktop and the PDFs to sign, and whose camera, microphone and speakers
-are the PC's. Where its app is: announced on the network (nearby.py), or
+are the PC's. Where its app is: announced (discovery.py), or
 where it was last.
 """
 from dataclasses import dataclass
@@ -20,12 +20,12 @@ class Tablet:
 
 
 class Tablets:
-    def __init__(self, settings, save=lambda: None, nearby=None, paired=None):
+    def __init__(self, settings, save=lambda: None, discovery=None, paired=None):
         """settings.tablet: the fingerprint of the one in use; save() stores
-        the settings; nearby: where the apps are on the network, if known."""
+        the settings; discovery: where the apps are, if known."""
         self.settings = settings
         self.save = save
-        self.nearby = nearby
+        self.discovery = discovery
         self.paired = paired or Paired()
 
     def all(self):
@@ -64,10 +64,12 @@ class Tablets:
             self.save()
 
     def addresses(self, tablet):
-        """Where its app is announced on the network: [(address, port)]."""
-        found = self.nearby.addresses(tablet.app_id) if self.nearby else []
-        if found:
-            at = "%s:%d" % found[0]
+        """Where its app is announced: its targets (transport.py), (address,
+        port) on the network; the first of those is remembered."""
+        found = self.discovery.addresses(tablet.app_id) if self.discovery else []
+        tcp = next((t for t in found if len(t) == 2 and isinstance(t[1], int)), None)
+        if tcp:
+            at = "%s:%d" % tcp
             if self.paired.entries().get(tablet.fingerprint, {}).get("app_at") != at:
                 self.paired.learn(tablet.fingerprint, app_at=at)
         return found
@@ -79,8 +81,8 @@ class Tablets:
         found = self.addresses(tablet)
         if found:
             return found
-        if self.nearby:
-            self.nearby.refresh()
+        if self.discovery:
+            self.discovery.refresh()
         at = self.paired.entries().get(tablet.fingerprint, {}).get("app_at", "")
         host, _colon, port = at.rpartition(":")
         return [(host, int(port))] if host and port.isdigit() and 0 < int(port) < 65536 else []

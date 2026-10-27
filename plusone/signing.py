@@ -144,7 +144,7 @@ class Signing:
     def _locate_app(self, app_id):
         """Where the app the PDF went to is now (its port changes when it
         restarts): that tablet's addresses, not another's."""
-        return self.app.nearby.addresses(app_id) or None
+        return self.app.discovery.addresses(app_id) or None
 
     def _app_done(self, path, token, sent, result, error):
         saving = False

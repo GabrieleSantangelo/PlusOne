@@ -4,11 +4,9 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Log
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
-import io.github.gabrielesantangelo.plusone.link.Sealed
+import io.github.gabrielesantangelo.plusone.link.Datagrams
 
 /**
  * The PC's sound on the speakers as it is (plusone/pcm.py): 16-bit stereo PCM
@@ -27,10 +25,11 @@ import io.github.gabrielesantangelo.plusone.link.Sealed
  * for a few seconds. A packet that does not come is the last one again,
  * fading out.
  */
-class PcmPlayback(key: ByteArray, private val pc: InetAddress, private val pcPort: Int,
+class PcmPlayback(key: ByteArray, pc: InetAddress, pcPort: Int,
                   private val rate: Int, private val frames: Int) {
-    val socket = DatagramSocket(0).apply { receiveBufferSize = 1 shl 20 }
-    private val sealed = Sealed(key)
+    private val datagrams = Datagrams(key, pc, pcPort, receiveBuffer = 1 shl 20)
+    /** This end's port, for the PC. */
+    val port get() = datagrams.port
     private val bytes = frames * CHANNELS * 2
     private val packets = HashMap<Int, ByteArray>()  // by number, under the lock
     private val lock = Object()
@@ -67,7 +66,7 @@ class PcmPlayback(key: ByteArray, private val pc: InetAddress, private val pcPor
 
     fun stop() {
         running = false
-        socket.close()
+        datagrams.close()
         synchronized(lock) { lock.notifyAll() }
         player.join(1000)
         try {
@@ -78,16 +77,12 @@ class PcmPlayback(key: ByteArray, private val pc: InetAddress, private val pcPor
     }
 
     private fun receive() {
-        val buffer = ByteArray(2048)
-        val packet = DatagramPacket(buffer, buffer.size)
         while (running) {
-            try {
-                socket.receive(packet)
+            val body = try {
+                datagrams.receive()
             } catch (e: Exception) {
                 break
             }
-            if (packet.address != pc) continue
-            val body = sealed.open(buffer, packet.length) ?: continue
             if (body.size != 5 + bytes || body[0] != PCM) continue
             val number = ByteBuffer.wrap(body, 1, 4).int
             synchronized(lock) {
@@ -165,8 +160,7 @@ class PcmPlayback(key: ByteArray, private val pc: InetAddress, private val pcPor
         late = 0
         dropped = 0
         try {
-            val packet = sealed.seal(report)
-            socket.send(DatagramPacket(packet, packet.size, pc, pcPort))
+            datagrams.send(report)
         } catch (e: Exception) {
             if (running) Log.w(CompanionService.TAG, "speakers: cannot report: $e")
         }

@@ -639,7 +639,7 @@ class PairDialog(Adw.Dialog):
         return Adw.NavigationPage(child=toolbar, title=title)
 
     def _list(self):
-        apps = [(app_id, name) for app_id, _a, _p, name in self.app.nearby.apps() if app_id]
+        apps = [(app_id, name) for app_id, _a, _p, name in self.app.discovery.apps() if app_id]
         if apps == self._listing:
             return
         self._listing = apps
@@ -667,7 +667,7 @@ class PairDialog(Adw.Dialog):
                              margin_start=24, margin_end=24)
         self.stage.append(_spinner(_("Connecting to {name}…").format(name=name)))
         self.nav.push(self._page(self.stage, name))
-        targets = self.app.nearby.addresses(app_id)
+        targets = self.app.discovery.addresses(app_id)
 
         def work():
             try:

@@ -6,14 +6,12 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import io.github.gabrielesantangelo.plusone.link.Sealed
+import io.github.gabrielesantangelo.plusone.link.Datagrams
 
 /**
  * The PC's desktop on this screen. The PC sends each encoded frame (H.264)
@@ -34,9 +32,9 @@ import io.github.gabrielesantangelo.plusone.link.Sealed
  * decoded here is measured, not guessed. (Not to the glass: MediaCodec's
  * "rendered" times only gave back the time it was released with.)
  */
-class DisplaySession(key: ByteArray, private val pc: InetAddress, private var pcPort: Int) {
-    val socket = DatagramSocket(0).apply { receiveBufferSize = 4 shl 20 }
-    private val sealed = Sealed(key)
+class DisplaySession(key: ByteArray, pc: InetAddress, pcPort: Int) {
+    // Room for a keyframe's packets at once.
+    val datagrams = Datagrams(key, pc, pcPort, receiveBuffer = 4 shl 20)
     @Volatile private var running = true
     // Packets to the PC go out in order from this thread (input comes on
     // the main one, where Android allows no network).
@@ -105,7 +103,7 @@ class DisplaySession(key: ByteArray, private val pc: InetAddress, private var pc
     fun stop() {
         running = false
         outbox.shutdownNow()
-        socket.close()
+        datagrams.close()
         detach()
         callbacks.quitSafely()
     }
@@ -198,18 +196,13 @@ class DisplaySession(key: ByteArray, private val pc: InetAddress, private var pc
     }
 
     private fun receive() {
-        val buffer = ByteArray(2048)
-        val packet = DatagramPacket(buffer, buffer.size)
         while (running) {
-            try {
-                socket.receive(packet)
+            val body = try {
+                datagrams.receive()
             } catch (e: Exception) {
                 if (running) Log.w(CompanionService.TAG, "display: $e")
                 break
             }
-            if (packet.address != pc) continue
-            val body = sealed.open(buffer, packet.length) ?: continue  // not sealed with this session's key
-            pcPort = packet.port  // replies go where the PC sends from
             val b = ByteBuffer.wrap(body).order(ByteOrder.BIG_ENDIAN)
             when (b.get()) {
                 VIDEO -> video(b)
@@ -351,8 +344,7 @@ class DisplaySession(key: ByteArray, private val pc: InetAddress, private var pc
         try {
             outbox.execute {
                 try {
-                    val packet = sealed.seal(body)
-                    socket.send(DatagramPacket(packet, packet.size, pc, pcPort))
+                    datagrams.send(body)
                 } catch (e: Exception) {
                     if (running) Log.w(CompanionService.TAG, "display: cannot send: $e")
                 }

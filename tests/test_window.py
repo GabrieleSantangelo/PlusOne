@@ -47,8 +47,8 @@ def make(monkeypatch, tmp_path, tablets=()):
     app = Adw.Application(application_id="io.github.gabrielesantangelo.PlusOne.Test")
     app.register(None)
     app.settings = Settings()
-    app.nearby = Nearby()
-    app.tablets = Tablets(app.settings, nearby=app.nearby, paired=paired)
+    app.discovery = Nearby()
+    app.tablets = Tablets(app.settings, discovery=app.discovery, paired=paired)
     app.controller = types.SimpleNamespace(state=State.IDLE, running=False, detail=("", {}),
                                            start=lambda: None, stop=lambda: None)
     app.listeners, app.log_listeners, app.log_lines = [], [], ["a line of the log"]
@@ -92,7 +92,7 @@ def test_the_tablet_in_use(monkeypatch, tmp_path):
     assert win.stack.get_visible_child_name() == "tablet"
     assert win.name_label.get_label() == "Kitchen" and win.status_label.get_label() == "Not found: open Plus One on the tablet"
     assert win.screen_button.get_label() == "Use as second screen"
-    app.nearby.found = [(KITCHEN[:16], "10.0.0.2", 47236, "Kitchen")]
+    app.discovery.found = [(KITCHEN[:16], "10.0.0.2", 47236, "Kitchen")]
     win._refresh()
     assert win.status_label.get_label() == "Ready" and win.where_label.get_label() == "Ready"
     # The Tablets page: the paired ones, the one in use checked.
@@ -126,7 +126,7 @@ def test_no_other_tablet_while_connected(monkeypatch, tmp_path):
 
 def test_pairing_lists_the_tablets_with_the_app(monkeypatch, tmp_path):
     _win, app = make(monkeypatch, tmp_path, [(KITCHEN, "Kitchen")])
-    app.nearby.found = [(KITCHEN[:16], "10.0.0.2", 47236, "Kitchen"), ("cccc" + "0" * 12, "10.0.0.3", 47236, "New")]
+    app.discovery.found = [(KITCHEN[:16], "10.0.0.2", 47236, "Kitchen"), ("cccc" + "0" * 12, "10.0.0.3", 47236, "New")]
     dialog = gui.PairDialog(app)
     assert [(row.get_title(), row.get_subtitle()) for row in dialog.rows] == [("Kitchen", "Paired"), ("New", "")]
 
@@ -149,7 +149,7 @@ def test_the_first_answer_to_the_code_counts(monkeypatch, tmp_path):
 def test_paired_with_the_tablet_chosen(monkeypatch, tmp_path):
     _win, app = make(monkeypatch, tmp_path)
     new = "cccc" + "0" * 60
-    app.nearby.found = [(new[:16], "10.0.0.3", 47236, "New")]
+    app.discovery.found = [(new[:16], "10.0.0.3", 47236, "New")]
     asked = []
 
     def pair(targets, ask):

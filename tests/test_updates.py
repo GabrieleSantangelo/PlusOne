@@ -48,7 +48,7 @@ class App:
         tablet = types.SimpleNamespace(app_id="00ff", name="Tab")
         self.settings = types.SimpleNamespace(update_tablet=True)
         self.tablets = types.SimpleNamespace(active=lambda: tablet, targets=lambda t: [("10.0.0.7", 47236)])
-        self.nearby = types.SimpleNamespace(app_version=lambda app_id: version)
+        self.discovery = types.SimpleNamespace(app_version=lambda app_id: version)
         self.busy = lambda: busy
         self.notes = []
         self.notify = lambda *args, **kwargs: self.notes.append(args[1])

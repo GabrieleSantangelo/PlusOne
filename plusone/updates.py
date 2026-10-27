@@ -119,7 +119,7 @@ class TabletUpdates:
         tablet = self.app.tablets.active()
         if tablet is None:
             return
-        version = self.app.nearby.app_version(tablet.app_id)
+        version = self.app.discovery.app_version(tablet.app_id)
         # 0: an app before 0.8, which cannot take one (installed by hand once).
         if not version or version >= self.code:
             return

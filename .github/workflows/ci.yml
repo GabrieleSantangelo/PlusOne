@@ -96,8 +96,8 @@ jobs:
           path: ${{ runner.temp }}/gradle
           key: gradle-${{ hashFiles('android/**/*.kts', 'android/gradle/**', 'Dockerfile.android') }}
           restore-keys: gradle-
-      - name: Companion app, in the same container as locally (lint errors fail it)
-        run: tools/android-docker.sh lint assembleDebug
+      - name: Companion app, in the same container as locally (lint errors and its tests fail it)
+        run: tools/android-docker.sh lint testDebugUnitTest assembleDebug
         env:
           PLUSONE_IMAGE_BUILT: "1"
           PLUSONE_GRADLE_CACHE: ${{ runner.temp }}/gradle

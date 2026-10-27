@@ -432,9 +432,9 @@ What comes next, and the convenience rules every feature follows, is in
 ## Development
 
 ```
-plusone/link/     connectivity, under every service: discovery (nearby.py), trust and pairing
-                  (trust.py), the tablets (tablets.py), transports, links (link.py: connect,
-                  request, hold), datagrams (sealed UDP)
+plusone/link/     connectivity, under every service: discovery (discovery.py, from every source;
+                  nearby.py: mDNS), trust and pairing (trust.py), the tablets (tablets.py),
+                  transports, links (link.py: connect, request, hold), datagrams (sealed UDP)
 plusone/          the services and the app: app.py (background app, D-Bus, notifications), gui.py (window),
                   engine.py + appdisplay.py + media.py + display.py + pen.py (the desktop on the tablet),
                   signing.py + sign_jobs.py + sign.py + pdf.py + ink.py + modeler.py (Sign on Tablet),
@@ -442,8 +442,9 @@ plusone/          the services and the app: app.py (background app, D-Bus, notif
                   updates.py (both sides up to date)
 data/gnome-shell/ the Quick Settings extension
 data/nautilus/    the Files context-menu entry
-android/          the companion app for the tablet (Kotlin): link/ (listening, mDNS, pairing, the PCs' links)
-                  under CompanionService and its services, the *Handler.kt
+android/          the companion app for the tablet (Kotlin): link/ (listeners, announcers, pairing,
+                  the PCs' links and their requests, datagrams; its tests in app/src/test) under
+                  CompanionService and its services, the *Handler.kt
 tests/            unit and protocol tests (a scripted fake tablet, no hardware needed)
 packaging/        build-deb.sh and maintainer scripts
 tools/            CI scripts; tools/re/ has the reverse-engineering helpers (the Second Screen ones, and its measurements, are in the history up to 0.8)

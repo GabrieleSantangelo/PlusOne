@@ -35,7 +35,7 @@ class DisplayHandler(private val service: CompanionService) : Handler {
         try {
             val mode = service.getSystemService(android.hardware.display.DisplayManager::class.java)
                 .getDisplay(android.view.Display.DEFAULT_DISPLAY).mode
-            link.send(JSONObject().put("type", "display-ready").put("port", session.socket.localPort)
+            link.send(JSONObject().put("type", "display-ready").put("port", session.datagrams.port)
                 .put("width", maxOf(mode.physicalWidth, mode.physicalHeight))
                 .put("height", minOf(mode.physicalWidth, mode.physicalHeight))
                 .put("refresh", mode.refreshRate.toDouble()))

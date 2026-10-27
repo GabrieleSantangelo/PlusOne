@@ -28,7 +28,7 @@ from .engine import Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .signing import Signing  # noqa: E402
 from .devices import SPEAKERS_NAME, Devices, make_default_sink  # noqa: E402
-from .link import Nearby, Tablets  # noqa: E402
+from .link import Discovery, Nearby, Tablets  # noqa: E402
 from .updates import UPDATED_FROM, SelfUpdate, TabletUpdates  # noqa: E402
 
 APP_ID = "io.github.gabrielesantangelo.PlusOne"
@@ -219,8 +219,9 @@ class PlusOneApp(Adw.Application):
         # The system's language, as the Quick Settings toggle, Files and the
         # tablet have it: a choice of Plus One's own mixed languages.
         i18n.set_language("auto")
-        self.nearby = Nearby(on_change=self._on_nearby)
-        self.tablets = Tablets(self.settings, self.save_settings, self.nearby)
+        # Every way of finding the tablets' apps: mDNS for now.
+        self.discovery = Discovery([Nearby(on_change=self._on_nearby)])
+        self.tablets = Tablets(self.settings, self.save_settings, self.discovery)
         self.controller = Controller(self.settings, self._on_state, self.tablets)
         self.listeners = []      # windows following the state
         self.log_listeners = []  # windows showing the log
@@ -259,7 +260,7 @@ class PlusOneApp(Adw.Application):
         set_sign_entry(self.settings.sign_on_tablet)
         # Which tablets have the app, and where: for pairing, the desktop,
         # signing and the devices. Avahi listens anyway.
-        self.nearby.start()
+        self.discovery.start()
         self.devices.apply()
         self._update_hold()
         self.self_update.start()
@@ -521,7 +522,7 @@ class PlusOneApp(Adw.Application):
         """Whether Files should offer "Sign on Tablet" now: switched on, a
         tablet paired, and one connected or on the network (or no telling)."""
         return self.settings.sign_on_tablet and self.tablets.active() is not None and (
-            self.controller.state in (State.CONNECTING, State.STREAMING) or self.nearby.present())
+            self.controller.state in (State.CONNECTING, State.STREAMING) or self.discovery.present())
 
     def _on_nearby(self):
         self.devices.apply()  # the speakers come and go with the tablet

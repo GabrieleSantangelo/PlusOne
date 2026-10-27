@@ -11,6 +11,7 @@ import java.security.spec.ECGenParameterSpec
 import java.util.Date
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import javax.security.auth.x500.X500Principal
@@ -63,6 +64,14 @@ object Identity {
         }
         return SSLContext.getInstance("TLS").apply { init(keys.keyManagers, arrayOf<TrustManager>(anyPeer), null) }
     }
+
+    /** Where the PCs connect (port; 0: any free one): TLS 1.3 only, the
+     * PC's certificate asked for (LinkServer checks it is a paired one). */
+    fun serverSocket(port: Int): SSLServerSocket =
+        (sslContext().serverSocketFactory.createServerSocket(port) as SSLServerSocket).apply {
+            needClientAuth = true
+            enabledProtocols = arrayOf("TLSv1.3")
+        }
 
     fun fingerprint(der: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) }
