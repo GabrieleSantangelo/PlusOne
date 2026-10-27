@@ -56,8 +56,13 @@ const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// An input or realtime message's largest size: with the seal (30 bytes),
 /// UDP and IPv6 (48), a datagram of 1500 bytes, which any network carries.
 pub const MAX_DATAGRAM: usize = 1422;
-/// Realtime over the stream: dropped while this much urgent waits to be sent.
+/// Realtime over the stream: dropped while this much urgent waits to be
+/// sent, at most; on a slow stream, while more than REALTIME_WAIT of it
+/// does at the rate the stream takes it (Bluetooth: 256 KiB were seconds).
 const STREAM_BUDGET: usize = 256 << 10;
+const REALTIME_WAIT: Duration = Duration::from_millis(150);
+/// The stream's rate is measured over this long, while it is full.
+const RATE_WINDOW: Duration = Duration::from_millis(200);
 /// Reliable frames handed to TLS at a time: an urgent frame (input,
 /// realtime, a ping) queued meanwhile waits behind no more than this.
 const WRITE_SLICE: usize = 16 << 10;
@@ -304,6 +309,8 @@ pub struct Session {
     flow: bool,
     /// The reliable frames' pace on the current path (pace.rs).
     pace: Mutex<crate::pace::Pace>,
+    /// How much urgent may wait on the stream before realtime is dropped.
+    stream_budget: std::sync::atomic::AtomicUsize,
     outbox: Mutex<Outbox>,
     reliable: Mutex<Reliable>,
     wake: Wake,
@@ -494,6 +501,7 @@ impl Session {
             next_id: AtomicU16::new(if established.dialer { 1 } else { 2 }),
             flow: hello["flow"].as_u64() == Some(1),
             pace: Mutex::new(crate::pace::Pace::new(Instant::now())),
+            stream_budget: std::sync::atomic::AtomicUsize::new(STREAM_BUDGET),
             outbox: Mutex::default(),
             reliable: Mutex::new(Reliable { next: 1, ..Default::default() }),
             wake: Wake::new()?,
@@ -843,7 +851,7 @@ impl Session {
     fn queue(&self, kind: u8, channel: u16, body: &[u8]) {
         {
             let mut outbox = self.outbox.lock().unwrap();
-            if kind == frame::DATAGRAM && outbox.urgent.len() > STREAM_BUDGET {
+            if kind == frame::DATAGRAM && outbox.urgent.len() > self.stream_budget.load(Ordering::Relaxed) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -938,6 +946,9 @@ impl Session {
     fn drive(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,
              decoder: &mut Decoder) -> Result<(), String> {
         let mut plain = vec![0u8; 64 << 10];
+        // The stream's rate while it is full: (window's start, bytes, full in it).
+        let mut window = (Instant::now(), 0usize, false);
+        self.stream_budget.store(STREAM_BUDGET, Ordering::Relaxed);
         let mut next_ping = Instant::now();
         let mut next_udp_ping = Instant::now();
         // Frames that came with the hello.
@@ -964,6 +975,7 @@ impl Session {
                 pace.spent(taken);
                 paced = pace.wait();
                 if !out.is_empty() {
+                    window.1 += out.len();
                     conn.writer().write_all(&out).map_err(|e| e.to_string())?;
                 }
             }
@@ -977,6 +989,19 @@ impl Session {
                     }
                     Err(e) => return Err(e.to_string()),
                 }
+            }
+            window.2 |= blocked;
+            let elapsed = window.0.elapsed();
+            if elapsed >= RATE_WINDOW {
+                // Full in it: what it took is its rate; else it takes all there is.
+                let budget = if window.2 {
+                    let rate = window.1 as f64 / elapsed.as_secs_f64();
+                    ((rate * REALTIME_WAIT.as_secs_f64()) as usize).clamp(8 << 10, STREAM_BUDGET)
+                } else {
+                    STREAM_BUDGET
+                };
+                self.stream_budget.store(budget, Ordering::Relaxed);
+                window = (Instant::now(), 0, false);
             }
             // All out, and more queued meanwhile (its wake taken already, while
             // the stream was full): round again at once, after a look at what

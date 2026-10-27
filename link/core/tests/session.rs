@@ -452,6 +452,63 @@ fn a_wifi_direct_path_is_one_on_both_sides() {
 }
 
 #[test]
+fn realtime_on_a_slow_stream_is_dropped_not_queued_for_seconds() {
+    // Bluetooth's pace (about 100 KB/s) and realtime asked at twice that:
+    // what goes back comes in a fraction of a second, the rest is dropped.
+    let (pc, tablet, _address) = pair();
+    let (cable, far) = std::os::unix::net::UnixStream::pair().unwrap();
+    cable.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let (mut reading, mut writing) = (cable.try_clone().unwrap(), cable);
+    let pcs_end = plusone_link::stream::bridge(
+        move |buf| {
+            use std::io::Read;
+            reading.read(buf).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock {
+                std::io::Error::from(std::io::ErrorKind::TimedOut)
+            } else { e })
+        },
+        move |data| {
+            use std::io::Write;
+            std::thread::sleep(Duration::from_micros(data.len() as u64 * 10));  // 100 KB/s
+            writing.write_all(data)
+        },
+        4096).unwrap();
+    let accepter = tablet.clone();
+    std::thread::spawn(move || accepter.accept_stream(Box::new(far), "bt").map(|_| ()));
+    let session = pc.connect_stream(Box::new(pcs_end), "bt").unwrap();
+    let realtime = session.open("echo", "rt", Class::Realtime).unwrap();
+    let receiving = {
+        let realtime = realtime.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            let mut waits = Vec::new();
+            let until = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < until {
+                if let Ok(Some(n)) = realtime.recv(&mut buf, Some(Duration::from_millis(200))) {
+                    if n >= 16 {
+                        let sent = u128::from_be_bytes(buf[..16].try_into().unwrap());
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros();
+                        waits.push(Duration::from_micros((now - sent) as u64));
+                    }
+                }
+            }
+            waits
+        })
+    };
+    for _ in 0..600 {  // 3 s at 200 packets a second of 1 KB
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros();
+        let mut packet = vec![0u8; 1000];
+        packet[..16].copy_from_slice(&now.to_be_bytes());
+        realtime.send(&packet).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut waits = receiving.join().unwrap();
+    waits.sort();
+    assert!(!waits.is_empty());
+    let p50 = waits[waits.len() / 2];
+    assert!(p50 < Duration::from_millis(600), "realtime waited {p50:?} ({} back)", waits.len());
+}
+
+#[test]
 fn a_session_goes_on_over_another_path() {
     let (pc, tablet, address) = pair();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
