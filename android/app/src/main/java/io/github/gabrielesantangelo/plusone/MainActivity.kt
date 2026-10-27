@@ -346,18 +346,20 @@ class MainActivity : AppCompatActivity() {
 
     /** What this PC may do, in a line: what is on, or a hint that there is a choice. */
     private fun pcAllows(fingerprint: String): String =
-        if (PcOptions.shareSignatures(this, fingerprint)) getString(R.string.pc_shares_signatures)
-        else getString(R.string.pc_options_hint)
+        listOfNotNull(getString(R.string.pc_updates_app).takeIf { PcOptions.updates(this, fingerprint) },
+            getString(R.string.pc_shares_signatures).takeIf { PcOptions.shareSignatures(this, fingerprint) })
+            .joinToString(" · ").ifEmpty { getString(R.string.pc_options_hint) }
 
     /** The choices for one PC alone. */
     private fun pcOptions(fingerprint: String, name: String) {
-        val items = arrayOf(getString(R.string.pc_share_signatures))
-        val checked = booleanArrayOf(PcOptions.shareSignatures(this, fingerprint))
+        val items = arrayOf(getString(R.string.pc_update_app), getString(R.string.pc_share_signatures))
+        val checked = booleanArrayOf(PcOptions.updates(this, fingerprint), PcOptions.shareSignatures(this, fingerprint))
         MaterialAlertDialogBuilder(this)
             .setTitle(name)
             .setMultiChoiceItems(items, checked) { _, which, on ->
                 when (which) {
-                    0 -> PcOptions.setShareSignatures(this, fingerprint, on)
+                    0 -> PcOptions.setUpdates(this, fingerprint, on)
+                    1 -> PcOptions.setShareSignatures(this, fingerprint, on)
                 }
             }
             .setPositiveButton(R.string.done) { _, _ -> }

@@ -50,8 +50,9 @@ class LinkServer(
         /** The app's versionCode: in the hello and the announcements. */
         fun appVersion(): Long
         /** The user's answer to pairing with pc (whose code is code, from
-         * the address from): null when no question may be asked now. */
-        fun askPairing(pc: String, code: String, from: String): Boolean?
+         * the address from, its fingerprint fingerprint): null when no
+         * question may be asked now. */
+        fun askPairing(pc: String, code: String, from: String, fingerprint: String): Boolean?
         /** The PC withdrew the question (said no there, or went). */
         fun pairingWithdrawn(code: String)
         /** A PC connected (+1) or went (-1): for when the app may rest. */
@@ -153,7 +154,7 @@ class LinkServer(
                 if (!known || !hello.optBoolean("paired")) {
                     // Only when the user pairs, in Plus One's window on the PC.
                     if (!hello.optBoolean("pair")) return
-                    if (!pair(socket, wire, pc, pcName, guard)) return
+                    if (!pair(socket, wire, pc, fingerprint, pcName, guard)) return
                     Paired.add(context, fingerprint, pcName)
                 }
                 guard.cancel(false)
@@ -185,7 +186,8 @@ class LinkServer(
     /** Numeric comparison: the app commits to its random number, learns the
      * PC's, shows its own; both screens then show a code made of the two
      * certificates and the two numbers, and the user confirms it on both. */
-    private fun pair(socket: SSLSocket, wire: Wire, pc: ByteArray, pcName: String, guard: ScheduledFuture<*>): Boolean {
+    private fun pair(socket: SSLSocket, wire: Wire, pc: ByteArray, fingerprint: String, pcName: String,
+                     guard: ScheduledFuture<*>): Boolean {
         val mine = Identity.certificate.encoded
         val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }
         wire.send(JSONObject().put("type", "pair-commit").put("commit", Identity.commitment(nonce, mine, pc)))
@@ -205,7 +207,7 @@ class LinkServer(
             if (type != "pair-ok") host.pairingWithdrawn(code)
         }.apply { start() }
         val from = address(socket.inetAddress)
-        val accepted = host.askPairing(pcName, code, from) ?: return false  // another question is up, or too soon
+        val accepted = host.askPairing(pcName, code, from, fingerprint) ?: return false  // another question is up, or too soon
         wire.send(JSONObject().put("type", if (accepted) "pair-ok" else "pair-no"))
         listening.join(PAIRING_TIMEOUT.toLong())
         return accepted && answer.get() == "pair-ok"

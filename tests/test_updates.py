@@ -54,12 +54,12 @@ class App:
         self.notify = lambda *args, **kwargs: self.notes.append(args[1])
 
 
-def run(app):
+def run(app, reason=None):
     sent = []
 
     def send(targets, app_id, apk, code):
         sent.append((targets, app_id, apk, code))
-        return None
+        return reason
     tablet = updates.TabletUpdates(app, folder="/nowhere", fetch=lambda version, folder: "/nowhere/app.apk",
                                    send=send)
     tablet.check()
@@ -140,3 +140,25 @@ def test_the_update_goes_over_the_link_when_it_reaches_the_tablet(tmp_path, monk
     assert asked == [("abc", "update")]
     header, payload, _limit = tablet.sent
     assert payload == b"an app" and header["sha256"] == hashlib.sha256(b"an app").hexdigest()
+
+
+def test_by_cable_alone_the_link_says_the_version(monkeypatch):
+    # No address on the network, nor a version there: plus-one-link has a
+    # session with it (the cable), and its "update" feature says the version.
+    code = updates.version_code(__version__)
+    app = App(None)
+    app.tablets.targets = lambda t: []
+    monkeypatch.setattr(updates.channels, "app_version", lambda app_id: code - 1)
+    monkeypatch.setattr(updates.channels, "connected", lambda app_id: True)
+    _tablet, sent = run(app)
+    assert sent == [([], "00ff", "/nowhere/app.apk", code)]
+
+
+def test_off_there_is_not_asked_again(monkeypatch):
+    # The user takes no updates from this PC on the tablet: not again (each
+    # time the whole app) until Plus One starts again.
+    code = updates.version_code(__version__)
+    tablet, sent = run(App(code - 1), reason="off")
+    tablet.tried.clear()  # long after
+    tablet.check()
+    assert len(sent) == 1

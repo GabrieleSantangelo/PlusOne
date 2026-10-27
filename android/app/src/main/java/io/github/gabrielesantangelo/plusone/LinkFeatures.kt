@@ -24,7 +24,9 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
     private val waiting = ConcurrentHashMap<String, LinkedBlockingQueue<LinkChannel>>()
 
     init {
-        for (handler in handlers) for (type in handler.types) core.serve(type) { channel -> handle(handler, channel) }
+        for (handler in handlers) for (type in handler.types) {
+            core.serve(type, handler.linkVersion(type)) { channel -> handle(handler, channel) }
+        }
     }
 
     private fun handle(handler: Handler, channel: LinkChannel) {

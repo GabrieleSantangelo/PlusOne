@@ -50,16 +50,30 @@ def connect(app_id, feature):
     return ChannelLink(connection, found["id"], feature, control, found.get("name") or "")
 
 
-def connected(app_id):
-    """Whether plus-one-link has a session with the paired tablet whose id
-    starts with app_id now (by cable, say, with no address on the network)."""
+def _session(app_id):
+    """plus-one-link's entry for the paired tablet whose id starts with
+    app_id, if it has a session with it now; else None."""
     if plusone_link is None:
-        return False
+        return None
     try:
         with plusone_link.Link() as connection:
-            return any(d["id"].startswith(app_id) and d.get("connected") for d in connection.devices())
+            return next((d for d in connection.devices() if d["id"].startswith(app_id) and d.get("connected")), None)
     except plusone_link.LinkError:
-        return False
+        return None
+
+
+def connected(app_id):
+    """Whether plus-one-link has a session with that tablet now (by cable,
+    say, with no address on the network)."""
+    return _session(app_id) is not None
+
+
+def app_version(app_id):
+    """The versionCode that tablet's app serves "update" at over the link
+    (its own), while there is a session with it; else None."""
+    session = _session(app_id)
+    version = (session or {}).get("features", {}).get("update")
+    return version if type(version) is int and version > 1 else None
 
 
 class ChannelLink:

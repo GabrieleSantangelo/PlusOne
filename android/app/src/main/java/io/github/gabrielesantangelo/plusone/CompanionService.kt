@@ -87,6 +87,7 @@ class CompanionService : Service(), LinkServer.Host {
         link = core
         core.onEvent = { io.github.gabrielesantangelo.plusone.link.LinkStatus.event(it) }
         core.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
+        PcOptions.adoptPaired(this, io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         // A cable plugged in before the service was up, or while it was not.
         (pendingCable ?: getSystemService(android.hardware.usb.UsbManager::class.java).accessoryList
             ?.firstOrNull { it.manufacturer == "Plus One" })?.let { pendingCable = null; openCable(it) }
@@ -162,7 +163,8 @@ class CompanionService : Service(), LinkServer.Host {
 
     override fun appVersion(): Long = Updates.versionCode(this)
 
-    override fun askPairing(pc: String, code: String, from: String): Boolean? = Pairing.ask(this, pc, code, from)
+    override fun askPairing(pc: String, code: String, from: String, fingerprint: String): Boolean? =
+        Pairing.ask(this, pc, code, from, fingerprint)
 
     override fun pairingWithdrawn(code: String) = Pairing.answer(code, false)
 

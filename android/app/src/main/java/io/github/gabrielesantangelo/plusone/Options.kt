@@ -55,6 +55,7 @@ object Options {
 object PcOptions {
     private const val PREFS = "pc-options"
     const val SIGNATURES = "signatures"
+    const val UPDATES = "updates"
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -63,6 +64,26 @@ object PcOptions {
 
     fun setShareSignatures(context: Context, pc: String, on: Boolean) =
         prefs(context).edit().putBoolean("$pc/$SIGNATURES", on).apply()
+
+    /** The app's update from that PC is taken (plusone/updates.py). Asked
+     * when it is paired (yes at first); the PCs paired before it was asked
+     * keep updating it (adoptPaired). */
+    fun updates(context: Context, pc: String) = prefs(context).getBoolean("$pc/$UPDATES", false)
+
+    fun setUpdates(context: Context, pc: String, on: Boolean) =
+        prefs(context).edit().putBoolean("$pc/$UPDATES", on).apply()
+
+    /** Once: the PCs paired before updates were asked about update as they did. */
+    fun adoptPaired(context: Context, paired: Set<String>) {
+        val prefs = prefs(context)
+        if (prefs.getBoolean(ADOPTED, false)) return
+        prefs.edit().apply {
+            for (pc in paired) if (!prefs.contains("$pc/$UPDATES")) putBoolean("$pc/$UPDATES", true)
+            putBoolean(ADOPTED, true)
+        }.apply()
+    }
+
+    private const val ADOPTED = "updates-adopted"
 
     fun forget(context: Context, pc: String) {
         val prefs = prefs(context)

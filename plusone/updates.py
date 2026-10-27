@@ -116,6 +116,7 @@ class TabletUpdates:
         self.fetch, self.send = fetch, send
         self.code = version_code(__version__)
         self.tried = {}      # app id -> (its version then, monotonic time)
+        self.refused = {}    # app id -> its version it said "off" at: not again until Plus One starts again
         self.working = False
 
     def check(self):
@@ -125,21 +126,22 @@ class TabletUpdates:
         tablet = self.app.tablets.active()
         if tablet is None:
             return
-        version = self.app.discovery.app_version(tablet.app_id)
+        # Where it is announced; else over the link (by cable, no address).
+        version = self.app.discovery.app_version(tablet.app_id) or channels.app_version(tablet.app_id)
         # 0: an app before 0.8, which cannot take one (installed by hand once).
-        if not version or version >= self.code:
+        if not version or version >= self.code or self.refused.get(tablet.app_id) == version:
             return
         tried = self.tried.get(tablet.app_id)
         if tried and tried[0] == version and time.monotonic() - tried[1] < TRY_AGAIN:
             return
         targets = self.app.tablets.targets(tablet)
-        if not targets:
+        if not targets and not channels.connected(tablet.app_id):
             return
         self.tried[tablet.app_id] = (version, time.monotonic())
         self.working = True
-        threading.Thread(target=self._update, args=(tablet, targets), daemon=True).start()
+        threading.Thread(target=self._update, args=(tablet, targets, version), daemon=True).start()
 
-    def _update(self, tablet, targets):
+    def _update(self, tablet, targets, version):
         try:
             apk = self.fetch(__version__, self.folder)
             log(f"updates: Plus One {__version__} to {tablet.name}")
@@ -147,10 +149,13 @@ class TabletUpdates:
         except Exception as e:  # noqa: BLE001 - not there, no release, gone: next time
             log("updates: the tablet's app not updated:", repr(e))
             reason = "error"
-        GLib.idle_add(once(self._done, tablet, reason))
+        GLib.idle_add(once(self._done, tablet, reason, version))
 
-    def _done(self, tablet, reason):
+    def _done(self, tablet, reason, version):
         self.working = False
+        if reason == "off":
+            # The user takes no updates from this PC there: not again for this version.
+            self.refused[tablet.app_id] = version
         if reason is None:
             self.app.notify("updates", "Updating Plus One on {tablet}", "To {version}, as on this PC",
                             tablet=tablet.name, version=__version__)

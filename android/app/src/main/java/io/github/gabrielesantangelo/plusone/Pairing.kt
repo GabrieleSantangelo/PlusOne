@@ -26,6 +26,7 @@ object Pairing {
     private class Request(val code: String, val pc: String) {
         val answered = CountDownLatch(1)
         @Volatile var accepted = false
+        @Volatile var updates = true  // the app's updates taken from that PC (PcOptions), unless unticked
         @Volatile var close: (() -> Unit)? = null  // the question's window, when shown
     }
 
@@ -37,7 +38,7 @@ object Pairing {
     /** Blocks the calling (connection) thread until the user answers, two
      * minutes at most: whether they accepted; null when no question may be
      * asked now (another is up, or one from there was just not accepted). */
-    fun ask(context: Context, pc: String, code: String, from: String): Boolean? {
+    fun ask(context: Context, pc: String, code: String, from: String, fingerprint: String): Boolean? {
         val request = Request(code, pc)
         synchronized(this) {
             val now = SystemClock.elapsedRealtime()
@@ -57,6 +58,7 @@ object Pairing {
             val now = SystemClock.elapsedRealtime()
             if (accepted) {
                 strikes.remove(from)
+                PcOptions.setUpdates(context, fingerprint, request.updates)
             } else {
                 quietUntil = now + QUIET
                 // 10 s, a minute, 10 minutes, then 10 minutes each time.
@@ -69,6 +71,11 @@ object Pairing {
         Notifications.cancelPairing(context, code)
         main.post { request.close?.invoke() }
         return accepted
+    }
+
+    /** Whether the app takes its updates from the PC being paired (the question's tick). */
+    fun setUpdates(code: String, on: Boolean) {
+        current?.takeIf { it.code == code }?.updates = on
     }
 
     /** The PC's name, while its pairing waits for an answer. */
@@ -134,6 +141,13 @@ class PairActivity : AppCompatActivity() {
                 setPadding(dp(16), dp(12), dp(16), dp(12))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 setMargins(0, dp(16), 0, dp(24))
+            })
+            addView(com.google.android.material.checkbox.MaterialCheckBox(context).apply {
+                text = getString(R.string.pair_updates)
+                isChecked = true
+                setOnCheckedChangeListener { _, on -> Pairing.setUpdates(code, on) }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 0, 0, dp(16))
             })
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL

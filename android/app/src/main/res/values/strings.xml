@@ -97,6 +97,9 @@
     <string name="pc_share_signatures">Share saved signatures</string>
     <string name="pc_shares_signatures">Shares your saved signatures</string>
     <string name="pc_options_hint">Tap to choose what it may do</string>
+    <string name="pc_update_app">Update the app from this PC</string>
+    <string name="pc_updates_app">Updates the app</string>
+    <string name="pair_updates">Update the app from this PC</string>
     <string name="started">Started</string>
     <string name="queue_title">To sign</string>
     <string name="sent">Sent to the PC: %1$s</string>

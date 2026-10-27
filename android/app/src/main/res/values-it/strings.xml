@@ -94,6 +94,9 @@
     <string name="pc_share_signatures">Condividi le firme salvate</string>
     <string name="pc_shares_signatures">Condivide le tue firme salvate</string>
     <string name="pc_options_hint">Tocca per scegliere cosa può fare</string>
+    <string name="pc_update_app">Aggiorna l\'app da questo PC</string>
+    <string name="pc_updates_app">Aggiorna l\'app</string>
+    <string name="pair_updates">Aggiorna l\'app da questo PC</string>
     <string name="started">Iniziato</string>
     <string name="queue_title">Da firmare</string>
     <string name="sent">Mandato al PC: %1$s</string>

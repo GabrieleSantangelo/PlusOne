@@ -12,6 +12,8 @@ interface Handler {
     fun maxPayload(type: String): Long = 0
     /** Whether it answers a PC of another protocol version too (an update). */
     val acrossVersions: Boolean get() = false
+    /** The version type is served at over the link's core (its hello says it). */
+    fun linkVersion(type: String): Int = 1
     /** One request on link: true to read the link's next one, false when
      * this one took the link (a session, over now: the link closes). */
     fun handle(link: Link, request: JSONObject, size: Long): Boolean

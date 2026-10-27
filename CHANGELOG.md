@@ -10,6 +10,11 @@
   the tablet only if both choose it (the PC: Signing → Share them with the
   tablet; the tablet: the PC's options, under Paired PCs). Off at first:
   each side keeps its own. Nor do they move to a new tablet with the app.
+- **The app's updates only from the PCs you allow**: when you pair a PC,
+  the tablet asks whether to take the app's updates from it (yes at
+  first); the PCs paired before keep updating it; each PC's options on
+  the tablet change it. By cable alone the PC learns the app's version
+  over the link, so it updates it there too.
 - **A big transfer never chokes the cable**: plus-one-link feeds a PDF or
   the app to the link only as fast as it goes, so the desktop and the sound
   sharing the cable go on meanwhile.
