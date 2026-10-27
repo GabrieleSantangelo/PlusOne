@@ -10,3 +10,5 @@ android/**/build
 *.p12
 *.jks
 *.keystore
+link/target
+rust/target

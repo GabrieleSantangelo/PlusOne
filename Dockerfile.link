@@ -1,0 +1,12 @@
+# Build environment for the link (link/): Rust from Ubuntu's packages
+# (signed, no curl | sh) and a C compiler for ring. Used by
+# tools/link-docker.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        rustc-1.85 cargo-1.85 build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/lib/rust-1.85/bin:$PATH CARGO_HOME=/cargo
+WORKDIR /src/link

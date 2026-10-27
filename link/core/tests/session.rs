@@ -1,0 +1,179 @@
+//! Two nodes on loopback: a PC and a tablet, paired with each other.
+
+use plusone_link::{Class, Event, Identity, Node, Paired};
+use std::net::SocketAddr;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+const WAIT: Option<Duration> = Some(Duration::from_secs(5));
+
+fn identity() -> (Identity, String) {
+    let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
+    let identity = Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap();
+    let fingerprint = identity.fingerprint();
+    (identity, fingerprint)
+}
+
+fn trusting(fingerprint: &str) -> Paired {
+    let fingerprint = fingerprint.to_owned();
+    Arc::new(move |seen: &str| seen == fingerprint)
+}
+
+/// A tablet that echoes every message on "echo" channels, and a PC; the
+/// tablet's address.
+fn pair() -> (Node, Node, SocketAddr) {
+    let (pc_id, pc_fp) = identity();
+    let (tablet_id, tablet_fp) = identity();
+    let tablet = Node::new("tablet", &tablet_id, trusting(&pc_fp)).unwrap();
+    tablet.serve("echo", 1, |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 || incoming.channel.send(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+    let address = tablet.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
+    (pc, tablet, address)
+}
+
+#[test]
+fn hello_says_names_and_features() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert_eq!(session.name, "tablet");
+    assert_eq!(session.features["echo"], 1);
+}
+
+#[test]
+fn control_messages_both_ways_in_order() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let channel = session.open("echo", "test", Class::Control).unwrap();
+    let big = vec![7u8; 200 << 10];
+    let mut buf = vec![0u8; 1 << 20];
+    for i in 0..50u8 {
+        let message: &[u8] = if i == 25 { &big } else { std::slice::from_ref(&i) };
+        channel.send(message).unwrap();
+        let n = channel.recv(&mut buf, WAIT).unwrap().unwrap();
+        assert_eq!(&buf[..n], message);
+    }
+}
+
+#[test]
+fn realtime_goes_over_udp_once_proven() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let channel = session.open("echo", "video", Class::Realtime).unwrap();
+    let mut buf = [0u8; 2048];
+    // At once, before any pong: over the stream.
+    channel.send(b"early").unwrap();
+    assert_eq!(channel.recv(&mut buf, WAIT).unwrap(), Some(5));
+    let started = Instant::now();
+    while session.rtt().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(2), "UDP never proven");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut got = 0;
+    for i in 0..500u32 {
+        let mut packet = vec![0u8; 1200];
+        packet[..4].copy_from_slice(&i.to_be_bytes());
+        channel.send(&packet).unwrap();
+        if let Some(n) = channel.recv(&mut buf, Some(Duration::from_millis(200))).unwrap() {
+            assert_eq!(n, 1200);
+            got += 1;
+        }
+    }
+    assert!(got >= 495, "{got} of 500 came back");
+    // Too big for a datagram: dropped, counted.
+    channel.send(&[0u8; 1401]).unwrap();
+    assert_eq!(channel.recv(&mut buf, Some(Duration::from_millis(300))).unwrap(), None);
+    assert!(session.dropped() >= 1);
+}
+
+#[test]
+fn a_feature_not_served_is_refused() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let error = session.open("camera", "video", Class::Realtime).err().unwrap();
+    assert!(error.contains("not served"), "{error}");
+}
+
+#[test]
+fn an_unpaired_device_gets_no_session() {
+    let (_pc, _tablet, address) = pair();
+    let (stranger_id, _) = identity();
+    let stranger = Node::new("stranger", &stranger_id, Arc::new(|_: &str| true)).unwrap();
+    assert!(stranger.connect(address, Duration::from_secs(2)).is_err());
+}
+
+#[test]
+fn closing_a_channel_ends_it_on_the_other_side() {
+    let (pc, tablet, address) = pair();
+    let (opened, heard) = mpsc::channel();
+    tablet.serve("sink", 1, move |incoming| {
+        let mut buf = [0u8; 64];
+        let mut ended = false;
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, WAIT) {
+            if n == 0 {
+                ended = true;
+                break;
+            }
+        }
+        opened.send(ended).unwrap();
+    });
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let channel = session.open("sink", "x", Class::Control).unwrap();
+    channel.send(b"one").unwrap();
+    drop(channel);
+    assert_eq!(heard.recv_timeout(Duration::from_secs(5)), Ok(true));
+}
+
+#[test]
+fn a_session_closed_ends_its_channels_and_says_so() {
+    let (pc, _tablet, address) = pair();
+    let (events, gone) = mpsc::channel();
+    pc.on_event(move |event| {
+        if let Event::Gone(peer, reason) = event {
+            let _ = events.send((peer, reason));
+        }
+    });
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let channel = session.open("echo", "x", Class::Realtime).unwrap();
+    session.close();
+    let mut buf = [0u8; 64];
+    assert_eq!(channel.recv(&mut buf, WAIT).unwrap(), Some(0));
+    let (peer, _) = gone.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(peer, session.peer);
+    assert!(pc.session(&session.peer).is_none());
+}
+
+#[test]
+fn the_tablet_hears_the_pc_go() {
+    let (pc, tablet, address) = pair();
+    let (events, gone) = mpsc::channel();
+    tablet.on_event(move |event| {
+        if let Event::Gone(_, reason) = event {
+            let _ = events.send(reason);
+        }
+    });
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(tablet.sessions().len(), 1);
+    session.close();
+    gone.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(tablet.sessions().is_empty());
+}
+
+#[test]
+fn a_new_session_replaces_the_one_before() {
+    let (pc, tablet, address) = pair();
+    let first = pc.connect(address, Duration::from_secs(2)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let second = pc.connect(address, Duration::from_secs(2)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(first.is_closed());
+    assert!(!second.is_closed());
+    assert_eq!(tablet.sessions().len(), 1);
+}

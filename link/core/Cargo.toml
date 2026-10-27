@@ -1,0 +1,19 @@
+[package]
+name = "plus-one-link"
+version = "0.1.0"
+description = "Plus One's link: one session with a paired device over any path, channels for the features"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "plusone_link"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ring = "0.17"
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }

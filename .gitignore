@@ -13,3 +13,4 @@ android/local.properties
 *.p12
 *.jks
 *.keystore
+link/target/
