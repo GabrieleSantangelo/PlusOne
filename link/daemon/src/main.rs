@@ -12,10 +12,11 @@
 //!   {"op": "devices"}            the paired tablets: id, name, connected,
 //!                                features, rtt_ms, dropped
 //!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]
-//!    [, "kind": "p2p"]}          a session with the tablet there (or with
-//!                                that one, wherever it is): its id; "p2p":
-//!                                the address is in a Wi-Fi Direct group
-//!                                with it (a better path, not remembered)
+//!    [, "kind": "p2p"|"ap"]}     a session with the tablet there (or with
+//!                                that one, wherever it is): its id; "p2p",
+//!                                "ap": the address is in a Wi-Fi Direct
+//!                                group with it, on the PC's own access
+//!                                point (a better path, not remembered)
 //!   {"op": "browse"[, "wait": S]}  the tablets announcing the link nearby
 //!                                (mDNS): id (its start), name, address
 //!   {"op": "queued", "device"}   bytes on their way to it, not yet sent
@@ -107,8 +108,8 @@ impl Daemon {
         let session = match (request["address"].as_str(), request["device"].as_str()) {
             (Some(address), _) => {
                 let address = address.parse().map_err(|e| format!("the address: {e}"))?;
-                if request["kind"].as_str() == Some("p2p") {
-                    self.node.connect_as(address, timeout, "p2p")?
+                if let Some(kind @ ("p2p" | "ap")) = request["kind"].as_str() {
+                    self.node.connect_as(address, timeout, kind)?
                 } else {
                     let session = self.node.connect(address, timeout)?;
                     self.reached(&session.peer, address);

@@ -67,3 +67,26 @@ def test_iw_parsed():
         assert p2p._iw_addresses() == {"phy2": "b0:dc:ef:a6:04:83"}
     finally:
         p2p.Gio.Subprocess.new = original
+
+
+def test_the_access_point_never_on_the_main_connection(monkeypatch):
+    from plusone.link import ap
+    devices = {
+        ap.NM_PATH: {"PrimaryConnection": "/active/1"},
+        "/active/1": {"Devices": ["/d/1"]},
+        "/d/1": {"DeviceType": p2p.TYPE_WIFI, "Interface": "wlan0", "WirelessCapabilities": 0x7ff},
+        "/d/2": {"DeviceType": p2p.TYPE_WIFI, "Interface": "wlx1", "WirelessCapabilities": 0x40},
+    }
+
+    class NM:
+        def call(self, _bus, path, iface, method, args=None, reply=None):
+            return ([d for d in devices if d.startswith("/d/")],)
+
+        def get(self, _bus, path, iface, name):
+            return devices.get(path, {}).get(name)
+    fake = NM()
+    monkeypatch.setattr(ap, "_call", fake.call)
+    monkeypatch.setattr(ap, "_get", fake.get)
+    assert ap.ap_device(None) == ("/d/2", "wlx1")
+    devices["/d/2"]["WirelessCapabilities"] = 0  # no access point in it
+    assert ap.ap_device(None) is None

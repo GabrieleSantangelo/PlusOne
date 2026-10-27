@@ -110,7 +110,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn rank(kind: &str) -> u8 {
     match kind {
         "usb" => 4,
-        "p2p" => 3,  // Wi-Fi Direct: once through the air, no access point's queue
+        "p2p" | "ap" => 3,  // Wi-Fi Direct, the PC's own access point: once through the air, no one else's queue
         "lan" => 2,
         _ => 1,
     }

@@ -13,6 +13,8 @@
     <!-- A Wi-Fi Direct group with the PC, a path of the link's own
          (P2pHandler): never used to tell where the tablet is. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- The PC's own access point (ApHandler): a network asked for by name. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
