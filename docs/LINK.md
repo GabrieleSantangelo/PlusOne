@@ -1,6 +1,7 @@
 # The link: connection apart from the features
 
-Status: design; phase 1 in progress (branch `link`).
+Status: phase 1 done (the core); phase 2 in progress: plus-one-link and
+plusone_link work, the features not on them yet (branch `link`).
 
 The connection to the tablet becomes a layer of its own, in Rust, the same
 code on both sides: on the PC a program of its own (`plus-one-link`), in
@@ -169,6 +170,26 @@ signing with the keystore's key.
   datagram kinds become channels). Then signing; then camera and
   microphone, which leave WebRTC for their own realtime channels (WebRTC
   needs an IP path, the cable and Bluetooth are not one).
+
+## Measured
+
+On loopback, the flows of the tablet in use at once from Python (video,
+1200-byte packets at 20 Mbit/s in 60 bursts a second; sound, a packet each
+5 ms; input, 285 a second), each packet from Python's write to the other
+end's read (`tools/bench/paths.py old|link 20`, twice each, 2026-10-27):
+
+| | Now: Python seals, straight to UDP | The link: Python writes, plus-one-link seals |
+|---|---|---|
+| Video p50 / p99 / max | 0.03 / 0.20-0.25 / ~2.0 ms | 0.14 / 0.31-0.34 / 0.4-1.2 ms |
+| Sound p50 / p99.9 | 0.10-0.14 / 0.27-0.51 ms | 0.11 / 0.36-0.37 ms |
+| Input p50 / p99.9 | 0.09-0.10 / 0.29-0.30 ms | 0.11-0.13 / 0.37-0.41 ms |
+| The PC's CPU in 20 s | 0.98-1.03 s | 0.85-0.92 s (half of it plus-one-link's) |
+| Lost | 0 | 0 |
+
+The link costs about 0.1 ms a packet (a thread more to wake on each side)
+and less CPU, with lower peaks: nothing anyone sees next to a frame's
+16.7 ms and the Wi-Fi's milliseconds. The core alone, Rust at both ends
+(`link/core/examples/bench.rs`): 0.1 ms p50, 0.3 ms p99.
 
 ## Phases
 

@@ -34,10 +34,21 @@ impl NodeInner {
         self.served.lock().unwrap().get(feature).map(|(_, handler)| handler.clone())
     }
 
-    fn hello(&self) -> Value {
+    fn features(&self) -> Value {
         let features: Map<String, Value> =
             self.served.lock().unwrap().iter().map(|(name, (version, _))| (name.clone(), json!(version))).collect();
-        json!({"t": "hello", "name": self.name, "features": features})
+        Value::Object(features)
+    }
+
+    fn hello(&self) -> Value {
+        json!({"t": "hello", "name": self.name, "features": self.features()})
+    }
+
+    fn features_changed(&self) {
+        let features = self.features();
+        for session in self.sessions.lock().unwrap().values() {
+            session.our_features(features.clone());
+        }
     }
 
     fn event(&self, event: Event) {
@@ -62,6 +73,8 @@ impl NodeInner {
     fn add(self: &Arc<Self>, established: session::Established) -> std::io::Result<Arc<Session>> {
         let session = Session::start(self, established)?;
         let before = self.sessions.lock().unwrap().insert(session.peer.clone(), session.clone());
+        // Served since the hello went (the session was not among them yet).
+        session.our_features(self.features());
         if let Some(before) = before {
             before.close();
         }
@@ -88,11 +101,19 @@ impl Node {
         })))
     }
 
-    /// A feature of ours, its version (the hello says it): the other side's
-    /// channels for it go to handler, each on a thread of its own. Before
-    /// sessions start: a session's hello says what was served then.
+    /// A feature of ours, its version (the hellos say it, and the sessions
+    /// up are told): the other side's channels for it go to handler, each
+    /// on a thread of its own.
     pub fn serve(&self, feature: &str, version: u32, handler: impl Fn(Incoming) + Send + Sync + 'static) {
         self.0.served.lock().unwrap().insert(feature.to_owned(), (version, Arc::new(handler)));
+        self.0.features_changed();
+    }
+
+    /// A feature no longer served: its channels from then on refused.
+    pub fn unserve(&self, feature: &str) {
+        if self.0.served.lock().unwrap().remove(feature).is_some() {
+            self.0.features_changed();
+        }
     }
 
     pub fn on_event(&self, listener: impl Fn(Event) + Send + Sync + 'static) {

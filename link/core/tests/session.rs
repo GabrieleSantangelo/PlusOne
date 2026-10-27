@@ -43,7 +43,23 @@ fn hello_says_names_and_features() {
     let (pc, _tablet, address) = pair();
     let session = pc.connect(address, Duration::from_secs(2)).unwrap();
     assert_eq!(session.name, "tablet");
-    assert_eq!(session.features["echo"], 1);
+    assert_eq!(session.features()["echo"], 1);
+}
+
+#[test]
+fn features_served_later_are_told() {
+    let (pc, tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    tablet.serve("speakers", 3, |_| {});
+    let started = Instant::now();
+    while session.features()["speakers"] != 3 {
+        assert!(started.elapsed() < Duration::from_secs(2), "never told");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    tablet.unserve("speakers");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(session.features().get("speakers").is_none());
+    assert!(session.open("speakers", "pcm", Class::Realtime).is_err());
 }
 
 #[test]

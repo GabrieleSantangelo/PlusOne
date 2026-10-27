@@ -1,0 +1,16 @@
+[package]
+name = "plus-one-link-daemon"
+version = "0.1.0"
+description = "plus-one-link: Plus One's link as a program of its own, its channels handed to apps through a Unix socket"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "plus-one-link"
+path = "src/main.rs"
+
+[dependencies]
+plus-one-link = { path = "../core" }
+serde_json = "1"
+libc = "0.2"

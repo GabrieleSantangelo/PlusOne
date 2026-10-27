@@ -118,7 +118,7 @@ pub struct Session {
     /// The other side's certificate's fingerprint, and what its hello said.
     pub peer: String,
     pub name: String,
-    pub features: Value,
+    features: Mutex<Value>,
     node: Weak<NodeInner>,
     started: Instant,
     closed: AtomicBool,
@@ -230,7 +230,7 @@ impl Session {
         let session = Arc::new(Session {
             peer,
             name: hello["name"].as_str().unwrap_or("").to_owned(),
-            features: hello["features"].clone(),
+            features: Mutex::new(hello["features"].clone()),
             node: Arc::downgrade(node),
             started: Instant::now(),
             closed: AtomicBool::new(false),
@@ -260,6 +260,16 @@ impl Session {
 
     fn us(&self) -> u64 {
         self.started.elapsed().as_micros() as u64
+    }
+
+    /// What the other side serves now: {feature: version}.
+    pub fn features(&self) -> Value {
+        self.features.lock().unwrap().clone()
+    }
+
+    /// Ours changed (a feature served or no longer): the other side told.
+    pub(crate) fn our_features(&self, features: Value) {
+        self.send_message(json!({"t": "features", "features": features}));
     }
 
     pub fn is_closed(&self) -> bool {
@@ -562,6 +572,7 @@ impl Session {
                 }
             }
             "close" => self.close_channel(id, false),
+            "features" => *self.features.lock().unwrap() = message["features"].clone(),
             other => log!("{}: a message of type {other:?}", self.label()),
         }
     }

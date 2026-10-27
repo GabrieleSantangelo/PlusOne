@@ -102,6 +102,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "plus-one-link-daemon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "plus-one-link",
+ "serde_json",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

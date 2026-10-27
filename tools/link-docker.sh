@@ -3,6 +3,8 @@
 # never touches the host.
 #   tools/link-docker.sh fetch        crates.io's crates, as Cargo.lock pins
 #                                     them (downloaded only: nothing runs)
+#   tools/link-docker.sh lock         Cargo.lock again after a crate of ours
+#                                     came or went (no network: nothing new)
 #   tools/link-docker.sh build|test|clippy|... [args]
 #                                     cargo, with no network at all: what the
 #                                     crates' build scripts and tests run
@@ -18,6 +20,9 @@ if [ "$command" = fetch ]; then
     network=""
     cargo="cargo fetch --locked"
     [ -f link/Cargo.lock ] || cargo="cargo generate-lockfile && cargo fetch --locked"
+elif [ "$command" = lock ]; then
+    network="--network none"
+    cargo="cargo update --workspace --offline"
 else
     network="--network none"
     cargo="cargo $command --offline --locked $*"
