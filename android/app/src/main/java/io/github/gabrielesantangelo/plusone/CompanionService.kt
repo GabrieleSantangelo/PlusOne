@@ -29,6 +29,14 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class CompanionService : Service(), LinkServer.Host {
     private var server: LinkServer? = null
+    /** The link's core (docs/LINK.md), beside the link of before while the
+     * features move over: the PCs' plus-one-link connect to it. */
+    var link: io.github.gabrielesantangelo.plusone.link.LinkCore? = null
+        private set
+    private var linkAnnouncer: MdnsAnnouncer? = null
+    private val pairedChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        link?.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -57,7 +65,44 @@ class CompanionService : Service(), LinkServer.Host {
             // How the PCs reach the app, and learn where: another way is one more here.
             listeners = listOf(TcpListener()),
             announcers = listOf(MdnsAnnouncer(this))).also { it.start() }
+        startLink()
         handler.postDelayed(::idleCheck, IDLE_CHECK)
+    }
+
+    /** The link's core: listening, announced, the paired PCs trusted; "echo"
+     * served (every message back: the link measured from the PC). */
+    private fun startLink() {
+        val core = try {
+            io.github.gabrielesantangelo.plusone.link.LinkCore(deviceName(this),
+                io.github.gabrielesantangelo.plusone.link.Identity.certificate,
+                io.github.gabrielesantangelo.plusone.link.Identity.privateKey)
+        } catch (e: Throwable) {  // UnsatisfiedLinkError among them: the old link goes on alone
+            Log.w(TAG, "link: not started: $e")
+            return
+        }
+        link = core
+        core.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
+        getSharedPreferences("paired", MODE_PRIVATE).registerOnSharedPreferenceChangeListener(pairedChanged)
+        core.serve("echo") { channel ->
+            val buffer = ByteArray(256 shl 10)
+            while (true) {
+                val length = channel.receive(buffer)
+                if (length <= 0) break
+                channel.send(buffer, 0, length)
+            }
+        }
+        Thread({
+            try {
+                val port = core.listen()
+                val id = io.github.gabrielesantangelo.plusone.link.Identity.fingerprint(
+                    io.github.gabrielesantangelo.plusone.link.Identity.certificate.encoded)
+                linkAnnouncer = MdnsAnnouncer(this, io.github.gabrielesantangelo.plusone.link.LinkCore.SERVICE_TYPE)
+                    .also { it.announce("tcp", port, id, deviceName(this), appVersion()) }
+                Log.i(TAG, "link: listening on $port")
+            } catch (e: Exception) {
+                Log.w(TAG, "link: cannot listen: $e")
+            }
+        }, "link-start").start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -70,6 +115,9 @@ class CompanionService : Service(), LinkServer.Host {
         Jobs.unlisten(queueChanged)
         handler.removeCallbacksAndMessages(null)
         server?.stop()
+        getSharedPreferences("paired", MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(pairedChanged)
+        linkAnnouncer?.stop()
+        link?.close()
         super.onDestroy()
     }
 

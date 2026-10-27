@@ -27,6 +27,13 @@ object Identity {
 
     private val keyStore: KeyStore by lazy { KeyStore.getInstance("AndroidKeyStore").apply { load(null) } }
 
+    /** The key, for signing in the keystore (it never comes out of it). */
+    val privateKey: java.security.PrivateKey
+        get() {
+            certificate  // created if needed
+            return keyStore.getKey(ALIAS, null) as java.security.PrivateKey
+        }
+
     val certificate: X509Certificate
         get() {
             if (!keyStore.containsAlias(ALIAS)) create()

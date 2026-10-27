@@ -60,6 +60,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           persist-credentials: false
+      - name: The link's core for the app (link/android, into jniLibs)
+        run: tools/link-docker.sh fetch && tools/link-docker.sh android
       - name: Companion app, unsigned
         run: tools/android-docker.sh assembleRelease
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

@@ -1,7 +1,7 @@
 # The link: connection apart from the features
 
-Status: phase 1 done (the core); phase 2 in progress: plus-one-link and
-plusone_link work, the features not on them yet (branch `link`).
+Status (branch `link`): the core, plus-one-link, plusone_link and the
+core in the app work, measured with the tablet; no feature on them yet.
 
 The connection to the tablet becomes a layer of its own, in Rust, the same
 code on both sides: on the PC a program of its own (`plus-one-link`), in
@@ -190,6 +190,19 @@ The link costs about 0.1 ms a packet (a thread more to wake on each side)
 and less CPU, with lower peaks: nothing anyone sees next to a frame's
 16.7 ms and the Wi-Fi's milliseconds. The core alone, Rust at both ends
 (`link/core/examples/bench.rs`): 0.1 ms p50, 0.3 ms p99.
+
+With the tablet (2026-10-27): the app's core (link/android in
+libplusonelink.so, LinkCore.kt) listens and announces
+`_plusone-link._tcp`; plus-one-link reached it with the PC's own
+identity and pairing, a session in 158 ms (the TLS handshake signed in
+Android's keystore). Round trips on the app's "echo" over the phone's
+hotspot (each way twice through the air), against ICMP's 7.1 ms average:
+
+| | Came back | p50 | p90 | p99 |
+|---|---|---|---|---|
+| Control, 100 bytes, one at a time | 300 of 300 | 10.8 ms | 14.1 | 29.5 |
+| Realtime, 200 bytes, 200 a second | 1000 of 1000 | 8.9 ms | 10.6 | 15.3 |
+| Realtime, 17 Mbit/s each way | 17994 of 18000 | 12.8 ms | 17.0 | 22.9 |
 
 ## Phases
 

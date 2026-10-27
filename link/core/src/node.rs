@@ -7,6 +7,8 @@ use crate::log;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +29,8 @@ pub(crate) struct NodeInner {
     served: Mutex<HashMap<String, (u32, Handler)>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     events: Mutex<Option<Arc<dyn Fn(Event) + Send + Sync>>>,
+    listeners: Mutex<Vec<TcpListener>>,
+    closed: AtomicBool,
 }
 
 impl NodeInner {
@@ -98,6 +102,8 @@ impl Node {
             served: Mutex::default(),
             sessions: Mutex::default(),
             events: Mutex::default(),
+            listeners: Mutex::default(),
+            closed: AtomicBool::new(false),
         })))
     }
 
@@ -132,9 +138,13 @@ impl Node {
     pub fn listen(&self, address: SocketAddr) -> std::io::Result<SocketAddr> {
         let listener = TcpListener::bind(address)?;
         let bound = listener.local_addr()?;
+        self.0.listeners.lock().unwrap().push(listener.try_clone()?);
         let node = self.0.clone();
         std::thread::Builder::new().name("link-listen".into()).spawn(move || {
             for tcp in listener.incoming() {
+                if node.closed.load(Ordering::SeqCst) {
+                    break;
+                }
                 let Ok(tcp) = tcp else { continue };
                 let node = node.clone();
                 // Each on its own: a slow or hostile one holds up no other.
@@ -151,6 +161,19 @@ impl Node {
             }
         })?;
         Ok(bound)
+    }
+
+    /// Everything over: no more listening, every session closed.
+    pub fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        for listener in self.0.listeners.lock().unwrap().drain(..) {
+            // A listening socket shut down: its accept() returns at once.
+            crate::sys::shutdown(listener.as_raw_fd());
+        }
+        let sessions: Vec<Arc<Session>> = self.0.sessions.lock().unwrap().values().cloned().collect();
+        for session in sessions {
+            session.close();
+        }
     }
 
     /// A session with the device listening at address.

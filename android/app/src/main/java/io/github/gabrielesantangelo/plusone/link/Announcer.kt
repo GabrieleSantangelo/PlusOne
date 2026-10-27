@@ -13,10 +13,11 @@ interface Announcer {
     fun stop()
 }
 
-/** mDNS (DNS-SD, _plusone._tcp): the TCP listener's port, and in its TXT
- * record the app's id (its certificate's fingerprint, the start), name and
- * version (an older one than the PC's gets its update). */
-class MdnsAnnouncer(private val context: Context) : Announcer {
+/** mDNS (DNS-SD, _plusone._tcp; the link's core, _plusone-link._tcp): the
+ * TCP listener's port, and in its TXT record the app's id (its
+ * certificate's fingerprint, the start), name and version (an older one
+ * than the PC's gets its update). */
+class MdnsAnnouncer(private val context: Context, private val serviceType: String = SERVICE_TYPE) : Announcer {
     @Volatile private var registration: NsdManager.RegistrationListener? = null
     @Volatile private var stopped = false
 
@@ -26,7 +27,7 @@ class MdnsAnnouncer(private val context: Context) : Announcer {
         if (kind != "tcp") return
         val info = NsdServiceInfo().apply {
             serviceName = name.take(63)  // a DNS label's most
-            serviceType = SERVICE_TYPE
+            serviceType = this@MdnsAnnouncer.serviceType
             port = where
             setAttribute("id", id.take(16))
             // A TXT entry, key and value, is 255 bytes at most.

@@ -193,3 +193,17 @@ fn a_new_session_replaces_the_one_before() {
     assert!(!second.is_closed());
     assert_eq!(tablet.sessions().len(), 1);
 }
+
+#[test]
+fn a_node_closed_listens_no_more() {
+    let (pc, tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    tablet.close();
+    let started = Instant::now();
+    while !session.is_closed() {
+        assert!(started.elapsed() < Duration::from_secs(2), "the session went on");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(pc.connect(address, Duration::from_secs(1)).is_err());
+}

@@ -74,6 +74,22 @@ jobs:
           missing = [e for e in need if not Gst.ElementFactory.find(e)]
           sys.exit(f"missing: {missing}" if missing else 0)'
 
+  link:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: The link's crates (Cargo.lock's)
+        run: tools/link-docker.sh fetch
+      - name: Its tests, with no network
+        run: tools/link-docker.sh test
+      - name: plusone_link against plus-one-link and a test tablet
+        run: |
+          tools/link-docker.sh build --release --workspace --examples --bins
+          sudo apt-get install -y --no-install-recommends python3-pytest
+          PLUSONE_LINK_BIN=link/target/release python3 -m pytest -q -p no:cacheprovider tests/test_plusone_link.py
+
   android:
     runs-on: ubuntu-24.04
     steps:
@@ -90,6 +106,19 @@ jobs:
           load: true
           cache-from: type=gha,scope=android
           cache-to: type=gha,mode=max,scope=android
+      - name: Build the link's container (the NDK and Rust cached between runs)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.link-android
+          tags: plus-one-link-android
+          load: true
+          cache-from: type=gha,scope=link-android
+          cache-to: type=gha,mode=max,scope=link-android
+      - name: The link's core for the app (link/android, into jniLibs)
+        run: tools/link-docker.sh fetch && tools/link-docker.sh android
+        env:
+          PLUSONE_IMAGE_BUILT: "1"
       - name: Gradle's downloads, cached between runs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:

@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "daemon"]
+members = ["core", "daemon", "android"]
 resolver = "3"
 
 [workspace.package]
@@ -9,3 +9,4 @@ license = "MIT"
 
 [profile.release]
 opt-level = 3
+strip = true

@@ -14,3 +14,4 @@ android/local.properties
 *.jks
 *.keystore
 link/target/
+android/app/src/main/jniLibs/
