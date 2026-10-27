@@ -99,7 +99,9 @@ pub fn bridge(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'sta
         let _ = inbound.shutdown(Shutdown::Both);
     })?;
     std::thread::Builder::new().name("link-bridge-out".into()).spawn(move || {
-        let mut buf = vec![0u8; chunk];
+        // A byte short of a transfer: a full one is never a whole number of
+        // packets, so it goes as one (usb_pieces would cut it in two).
+        let mut buf = vec![0u8; chunk - 1];
         loop {
             match outbound.read(&mut buf) {
                 Ok(0) | Err(_) => break,

@@ -233,6 +233,43 @@ fn until(what: &str, done: impl Fn() -> bool) {
 }
 
 #[test]
+fn a_transfer_one_way_on_a_stream_goes_as_fast_as_the_stream() {
+    // The cable: a stream whose buffers fill at once. What is queued while
+    // it is full goes as soon as there is room, not at the next ping.
+    let (pc, tablet, _address) = pair();
+    let (got, total) = mpsc::channel();
+    tablet.serve("sink", 1, move |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut bytes = 0;
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+            bytes += n;
+        }
+        let _ = got.send(bytes);
+    });
+    let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    for end in [&a, &b] {
+        use std::os::unix::io::AsRawFd;
+        plusone_link::sys::set_int(end.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 << 10);
+        plusone_link::sys::set_int(end.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 16 << 10);
+    }
+    let accepter = tablet.clone();
+    std::thread::spawn(move || accepter.accept_stream(Box::new(b), "usb").map(|_| ()));
+    let session = pc.connect_stream(Box::new(a), "usb").unwrap();
+    let channel = session.open("sink", "control", Class::Control).unwrap();
+    let chunk = vec![7u8; 64 << 10];
+    let started = Instant::now();
+    for _ in 0..128 {
+        channel.send(&chunk).unwrap();
+    }
+    drop(channel);
+    assert_eq!(total.recv_timeout(Duration::from_secs(30)).unwrap(), 128 * chunk.len());
+    assert!(started.elapsed() < Duration::from_secs(3), "8 MiB in {:?}", started.elapsed());
+}
+
+#[test]
 fn a_session_goes_on_over_another_path() {
     let (pc, tablet, address) = pair();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();

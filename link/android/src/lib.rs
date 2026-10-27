@@ -122,7 +122,8 @@ fn cable(node: Node, file: std::fs::File, kind: &str) {
             let (writer, sink) = (writer.clone(), sink.clone());
             let mut ours = ours;
             std::thread::Builder::new().name("link-cable-out".into()).spawn(move || {
-                let mut buf = vec![0u8; 16 << 10];
+                // A byte short of the accessory's transfer: a full one goes as one (usb_pieces).
+                let mut buf = vec![0u8; (16 << 10) - 1];
                 loop {
                     let n = match ours.read(&mut buf) {
                         Ok(0) | Err(_) => break,

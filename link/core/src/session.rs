@@ -790,6 +790,10 @@ impl Session {
                     Err(e) => return Err(e.to_string()),
                 }
             }
+            // All out, and more queued meanwhile (its wake taken already, while
+            // the stream was full): round again at once, after a look at what
+            // came, not at the next ping (a transfer went a burst a second).
+            let more = !blocked && !self.outbox.lock().unwrap().is_empty();
             let now = Instant::now();
             let silent = path.us().saturating_sub(path.heard_us.load(Ordering::Relaxed));
             if silent > PATH_SILENCE.as_micros() as u64 {
@@ -821,7 +825,7 @@ impl Session {
                 libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 }, revents: 0 },
                 libc::pollfd { fd: self.wake.fd(), events: libc::POLLIN, revents: 0 },
             ];
-            sys::poll(&mut fds, Some(wait.min(PING_EVERY))).map_err(|e| e.to_string())?;
+            sys::poll(&mut fds, Some(if more { Duration::ZERO } else { wait.min(PING_EVERY) })).map_err(|e| e.to_string())?;
             if fds[1].revents != 0 {
                 self.wake.clear();
             }

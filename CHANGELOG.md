@@ -15,6 +15,10 @@
   first); the PCs paired before keep updating it; each PC's options on
   the tablet change it. By cable alone the PC learns the app's version
   over the link, so it updates it there too.
+- **The cable at full speed**: one way it went in bursts of 2 MB a few
+  seconds apart (16 MB in a minute); now 16 MB take a second, both ways
+  at about 18 MB/s each. What was queued while the cable was full waited
+  for the next keepalive instead of going as soon as there was room.
 - **A big transfer never chokes the cable**: plus-one-link feeds a PDF or
   the app to the link only as fast as it goes, so the desktop and the sound
   sharing the cable go on meanwhile.
