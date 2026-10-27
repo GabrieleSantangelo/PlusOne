@@ -28,7 +28,7 @@ REQUEST = 64 << 10
 # A channel's largest message: control's (the system caps a message
 # socket's), and input's or realtime's (a datagram on any network).
 MAX_CONTROL = 200 << 10
-MAX_DATAGRAM = 1400
+MAX_DATAGRAM = 1422
 
 
 class LinkError(Exception):
@@ -36,6 +36,9 @@ class LinkError(Exception):
 
 
 def socket_path():
+    """plus-one-link's socket: PLUSONE_LINK_SOCKET, or its usual place."""
+    if os.environ.get("PLUSONE_LINK_SOCKET"):
+        return os.environ["PLUSONE_LINK_SOCKET"]
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return os.path.join(runtime, "plus-one", "link")
 

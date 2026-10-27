@@ -15,7 +15,8 @@ import java.net.InetAddress
  * newest, is a replay; one that only came out of order is kept (the
  * modules put a frame's packets, or the sound's, in order themselves).
  */
-class Datagrams(key: ByteArray, private val pc: InetAddress, @Volatile private var pcPort: Int, receiveBuffer: Int) {
+class Datagrams(key: ByteArray, private val pc: InetAddress, @Volatile private var pcPort: Int, receiveBuffer: Int)
+    : Packets {
     private val socket = DatagramSocket(0).apply { receiveBufferSize = receiveBuffer }
     private val sealed = Sealed(key)
     private val buffer = ByteArray(2048)
@@ -26,7 +27,7 @@ class Datagrams(key: ByteArray, private val pc: InetAddress, @Volatile private v
     val port: Int = socket.localPort
 
     /** The next body from the PC: blocks; throws once closed. From one thread. */
-    fun receive(): ByteArray {
+    override fun receive(): ByteArray {
         while (true) {
             socket.receive(packet)
             if (packet.address != pc) continue
@@ -41,12 +42,12 @@ class Datagrams(key: ByteArray, private val pc: InetAddress, @Volatile private v
      * at a time, so they leave in the order of their counts (the PC takes
      * only one newer than the newest it heard). */
     @Synchronized
-    fun send(body: ByteArray) {
+    override fun send(body: ByteArray) {
         val sealedBody = sealed.seal(body)
         socket.send(DatagramPacket(sealedBody, sealedBody.size, pc, pcPort))
     }
 
-    fun close() = socket.close()
+    override fun close() = socket.close()
 
     companion object {
         const val WINDOW = 1024  // packets: a keyframe's, out of order on the Wi-Fi, fit well within it

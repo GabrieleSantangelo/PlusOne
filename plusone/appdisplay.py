@@ -9,7 +9,9 @@ carry the time they were captured, and pings match the two clocks.
 """
 import argparse
 import collections
+import json
 import math
+import select
 import struct
 import threading
 import time
@@ -21,6 +23,11 @@ from gi.repository import GLib, Gst  # noqa: E402
 
 from . import link, log, media, once, pen  # noqa: E402
 from .link.datagrams import NONCE, TAG, Datagrams  # noqa: E402
+
+try:
+    import plusone_link
+except ImportError:  # a Plus One without the link (docs/LINK.md): the link of before only
+    plusone_link = None
 
 VIDEO, KEYFRAME, PING, PONG, STATS, INPUT = 1, 2, 3, 4, 5, 6
 VIDEO_HEADER = struct.Struct("!BBIHHq")  # kind, flags, frame, index, count, captured
@@ -464,6 +471,58 @@ class RateControl:
         return kbps
 
 
+class LinkPackets:
+    """The desktop's packets over the link (plus-one-link, docs/LINK.md),
+    as Datagrams carries them over the link of before: VIDEO, PING and PONG
+    out and KEYFRAME, PONG and STATS in on a realtime channel, INPUT in on
+    an input channel (the newest state kept, never queued); queued() is
+    plus-one-link's backlog to the tablet."""
+
+    def __init__(self, connection, device, control, media, input):
+        self.connection, self.device = connection, device
+        self.control, self.media, self.input = control, media, input
+        self.payload = plusone_link.MAX_DATAGRAM - VIDEO_HEADER.size
+        self._open = [media, input]
+        self.errors = set()
+
+    def send(self, body):
+        try:
+            self.media.send(body)
+        except OSError as e:
+            if e.errno not in self.errors:
+                self.errors.add(e.errno)
+                log("app display: cannot send:", e.strerror)
+
+    def queued(self):
+        try:
+            return self.connection.queued(self.device)
+        except (OSError, ValueError, plusone_link.LinkError):
+            return 0
+
+    def receive(self, timeout):
+        """A body from the app, or None (nothing in time, or the channels over)."""
+        try:
+            ready = select.select(self._open, [], [], timeout)[0] if self._open else []
+        except (OSError, ValueError):  # closed
+            return None
+        if not self._open:
+            time.sleep(timeout)
+        for channel in ready:
+            try:
+                body = channel.recv()
+            except OSError:
+                body = b""
+            if body:
+                return body
+            self._open.remove(channel)  # its end: not waited on again
+        return None
+
+    def close(self):
+        for channel in (self.control, self.media, self.input):
+            channel.close()
+        self.connection.close()
+
+
 class AppStreamer:
     """The virtual monitor (or a test pattern), encoded, to the app."""
 
@@ -528,7 +587,8 @@ class AppStreamer:
         self._encoded = []  # ms from capture to sent, since the last stats
         self._running = True
         self._feedback = threading.Thread(target=self._listen, daemon=True)
-        log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {channel.app[0]}:{channel.app[1]}")
+        to = f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams) else "the link"
+        log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {to}")
 
     def start(self):
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -580,11 +640,12 @@ class AppStreamer:
         data = buf.extract_dup(0, buf.get_size())
         captured = self._captured.popleft() if self._captured else time.monotonic_ns()
         keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
-        count = -(-len(data) // PAYLOAD)
+        payload = getattr(self.channel, "payload", PAYLOAD)
+        count = -(-len(data) // payload)
         number = self._frame = self._frame + 1
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
-            self.channel.send(header + data[index * PAYLOAD:(index + 1) * PAYLOAD])
+            self.channel.send(header + data[index * payload:(index + 1) * payload])
         self._encoded.append((time.monotonic_ns() - captured) / 1e6)
         return Gst.FlowReturn.OK
 
@@ -692,9 +753,43 @@ class AppDisplay:
         self._teardown()
 
     # -- the link's thread ------------------------------------------------------
+    def _over_the_link(self):
+        """The session over the link (plus-one-link), when it runs and the
+        app serves the desktop on it: the channels, its answer; else None,
+        for the link of before."""
+        if plusone_link is None:
+            return None
+        try:
+            connection = plusone_link.Link()
+        except plusone_link.LinkError:
+            return None
+        channels = []
+        try:
+            device = next((d["id"] for d in connection.devices() if d["id"].startswith(self.app_id)), None)
+            if device is None:
+                raise plusone_link.LinkError("not a paired tablet")
+            for name, kind in (("control", plusone_link.CONTROL), ("media", plusone_link.REALTIME),
+                               ("input", plusone_link.INPUT)):
+                channels.append(connection.open(device, "display", name, kind))
+        except plusone_link.LinkError as e:
+            log("app display: not over the link:", e)
+            for channel in channels:
+                channel.close()
+            connection.close()
+            return None
+        packets = LinkPackets(connection, device, *channels)
+        packets.control.send(json.dumps({"type": "display"}).encode())
+        answer = packets.control.recv(timeout=10)
+        reply = json.loads(answer) if answer else {}
+        return packets, reply
+
     def _run(self):
         error = None
         try:
+            over_link = self._over_the_link()
+            if over_link is not None:
+                self._run_over_the_link(*over_link)
+                return
             self.link = link.connect(self.targets, self.app_id)
             if self._stopped.is_set():
                 return
@@ -729,6 +824,30 @@ class AppDisplay:
                 self.channel.close()  # stopped before teardown could see it (twice is harmless)
             if not self._stopped.is_set():
                 GLib.idle_add(once(self._ended, error))
+
+    def _run_over_the_link(self, packets, reply):
+        """The session on the link's channels, as _run's (its errors raised
+        to it), the control channel held instead of the link of before."""
+        self.channel = packets
+        if self._stopped.is_set():
+            return
+        if reply.get("type") != "display-ready":
+            raise ValueError(f"the app answered {reply.get('type') or reply.get('reason')!r}")
+        self.tablet_size = (int(reply["width"]), int(reply["height"]))
+        log(f"app display: over the link, {self.tablet_size[0]}x{self.tablet_size[1]}"
+            f" at {float(reply.get('refresh', 0)):.0f} Hz")
+        width, height, fps = self.mode
+        if (width, height) not in sizes(self.tablet_size):
+            width, height = auto_size(self.tablet_size)
+        self.mode = (width, height, fps)
+        GLib.idle_add(once(self._open))
+        # Until the app ends it (its control channel's end), or stop().
+        while not self._stopped.is_set():
+            try:
+                if packets.control.recv(timeout=0.5) == b"":
+                    return
+            except (OSError, ValueError):
+                return
 
     # -- the main loop ---------------------------------------------------------
     def _open(self):

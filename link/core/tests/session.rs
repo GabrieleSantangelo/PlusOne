@@ -103,7 +103,7 @@ fn realtime_goes_over_udp_once_proven() {
     }
     assert!(got >= 495, "{got} of 500 came back");
     // Too big for a datagram: dropped, counted.
-    channel.send(&[0u8; 1401]).unwrap();
+    channel.send(&[0u8; 1423]).unwrap();
     assert_eq!(channel.recv(&mut buf, Some(Duration::from_millis(300))).unwrap(), None);
     assert!(session.dropped() >= 1);
 }

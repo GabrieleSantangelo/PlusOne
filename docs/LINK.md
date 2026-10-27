@@ -1,7 +1,8 @@
 # The link: connection apart from the features
 
 Status (branch `link`): the core, plus-one-link, plusone_link and the
-core in the app work, measured with the tablet; no feature on them yet.
+core in the app work, measured with the tablet; the desktop goes over the
+link when plus-one-link runs.
 
 The connection to the tablet becomes a layer of its own, in Rust, the same
 code on both sides: on the PC a program of its own (`plus-one-link`), in
@@ -95,8 +96,8 @@ refuses it (not served, not allowed). Four classes:
 | Class | Delivery | On an IP path | On a stream (USB, Bluetooth) |
 |---|---|---|---|
 | control | reliable, ordered messages | the session's TLS stream | frames, first |
-| input | unreliable; the newest state counts, never queued | UDP | frames, before any media; one waiting at most |
-| realtime (sound, video) | unreliable; late is lost | UDP | frames; dropped while the stream's queue is past its budget |
+| input | unreliable; the newest state counts, never queued; up to 1422 bytes | UDP | frames, before any media; one waiting at most |
+| realtime (sound, video) | unreliable; late is lost; up to 1422 bytes | UDP | frames; dropped while the stream's queue is past its budget |
 | bulk (a PDF, a file, an update) | a reliable byte stream, last in line | a TCP connection of its own, joined to the session | frames, in what the others leave |
 
 - Datagrams: AES-256-GCM, the nonce the direction and a counter, the
@@ -203,6 +204,20 @@ hotspot (each way twice through the air), against ICMP's 7.1 ms average:
 | Control, 100 bytes, one at a time | 300 of 300 | 10.8 ms | 14.1 | 29.5 |
 | Realtime, 200 bytes, 200 a second | 1000 of 1000 | 8.9 ms | 10.6 | 15.3 |
 | Realtime, 17 Mbit/s each way | 17994 of 18000 | 12.8 ms | 17.0 | 22.9 |
+
+The desktop over it (2026-10-27): plusone/appdisplay.py opens "display"'s
+three channels (control, media, input) when plus-one-link runs and the
+app serves it, else the link of before; the packets are the same on both
+(LinkPackets, Packets.kt). A test pattern, 1920x1200 at 20 Mbit/s, 60 fps,
+about 24 s each, from the PC's capture to the frame decoded on the tablet:
+
+| | Median | 90% | Lost | Max |
+|---|---|---|---|---|
+| The link | 25.7 / 25.9 ms | 29.3 / 28.8 ms | 0 / 6 | 43 / 161 ms |
+| The link of before | 26.3 / 27.5 ms | 30.7 / 30.9 ms | 0 / 0 | 41 / 54 ms |
+
+(The 6 lost and 161 ms: one second of the second run, the hotspot's, it
+seems; to be watched.)
 
 ## Phases
 

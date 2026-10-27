@@ -85,9 +85,12 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
                     event.optString("channel"), event.optString("class"), event.optInt("id"))
                 val handler = served[channel.feature]
                 if (handler == null) { channel.close(); continue }
+                // The handler's from then on: it closes it (or keeps it, for another to use).
                 Thread({
-                    try { handler(channel) } catch (e: Exception) { Log.w(TAG, "link: ${channel.feature}: $e") }
-                    finally { channel.close() }
+                    try { handler(channel) } catch (e: Exception) {
+                        Log.w(TAG, "link: ${channel.feature}: $e")
+                        channel.close()
+                    }
                 }, "link-${channel.feature}").start()
             } else {
                 Log.i(TAG, "link: ${event.optString("event")} ${event.optString("name", event.optString("device").take(8))}")
@@ -120,7 +123,8 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
 }
 
 /** A channel's end: a message socket. [receive] -1 nothing in time, 0 its
- * end (closed by the PC, or the session over), else one message's length. */
+ * end (closed by the PC, or the session over), else one message's length.
+ * A served feature's handler owns the channels it is given. */
 class LinkChannel(fd: Int, val device: String, val feature: String, val name: String, val kind: String,
                   val id: Int) : Closeable {
     private val socket = ParcelFileDescriptor.adoptFd(fd)
@@ -145,5 +149,14 @@ class LinkChannel(fd: Int, val device: String, val feature: String, val name: St
 
     fun receive(buffer: ByteBuffer): Int = Os.read(fd, buffer)
 
-    override fun close() = socket.close()
+    /** Its end, now: whoever waits in receive() gets 0 (a close alone would
+     * not wake it). */
+    fun shutdown() {
+        try { Os.shutdown(fd, OsConstants.SHUT_RDWR) } catch (e: android.system.ErrnoException) { /* closed already */ }
+    }
+
+    override fun close() {
+        shutdown()
+        socket.close()
+    }
 }

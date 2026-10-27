@@ -84,13 +84,17 @@ class CompanionService : Service(), LinkServer.Host {
         core.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         getSharedPreferences("paired", MODE_PRIVATE).registerOnSharedPreferenceChangeListener(pairedChanged)
         core.serve("echo") { channel ->
-            val buffer = ByteArray(256 shl 10)
-            while (true) {
-                val length = channel.receive(buffer)
-                if (length <= 0) break
-                channel.send(buffer, 0, length)
+            channel.use {
+                val buffer = ByteArray(256 shl 10)
+                while (true) {
+                    val length = channel.receive(buffer)
+                    if (length <= 0) break
+                    channel.send(buffer, 0, length)
+                }
             }
         }
+        val display = LinkDisplay(this)
+        core.serve("display") { display.handle(it) }
         Thread({
             try {
                 // The same port each time, if free: where the PC reached it

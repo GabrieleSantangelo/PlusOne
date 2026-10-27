@@ -37,8 +37,9 @@ const UDP_PROOF: Duration = Duration::from_secs(3);
 const UDP_PROBE: Duration = Duration::from_millis(200);
 const HANDSHAKE: Duration = Duration::from_secs(5);
 const OPEN_WAIT: Duration = Duration::from_secs(5);
-/// An input or realtime message's largest size: a datagram on any network.
-pub const MAX_DATAGRAM: usize = 1400;
+/// An input or realtime message's largest size: with the seal (30 bytes),
+/// UDP and IPv6 (48), a datagram of 1500 bytes, which any network carries.
+pub const MAX_DATAGRAM: usize = 1422;
 /// Realtime over the stream: dropped while this much waits to be sent.
 const STREAM_BUDGET: usize = 256 << 10;
 /// Room in the UDP socket, each way: a keyframe's packets at once.

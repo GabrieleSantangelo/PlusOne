@@ -6,12 +6,11 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
-import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import io.github.gabrielesantangelo.plusone.link.Datagrams
+import io.github.gabrielesantangelo.plusone.link.Packets
 
 /**
  * The PC's desktop on this screen. The PC sends each encoded frame (H.264)
@@ -32,9 +31,7 @@ import io.github.gabrielesantangelo.plusone.link.Datagrams
  * decoded here is measured, not guessed. (Not to the glass: MediaCodec's
  * "rendered" times only gave back the time it was released with.)
  */
-class DisplaySession(key: ByteArray, pc: InetAddress, pcPort: Int) {
-    // Room for a keyframe's packets at once.
-    val datagrams = Datagrams(key, pc, pcPort, receiveBuffer = 4 shl 20)
+class DisplaySession(private val packets: Packets) {
     @Volatile private var running = true
     // Packets to the PC go out in order from this thread (input comes on
     // the main one, where Android allows no network).
@@ -103,7 +100,7 @@ class DisplaySession(key: ByteArray, pc: InetAddress, pcPort: Int) {
     fun stop() {
         running = false
         outbox.shutdownNow()
-        datagrams.close()
+        packets.close()
         detach()
         callbacks.quitSafely()
     }
@@ -198,7 +195,7 @@ class DisplaySession(key: ByteArray, pc: InetAddress, pcPort: Int) {
     private fun receive() {
         while (running) {
             val body = try {
-                datagrams.receive()
+                packets.receive()
             } catch (e: Exception) {
                 if (running) Log.w(CompanionService.TAG, "display: $e")
                 break
@@ -344,7 +341,7 @@ class DisplaySession(key: ByteArray, pc: InetAddress, pcPort: Int) {
         try {
             outbox.execute {
                 try {
-                    datagrams.send(body)
+                    packets.send(body)
                 } catch (e: Exception) {
                     if (running) Log.w(CompanionService.TAG, "display: cannot send: $e")
                 }
