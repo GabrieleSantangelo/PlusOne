@@ -61,6 +61,8 @@ const STREAM_BUDGET: usize = 256 << 10;
 /// Reliable frames handed to TLS at a time: an urgent frame (input,
 /// realtime, a ping) queued meanwhile waits behind no more than this.
 const WRITE_SLICE: usize = 16 << 10;
+/// The datagrams' DSCP, AF41 (34), as the IP header's byte.
+const REALTIME_TOS: libc::c_int = 34 << 2;
 /// Room in the UDP socket, each way: a keyframe's packets at once.
 const UDP_BUFFER: libc::c_int = 4 << 20;
 /// Room in a channel's socket, each way (the system caps it: a control
@@ -69,6 +71,16 @@ const CHANNEL_BUFFER: usize = 1 << 20;
 /// A control message with no room in its channel: this long for the
 /// feature to read, then the channel is closed (it holds up the stream).
 const CONTROL_STALL: Duration = Duration::from_secs(1);
+/// A control channel's window, with a peer that says "flow" in its hello:
+/// what its sender may have sent beyond what the other side's feature has
+/// taken. The receiving side keeps what comes in a queue of its own (never
+/// blocking the session, never closing a channel for being slow), and says
+/// how much its feature has taken ("credit", a running total) each
+/// GRANT_EVERY. A control message is at most about 200 KB (the sockets'
+/// own limit): far under WINDOW - GRANT_EVERY, so a sender never waits on
+/// credit that is held back.
+const WINDOW: u64 = 1 << 20;
+const GRANT_EVERY: u64 = 64 << 10;
 /// A control message waits for the queue to drain below this before it
 /// joins it: a big transfer (a PDF, the app) feeds the stream as fast as
 /// the stream goes, never ahead of it, so what shares the stream (the
@@ -154,6 +166,22 @@ struct End {
     fd: OwnedFd,
     /// Input: the newest datagram's counter handed on, plus one (0: none).
     newest: AtomicU64,
+    /// Closed: a pump waiting for credit gives up.
+    gone: AtomicBool,
+    /// Flow (control, with a peer that has it): bytes sent on it, and the
+    /// other side's running total taken by its feature.
+    sent: AtomicU64,
+    granted: AtomicU64,
+    /// Flow: what comes for it, to its feature in order on a thread of its
+    /// own (None: the channel's end, after what came before it).
+    inbox: Mutex<Option<mpsc::Sender<Option<Vec<u8>>>>>,
+}
+
+impl End {
+    fn new(id: u16, class: Class, fd: OwnedFd) -> End {
+        End { id, class, fd, newest: AtomicU64::new(0), gone: AtomicBool::new(false), sent: AtomicU64::new(0),
+              granted: AtomicU64::new(0), inbox: Mutex::new(None) }
+    }
 }
 
 /// What waits to go on the stream, in two queues: the urgent (input and
@@ -250,6 +278,8 @@ pub struct Session {
     channels: Mutex<HashMap<u16, Arc<End>>>,
     pending: Mutex<HashMap<u16, mpsc::Sender<Result<(), String>>>>,
     next_id: AtomicU16,
+    /// The other side has flow control on control channels (WINDOW).
+    flow: bool,
     outbox: Mutex<Outbox>,
     reliable: Mutex<Reliable>,
     wake: Wake,
@@ -317,6 +347,14 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
     let udp = match stream.addresses() {
         Some((_, local)) => {
             let udp = UdpSocket::bind(SocketAddr::new(local, 0))?;
+            // Input and realtime ahead of the stream's bulk on the air: DSCP
+            // AF41, which Wi-Fi puts in its video queue (WMM AC_VI, RFC
+            // 8325); the stream stays best effort.
+            if local.is_ipv4() {
+                sys::set_int(udp.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS, REALTIME_TOS);
+            } else {
+                sys::set_int(udp.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS, REALTIME_TOS);
+            }
             // As much as the system allows (net.core.wmem_max, rmem_max).
             sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, UDP_BUFFER);
             sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, UDP_BUFFER);
@@ -420,6 +458,7 @@ impl Session {
             pending: Mutex::default(),
             // Ours odd if we connected, even if we listened: never the same.
             next_id: AtomicU16::new(if established.dialer { 1 } else { 2 }),
+            flow: hello["flow"].as_u64() == Some(1),
             outbox: Mutex::default(),
             reliable: Mutex::new(Reliable { next: 1, ..Default::default() }),
             wake: Wake::new()?,
@@ -562,7 +601,8 @@ impl Session {
         let id = self.next_id.fetch_add(2, Ordering::Relaxed);
         let (ours, theirs) = sys::seqpacket_pair(CHANNEL_BUFFER).map_err(|e| e.to_string())?;
         // Ours before the other side hears of it: what it sends at once waits in the socket.
-        let end = Arc::new(End { id, class, fd: ours, newest: AtomicU64::new(0) });
+        let end = Arc::new(End::new(id, class, ours));
+        self.inbox(&end);
         self.channels.lock().unwrap().insert(id, end.clone());
         let (answer, answered) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, answer);
@@ -598,7 +638,8 @@ impl Session {
             Ok(pair) => pair,
             Err(e) => return refuse(&e.to_string()),
         };
-        let end = Arc::new(End { id, class, fd: ours, newest: AtomicU64::new(0) });
+        let end = Arc::new(End::new(id, class, ours));
+        self.inbox(&end);
         self.channels.lock().unwrap().insert(id, end.clone());
         self.send_message(json!({"t": "accept", "id": id}));
         self.pump(end);
@@ -627,6 +668,9 @@ impl Session {
                 }
                 match end.class {
                     Class::Control => {
+                        if me.flow && !me.wait_for_credit(&end, length as u64) {
+                            break;
+                        }
                         me.wait_for_room();
                         me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
                     }
@@ -640,6 +684,50 @@ impl Session {
         }
     }
 
+    /// Until the other side's window has room for length more bytes on
+    /// end (then counted as sent); false if the channel or the session is
+    /// over meanwhile.
+    fn wait_for_credit(&self, end: &End, length: u64) -> bool {
+        loop {
+            if self.is_closed() || end.gone.load(Ordering::Relaxed) {
+                return false;
+            }
+            let sent = end.sent.load(Ordering::Relaxed);
+            if sent + length <= end.granted.load(Ordering::Relaxed) + WINDOW {
+                end.sent.store(sent + length, Ordering::Relaxed);
+                return true;
+            }
+            std::thread::sleep(ROOM_POLL);
+        }
+    }
+
+    /// Flow: a control channel's inbox, emptied into its socket on a thread
+    /// of its own (blocking there, not the session), telling the other side
+    /// what its feature took each GRANT_EVERY.
+    fn inbox(self: &Arc<Self>, end: &Arc<End>) {
+        if !self.flow || end.class != Class::Control {
+            return;
+        }
+        let (inbox, arriving) = mpsc::channel::<Option<Vec<u8>>>();
+        *end.inbox.lock().unwrap() = Some(inbox);
+        let (me, end) = (Arc::downgrade(self), end.clone());
+        let _ = std::thread::Builder::new().name("link-inbox".into()).spawn(move || {
+            let (mut taken, mut told) = (0u64, 0u64);
+            while let Ok(Some(message)) = arriving.recv() {
+                if sys::send(end.fd.as_raw_fd(), &message, true).is_err() {
+                    break;  // its feature gone
+                }
+                taken += message.len() as u64;
+                if taken - told >= GRANT_EVERY {
+                    told = taken;
+                    let Some(me) = me.upgrade() else { break };
+                    me.send_message(json!({"t": "credit", "id": end.id, "taken": taken}));
+                }
+            }
+            sys::shutdown(end.fd.as_raw_fd());
+        });
+    }
+
     /// Until the queue is under CONTROL_BACKLOG, or the session is over.
     fn wait_for_room(&self) {
         while !self.is_closed() && self.outbox.lock().unwrap().len() > CONTROL_BACKLOG {
@@ -649,7 +737,14 @@ impl Session {
 
     fn close_channel(&self, id: u16, tell: bool) {
         let Some(end) = self.channels.lock().unwrap().remove(&id) else { return };
-        sys::shutdown(end.fd.as_raw_fd());
+        end.gone.store(true, Ordering::Relaxed);
+        match end.inbox.lock().unwrap().take() {
+            // Closed by the other side: what it sent before goes to the feature first.
+            Some(inbox) if !tell => {
+                let _ = inbox.send(None);
+            }
+            _ => sys::shutdown(end.fd.as_raw_fd()),
+        }
         if tell && !self.is_closed() {
             self.send_message(json!({"t": "close", "id": id}));
         }
@@ -663,6 +758,10 @@ impl Session {
             if count < end.newest.fetch_max(count + 1, Ordering::Relaxed) {
                 return;
             }
+        }
+        if let Some(inbox) = end.inbox.lock().unwrap().as_ref() {
+            let _ = inbox.send(Some(body.to_vec()));
+            return;
         }
         let fd = end.fd.as_raw_fd();
         let mut result = sys::send(fd, body, false);
@@ -955,6 +1054,11 @@ impl Session {
             "close" => self.close_channel(id, false),
             "bye" => self.end("closed by the other side"),
             "features" => *self.features.lock().unwrap() = message["features"].clone(),
+            "credit" => {
+                if let (Some(end), Some(taken)) = (self.channels.lock().unwrap().get(&id), message["taken"].as_u64()) {
+                    end.granted.fetch_max(taken, Ordering::Relaxed);
+                }
+            }
             other => log!("{}: a message of type {other:?}", self.label()),
         }
     }

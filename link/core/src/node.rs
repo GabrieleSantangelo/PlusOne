@@ -61,7 +61,8 @@ impl NodeInner {
     }
 
     fn hello(&self) -> Value {
-        json!({"t": "hello", "name": self.name, "features": self.features()})
+        // flow: control channels flow-controlled (session.rs, WINDOW).
+        json!({"t": "hello", "name": self.name, "features": self.features(), "flow": 1})
     }
 
     /// The session we have with peer, its id (a new path goes on with it),

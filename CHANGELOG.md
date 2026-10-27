@@ -26,6 +26,13 @@
   back in 28 ms; now in 9 ms (3 ms with the cable idle). The link sends
   them ahead of what waits, hands the rest to TLS a little at a time, and
   keeps the system's own queues short (on Wi-Fi's TCP too).
+- **A slow feature no longer breaks its channel, nor stalls the others**:
+  each control channel has a window (1 MB) its sender waits on, and what
+  arrives waits in a queue of its own until the feature takes it; before,
+  a feature that did not read for a second had its channel closed, and
+  the whole link waited that second.
+- **On Wi-Fi, the desktop and the sound marked as video** (DSCP AF41, WMM's
+  video queue): ahead of bulk traffic on the air.
 - **A big transfer never chokes the cable**: plus-one-link feeds a PDF or
   the app to the link only as fast as it goes, so the desktop and the sound
   sharing the cable go on meanwhile.

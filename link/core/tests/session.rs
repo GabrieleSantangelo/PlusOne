@@ -335,6 +335,44 @@ fn realtime_goes_ahead_of_a_big_transfer_on_a_stream() {
 }
 
 #[test]
+fn a_slow_channel_is_neither_closed_nor_in_the_others_way() {
+    // A feature that takes its time (two seconds before it reads): what is
+    // sent to it waits (its window), the channel stays, and the session's
+    // other channels go on meanwhile.
+    let (pc, tablet, address) = pair();
+    let (got, total) = mpsc::channel();
+    tablet.serve("slow", 1, move |incoming| {
+        std::thread::sleep(Duration::from_secs(2));
+        let mut buf = vec![0u8; 1 << 20];
+        let mut bytes = 0;
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+            bytes += n;
+        }
+        let _ = got.send(bytes);
+    });
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let slow = session.open("slow", "control", Class::Control).unwrap();
+    let sending = std::thread::spawn(move || {
+        let chunk = vec![7u8; 64 << 10];
+        for _ in 0..64 {
+            slow.send(&chunk).unwrap();
+        }
+    });
+    std::thread::sleep(Duration::from_millis(300));  // its window full by now
+    let echo = session.open("echo", "c", Class::Control).unwrap();
+    let mut buf = vec![0u8; 64];
+    let started = Instant::now();
+    echo.send(b"still here").unwrap();
+    assert_eq!(echo.recv(&mut buf, WAIT).unwrap(), Some(10));
+    assert!(started.elapsed() < Duration::from_millis(500), "the others waited {:?}", started.elapsed());
+    sending.join().unwrap();
+    assert_eq!(total.recv_timeout(Duration::from_secs(10)).unwrap(), 64 * (64 << 10));
+}
+
+#[test]
 fn a_session_goes_on_over_another_path() {
     let (pc, tablet, address) = pair();
     let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
