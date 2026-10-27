@@ -104,3 +104,34 @@ also when Python calls it, and what Python itself does is little.
 So far, then: Rust sends packets far faster, but the packets are not
 where the time goes. What it buys at Plus One's loads is not speed but a
 single language with types, and no lock between the parts.
+
+## Tried: Wi-Fi Direct (2026-10-27)
+
+`plus-one-rs display --p2p` asks the app over the link it has for a Wi-Fi
+Direct group (`P2pHandler.kt`), joins it through NetworkManager
+(`rust/src/link/p2p.rs`) and sends the desktop over it. What it took, and
+where it stops, on this PC (Intel AX211) and the Tab S10 FE+ (One UI 8.5):
+
+- NetworkManager does not tell the PC's P2P address (`HwAddress` is
+  empty); `iw dev` does. Android tells apps `02:00:00:00:00:00` for theirs:
+  the PC finds the tablet by its name.
+- Asked to connect, Samsung's Wi-Fi Direct first invites the peer back into
+  any group it remembers with it (`persistent=1`), whatever the app asks
+  (`enablePersistentMode(false)`, `setAuthorizeConnectionFromPeerEnabled`);
+  NetworkManager knows none, answers "unavailable", and both then wait for
+  the other. Only resetting the tablet's network settings forgot the group
+  (Second Screen's, of 23 October); there is no API or screen for it.
+- Then the negotiation works, in about a second: the tablet the group's
+  owner, the PC its client, WPS done.
+- And as the PC joins, the AX211's firmware crashes (`Microcode SW error`,
+  `NMI_INTERRUPT_UMAC_FATAL`), with the PC on the hotspot on the same
+  channel: at 5745 MHz and at 2462 MHz alike, and once more while asking
+  for the group on 5 GHz. Version 89 is the latest Intel published for this
+  card (linux-firmware, checked on its GitLab mirror); the kernel would
+  take 100, which does not exist.
+
+So Wi-Fi Direct at the same time as the PC's own Wi-Fi is out on this
+hardware. Left to try: the group on another channel than the PC's (the
+case Second Screen worked in, 13 of 13), or a Wi-Fi adapter of its own for
+it. Test builds of the app went up to versionCode 908: the next release has
+to be 0.9.9 or later.

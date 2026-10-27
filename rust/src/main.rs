@@ -4,8 +4,9 @@
 //!   plus-one-rs ping          finds the tablet in use (mDNS), links, pings
 //!   plus-one-rs display [--size WxH] [--fps N] [--bitrate KBPS] [--encoder E]
 //!                       [--test] [--no-input] [--seconds N]
-//!                       [--at HOST:PORT]
-//!                             the desktop on the tablet in use, as plus-one --cli
+//!                       [--at HOST:PORT] [--p2p]
+//!                             the desktop on the tablet in use, as plus-one --cli;
+//!                             --p2p: over a Wi-Fi Direct group with it (link/p2p.rs)
 //!   plus-one-rs speakers [--seconds N] [--name SINK]
 //!                             the tablet's speakers as a PipeWire sink, as the app's
 //!   plus-one-rs fake-app DIR [--port P] [--screen WxH] [--seconds N]
@@ -93,10 +94,13 @@ fn ping() {
     main.run();
 }
 
-/// The desktop on the tablet in use, until it ends, Ctrl+C, or --seconds.
+/// The desktop on the tablet in use, until it ends, Ctrl+C, or --seconds;
+/// with --p2p over a Wi-Fi Direct group with it.
 fn show_desktop(args: &[String]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     gst::init().expect("GStreamer");
-    let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let value = |name: &str| option(args, name);
     let options = display::Options {
         size: value("--size").and_then(|s| {
             let (w, h) = s.split_once('x')?;
@@ -108,6 +112,7 @@ fn show_desktop(args: &[String]) {
         touch: !args.iter().any(|a| a == "--no-input"),
         test: args.iter().any(|a| a == "--test"),
     };
+    let p2p = args.iter().any(|a| a == "--p2p");
     let seconds: Option<u32> = value("--seconds").and_then(|v| v.parse().ok());
     let at: Option<link::Target> = value("--at").and_then(|a| {
         let (host, port) = a.rsplit_once(':')?;
@@ -118,9 +123,11 @@ fn show_desktop(args: &[String]) {
     nearby.start();
     let found: Arc<dyn Source> = Arc::new(link::Discovery::new(vec![Arc::new(nearby.view())]));
     let tablets = link::Tablets::new(None, Some(found), link::Paired::default());
-    let session: std::rc::Rc<std::cell::RefCell<Option<display::Session>>> = Default::default();
-    let options = std::cell::Cell::new(Some(options));
-    let (quit, started) = (main.clone(), session.clone());
+    let session: Arc<Mutex<Option<display::Session>>> = Arc::default();
+    let group: Arc<Mutex<Option<link::p2p::Group>>> = Arc::default();
+    let ending = Arc::new(AtomicBool::new(false));  // the control link (--p2p) lets go
+    let mut options = Some(options);
+    let (quit, started, kept, released) = (main.clone(), session.clone(), group.clone(), ending.clone());
     // A few seconds for mDNS (where the app was last otherwise).
     glib::timeout_add_seconds_local_once(2, move || {
         let Some(tablet) = tablets.active() else {
@@ -128,24 +135,87 @@ fn show_desktop(args: &[String]) {
             return quit.quit();
         };
         let targets = at.clone().map(|t| vec![t]).unwrap_or_else(|| tablets.targets(&tablet));
+        let app_id = tablet.app_id().to_owned();
+        let options = options.take().unwrap();
         let done = quit.clone();
-        *started.borrow_mut() = Some(display::Session::start(targets, tablet.app_id().to_owned(), options.take().unwrap(),
-            move |error, _started| {
-                if let Some(error) = error {
-                    log!("app display ended: {error}");
+        let on_ended = move |error: Option<String>, _started: bool| {
+            if let Some(error) = error {
+                log!("app display ended: {error}");
+            }
+            done.quit();
+        };
+        if !p2p {
+            *started.lock().unwrap() = Some(display::Session::start(targets, app_id, options, on_ended));
+            return;
+        }
+        // The group first, asked for over the link there is; then the desktop over it.
+        let quit = quit.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(link::p2p::Group, link::Target), String> {
+                let t0 = Instant::now();
+                let mut control = link::connect(&targets, Some(&app_id), &link::Paired::default(), false)
+                    .map_err(|e| e.to_string())?;
+                let port = match &targets[0] { link::Target::Tcp(_, port) => *port };
+                let mut group = link::p2p::Group::find()?;
+                let own = link::p2p::own_address().unwrap_or_default();
+                log!("p2p: this PC is {own} on Wi-Fi Direct");
+                control.send(&msg!({"type": "p2p", "name": link::trust::hostname(), "address": own}), None)
+                    .map_err(|e| e.to_string())?;
+                let reply = control.receive(link::wire::MAX_HEADER).map_err(|e| e.to_string())?;
+                if reply.get("type").and_then(serde_json::Value::as_str) == Some("refused") {
+                    return Err(format!("the tablet said no: {:?}, seen: {:?}", reply.get("reason"), reply.get("seen")));
                 }
-                done.quit();
-            }));
+                let text = |k: &str| reply.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                let (address, name) = (text("p2p"), text("name"));
+                log!("p2p: asked; the tablet answers as {name} ({address}) ({:.1} s)", t0.elapsed().as_secs_f64());
+                group.join(&address, &name)?;
+                // Under way here: the app connects now (see P2pHandler.kt).
+                control.send(&msg!({"type": "p2p-go"}), None).map_err(|e| e.to_string())?;
+                group.wait()?;
+                // Where the app is in the group: it says so once the group is up.
+                control.set_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+                let tablet = loop {
+                    let message = control.receive(link::wire::MAX_HEADER).map_err(|e| e.to_string())?;
+                    if message.get("type").and_then(serde_json::Value::as_str) == Some("p2p-group") {
+                        log!("p2p: the tablet {} the group, at {:?}",
+                             if message.get("owner").and_then(serde_json::Value::as_bool) == Some(true) { "owns" } else { "is in" },
+                             message.get("address"));
+                        break message.get("address").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                    }
+                };
+                if tablet.is_empty() {
+                    return Err("the tablet has no address in the group".into());
+                }
+                // The group lasts as long as this link: held meanwhile.
+                std::thread::spawn(move || {
+                    let _ = control.hold(|| released.load(Ordering::Relaxed), || Ok(()), Duration::from_secs(1));
+                    let _ = control.send(&msg!({"type": "stop"}), None);
+                });
+                Ok((group, link::Target::Tcp(tablet, port)))
+            })();
+            glib::MainContext::default().invoke(move || match result {
+                Ok((group, target)) => {
+                    log!("p2p: the desktop over the group, at {target}");
+                    *kept.lock().unwrap() = Some(group);
+                    *started.lock().unwrap() = Some(display::Session::start(vec![target], app_id, options, on_ended));
+                }
+                Err(e) => {
+                    log!("p2p: {e}");
+                    quit.quit();
+                }
+            });
+        });
     });
     let stop = {
-        let (session, quit) = (session.clone(), main.clone());
+        let (session, quit, ending) = (session.clone(), main.clone(), ending.clone());
         move || {
-            if let Some(session) = session.borrow().as_ref() {
+            if let Some(session) = session.lock().unwrap().as_ref() {
                 session.stop();
             }
+            ending.store(true, Ordering::Relaxed);
             // The link's thread tells the app, within its tick.
             let quit = quit.clone();
-            glib::timeout_add_local_once(Duration::from_millis(800), move || quit.quit());
+            glib::timeout_add_local_once(Duration::from_millis(1200), move || quit.quit());
         }
     };
     let on_signal = stop.clone();
@@ -157,6 +227,7 @@ fn show_desktop(args: &[String]) {
         glib::timeout_add_seconds_local_once(seconds, stop);
     }
     main.run();
+    group.lock().unwrap().take();  // the group goes (NetworkManager would end it with the process anyway)
 }
 
 fn option(args: &[String], name: &str) -> Option<String> {

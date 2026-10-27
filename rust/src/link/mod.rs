@@ -14,6 +14,7 @@ pub mod datagrams;
 pub mod discovery;
 #[allow(clippy::module_inception)]
 pub mod link;
+pub mod p2p;
 pub mod tablets;
 pub mod trust;
 pub mod wire;

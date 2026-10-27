@@ -52,7 +52,7 @@ class CompanionService : Service(), LinkServer.Host {
         queueChanged()  // nor a notification for them
         server = LinkServer(this,
             handlers = listOf(SignHandler(this), DisplayHandler(this), SpeakersHandler(this),
-                CaptureHandler(this), UpdateHandler(this)),
+                CaptureHandler(this), UpdateHandler(this), P2pHandler(this)),
             host = this,
             // How the PCs reach the app, and learn where: another way is one more here.
             listeners = listOf(TcpListener()),
