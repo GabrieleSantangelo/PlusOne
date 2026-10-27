@@ -33,6 +33,20 @@ QUIET_AFTER = 200        # packets of silence in a row (a second) after which no
 STATS_EVERY = 30         # the app's reports (one a second) logged: one in so many, and each with a loss
 
 
+def app_report(body):
+    """(held, missed, late, left out, behind, gaps) from an app's STATS, in
+    frames and packets; what it does not say, 0. None if it is not one."""
+    if not body or body[0] != STATS:
+        return None
+    if len(body) == 25:
+        return struct.unpack_from("!IIIIII", body, 1)
+    if len(body) == 21:
+        return struct.unpack_from("!IIIII", body, 1) + (0,)
+    if len(body) == 13:
+        return struct.unpack_from("!III", body, 1) + (0, 0, 0)
+    return None
+
+
 class PcmSender:
     def __init__(self, source):
         self.channel = Datagrams()
@@ -90,20 +104,21 @@ class PcmSender:
 
     def _listen(self):
         """The app's reports, for the log: how much it holds, what it missed,
-        how far behind the PC its speaker is (an app before 0.9: 13 bytes)."""
+        how far behind the PC its speaker is, the gaps heard (the speaker
+        ran dry); an app of 0.8: 21 bytes, of 0.7: 13."""
         reports = 0
         while self._running:
-            body = self.channel.receive(1.0)
-            if not body or body[0] != STATS or len(body) not in (13, 21):
+            report = app_report(self.channel.receive(1.0))
+            if report is None:
                 continue
-            held, missed, late, dropped, behind = (struct.unpack_from("!IIIII", body, 1) if len(body) == 21
-                                                   else struct.unpack_from("!III", body, 1) + (0, 0))
+            held, missed, late, dropped, behind, gaps = report
             reports += 1
-            if missed or late or reports % STATS_EVERY == 1:
+            if missed or late or gaps or reports % STATS_EVERY == 1:
                 log(f"speakers: the tablet holds {held / RATE * 1000:.0f} ms"
                     + (f", its speaker is {behind / RATE * 1000:.0f} ms behind" if behind else "")
                     + f"; missed {missed} packets, {late} came late"
-                    + (f", {dropped} nearly silent left out" if dropped else ""))
+                    + (f", {dropped} nearly silent left out" if dropped else "")
+                    + (f"; {gaps} gaps heard" if gaps else ""))
 
     def losses(self):
         """(buffers captured, 0, 0, 0): the sound goes as long as this grows,

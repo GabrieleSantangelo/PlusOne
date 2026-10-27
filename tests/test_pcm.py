@@ -76,3 +76,12 @@ def test_silence_stops_going_after_a_second_and_sound_goes_again():
         assert number == pcm.QUIET_AFTER and sender.losses()[0] == pcm.QUIET_AFTER + 51
     finally:
         sender.close()
+
+
+def test_the_app_s_reports_of_each_version_are_read():
+    report = struct.pack("!BIIIIII", pcm.STATS, 1920, 2, 3, 4, 7000, 1)
+    assert pcm.app_report(report) == (1920, 2, 3, 4, 7000, 1)  # 0.9: the gaps heard too
+    assert pcm.app_report(report[:21]) == (1920, 2, 3, 4, 7000, 0)
+    assert pcm.app_report(report[:13]) == (1920, 2, 3, 0, 0, 0)
+    assert pcm.app_report(report[:17]) is None
+    assert pcm.app_report(b"\x07" + report[1:]) is None and pcm.app_report(None) is None

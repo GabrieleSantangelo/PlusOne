@@ -318,6 +318,19 @@ def test_the_bitrate_follows_the_network():
     assert rate.report(60, 9, 30, 20) is None  # nor below the least
 
 
+def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():
+    rate = appdisplay.RateControl(20000)
+    rate.kbps = 10000
+    for _ in range(2):
+        assert rate.report(60, 0, 30, 20) is None
+    assert rate.report(60, 0, 30, 20, skipped=2) is None  # after a keyframe, say: stays...
+    for _ in range(2):
+        assert rate.report(60, 0, 30, 20) is None  # ...but does not count as clean
+    assert rate.report(60, 0, 30, 20) == 11100
+    # Nothing lost yet, the delay as low as ever: the queue only shows here.
+    assert rate.report(45, 0, 30, 20, skipped=14) == 7400
+
+
 def test_a_still_desktop_s_few_frames_do_not_move_the_bitrate():
     rate = appdisplay.RateControl(20000)
     for _ in range(4):

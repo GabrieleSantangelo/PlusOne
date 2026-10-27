@@ -377,9 +377,13 @@ class Input:
 
 class RateControl:
     """The bitrate the network takes, from the app's report each second:
-    down by a third at once when frames were lost or the delay through the
-    network grew (a queue filling somewhere), up by a tenth after a few
-    clean seconds, never above the one set (most) nor below MIN_KBPS.
+    down by a third at once when frames were lost, the delay through the
+    network grew (a queue filling somewhere), or SKIPPED frames or more were
+    not encoded for what waited to go out here (the same queue, seen before
+    it shows in the delay: 15 s sooner, measured on a phone's hotspot); up
+    by a tenth after a few clean seconds, never above the one set (most)
+    nor below MIN_KBPS. A frame or two not encoded (after a keyframe, say)
+    is not clean either: no going up into a queue.
     The delay through the network: the app's capture-to-decoded less its
     first-packet-to-decoded (decoding, which does not change with the
     network), against the least of the last seconds; only from a second
@@ -390,6 +394,7 @@ class RateControl:
     CLEAN = 3       # reports in a row without loss nor queue before going up
     HISTORY = 10    # reports the least is taken over
     FRAMES = 10     # shown in the second, for its delay to count
+    SKIPPED = 3     # frames not encoded in the second: the network behind
 
     def __init__(self, most):
         self.most = most
@@ -397,15 +402,19 @@ class RateControl:
         self.clean = 0
         self.delays = collections.deque(maxlen=self.HISTORY)
 
-    def report(self, shown, lost, capture_to_decoded, first_to_decoded):
-        """A report; the new bitrate if it changed, else None."""
+    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0):
+        """A report, and the frames not encoded since the last; the new
+        bitrate if it changed, else None."""
         delay = capture_to_decoded - first_to_decoded if shown >= self.FRAMES else None
         if delay is not None:
             self.delays.append(delay)
         grown = delay is not None and len(self.delays) >= 3 and delay > min(self.delays) + self.GROWN_MS
-        if lost or grown:
+        if lost or grown or skipped >= self.SKIPPED:
             self.clean = 0
             return self._set(self.kbps * 2 // 3)
+        if skipped:
+            self.clean = 0
+            return None
         self.clean += 1
         if self.clean >= self.CLEAN and self.kbps < self.most:
             self.clean = 0
@@ -571,7 +580,7 @@ class AppStreamer:
                 encoded, self._encoded = sorted(self._encoded), []
                 skipped, self.skipped = self.skipped, 0
                 before = self.rate.kbps
-                kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10)
+                kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped)
                 if kbps is not None:
                     self.enc.set_property("bitrate", kbps)
                     media.cap_keyframes(self.enc, kbps, self.fps)
