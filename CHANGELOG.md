@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (1.0)
+
+- **Signing by cable**: a PDF to sign goes over the link too (plus-one-link),
+  so the cable alone is enough; so does the tablet's app update.
+- **A signed answer is bound to its PDF**: the tablet says the SHA-256 of
+  the PDF it showed, and the PC keeps the marks only for that PDF.
+- **Saved signatures shared only by choice**: they go between the PC and
+  the tablet only if both choose it (the PC: Signing → Share them with the
+  tablet; the tablet: the PC's options, under Paired PCs). Off at first:
+  each side keeps its own. Nor do they move to a new tablet with the app.
+- **A big transfer never chokes the cable**: plus-one-link feeds a PDF or
+  the app to the link only as fast as it goes, so the desktop and the sound
+  sharing the cable go on meanwhile.
+
 ## 0.10.0
 
 The link: the tablet by the Wi-Fi or the cable, moving between them

@@ -24,7 +24,12 @@ object Jobs {
               /** The PDF is the job's (deleted with it), not one opened by hand. */
               val ownsFile: Boolean = true,
               /** The certificate fingerprint of the PC it came from: only that PC may ask for it again. */
-              val peer: String = "") {
+              val peer: String = "",
+              /** The PDF's SHA-256, as it came: the answer says it, so the PC
+               * puts the marks on that PDF only. */
+              val sha256: String = "",
+              /** The PC shares its saved signatures (it sent them): ours go back if we share them too. */
+              val sharing: Boolean = false) {
         val order = counter.incrementAndGet()
         var result: JSONObject? = null
         var finished = false

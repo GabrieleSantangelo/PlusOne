@@ -91,6 +91,9 @@
     <string name="paired_none_title">Ancora nessuno</string>
     <string name="forget_title">Dimenticare %1$s?</string>
     <string name="forget_detail">Per firmare di nuovo da lì, confronterai ancora un codice.</string>
+    <string name="pc_share_signatures">Condividi le firme salvate</string>
+    <string name="pc_shares_signatures">Condivide le tue firme salvate</string>
+    <string name="pc_options_hint">Tocca per scegliere cosa può fare</string>
     <string name="started">Iniziato</string>
     <string name="queue_title">Da firmare</string>
     <string name="sent">Mandato al PC: %1$s</string>

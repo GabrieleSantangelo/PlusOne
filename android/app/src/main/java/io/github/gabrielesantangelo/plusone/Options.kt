@@ -49,3 +49,23 @@ object Options {
     fun setMicrophone(context: Context, on: Boolean) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("microphone", on).apply()
 }
+
+/** What the user allows each paired PC (by its certificate's fingerprint),
+ * apart from the others; forgotten with the PC. */
+object PcOptions {
+    private const val PREFS = "pc-options"
+    const val SIGNATURES = "signatures"
+
+    private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /** The saved signatures shared with that PC, both ways (if it shares them too). Off at first. */
+    fun shareSignatures(context: Context, pc: String) = prefs(context).getBoolean("$pc/$SIGNATURES", false)
+
+    fun setShareSignatures(context: Context, pc: String, on: Boolean) =
+        prefs(context).edit().putBoolean("$pc/$SIGNATURES", on).apply()
+
+    fun forget(context: Context, pc: String) {
+        val prefs = prefs(context)
+        prefs.edit().apply { prefs.all.keys.filter { it.startsWith("$pc/") }.forEach(::remove) }.apply()
+    }
+}

@@ -578,6 +578,12 @@ class PlusOneApp(Adw.Application):
         self.devices.apply()
         self._on_nearby()
 
+    def set_share_signatures(self, enabled):
+        """The saved signatures go to the tablet's app and come from it (signing.py)."""
+        if enabled != self.settings.share_signatures:
+            self.settings.share_signatures = enabled
+            save_settings(self.settings)
+
     def set_sign_on_tablet(self, enabled):
         if enabled == self.settings.sign_on_tablet:
             return

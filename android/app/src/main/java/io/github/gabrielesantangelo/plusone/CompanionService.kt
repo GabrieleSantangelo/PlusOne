@@ -58,20 +58,24 @@ class CompanionService : Service(), LinkServer.Host {
         File(cacheDir, "jobs").listFiles()?.forEach { if (it.nameWithoutExtension !in Jobs.ids) it.delete() }
         Jobs.listen(queueChanged)
         queueChanged()  // nor a notification for them
+        // One for both links: the room it keeps for PDFs counts uploads on
+        // either, and an update comes once whichever it comes on.
+        val sign = SignHandler(this)
+        val update = UpdateHandler(this)
         server = LinkServer(this,
-            handlers = listOf(SignHandler(this), DisplayHandler(this), SpeakersHandler(this),
-                CaptureHandler(this), UpdateHandler(this)),
+            handlers = listOf(sign, DisplayHandler(this), SpeakersHandler(this),
+                CaptureHandler(this), update),
             host = this,
             // How the PCs reach the app, and learn where: another way is one more here.
             listeners = listOf(TcpListener()),
             announcers = listOf(MdnsAnnouncer(this))).also { it.start() }
-        startLink()
+        startLink(sign, update)
         handler.postDelayed(::idleCheck, IDLE_CHECK)
     }
 
     /** The link's core: listening, announced, the paired PCs trusted; "echo"
      * served (every message back: the link measured from the PC). */
-    private fun startLink() {
+    private fun startLink(sign: SignHandler, update: UpdateHandler) {
         val core = try {
             io.github.gabrielesantangelo.plusone.link.LinkCore(deviceName(this),
                 io.github.gabrielesantangelo.plusone.link.Identity.certificate,
@@ -98,7 +102,7 @@ class CompanionService : Service(), LinkServer.Host {
             }
         }
         // The features moved over so far: their handlers of the link of before.
-        LinkFeatures(this, core, listOf(DisplayHandler(this), SpeakersHandler(this), CaptureHandler(this)))
+        LinkFeatures(this, core, listOf(DisplayHandler(this), SpeakersHandler(this), CaptureHandler(this), sign, update))
         Thread({
             try {
                 // The same port each time, if free: where the PC reached it

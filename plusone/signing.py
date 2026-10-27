@@ -15,6 +15,7 @@ import uuid
 from gi.repository import Gio, GLib
 
 from . import link, log, once, sign_jobs, signatures
+from .link import channels
 from .i18n import _
 
 NOTIFICATION = "sign"
@@ -102,7 +103,10 @@ class Signing:
         from .ink import load_pen
         color, width, _smoothing = load_pen(PEN)
         pen = {"color": list(color), "width": width}
-        ours = signatures.message()
+        # The saved signatures go to the tablet, and come from it, only when
+        # the user shares them (here, and for this PC there).
+        shared = self.app.settings.share_signatures
+        ours = signatures.message() if shared else None
 
         def theirs(found):
             GLib.idle_add(once(self._merge_signatures, found))
@@ -117,13 +121,16 @@ class Signing:
             result = error = None
             try:
                 result = sign_jobs.sign(targets, sent, pen=pen, signatures=ours, expect=app_id,
-                                        on_signatures=theirs, on_opened=opened,
+                                        on_signatures=theirs if shared else None, on_opened=opened,
                                         locate=lambda: self._locate_app(app_id),
                                         turn=turn, title=os.path.basename(path))
             except link.PairingRefused:
                 error = "refused"
             except sign_jobs.Lost:
                 error = "lost"
+            except sign_jobs.Mismatch as e:
+                log("signing:", e)
+                error = "mismatch"
             except link.Incompatible as e:
                 log("signing:", e)
                 error = "incompatible"
@@ -139,7 +146,9 @@ class Signing:
         announce it too, and only the real one proves it (TLS)."""
         tablet = self.app.tablets.active()
         where = self.app.tablets.targets(tablet) if tablet else []
-        return (where, tablet.name, tablet.app_id) if where else None
+        # No address, but over the link (the cable): it goes there.
+        reached = bool(where) or (tablet is not None and channels.connected(tablet.app_id))
+        return (where, tablet.name, tablet.app_id) if reached else None
 
     def _locate_app(self, app_id):
         """Where the app the PDF went to is now (its port changes when it
@@ -182,6 +191,12 @@ class Signing:
         if error == "lost":
             note = Gio.Notification.new(_("Lost the tablet"))
             note.set_body(_("What was signed on the tablet did not reach the PC: {name} is unchanged")
+                          .format(name=os.path.basename(path)))
+            self.app.send_notification(NOTIFICATION, note)
+            return False
+        if error == "mismatch":
+            note = Gio.Notification.new(_("Not saved"))
+            note.set_body(_("The tablet answered for another document: {name} is unchanged")
                           .format(name=os.path.basename(path)))
             self.app.send_notification(NOTIFICATION, note)
             return False

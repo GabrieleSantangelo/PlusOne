@@ -3,11 +3,17 @@ the user signs it there, and its marks come back. The app keeps a job until
 the PC says it got the answer: should the link drop meanwhile, the PC
 connects again and asks for it (resume).
 
-Messages (over the link): "sign" (job id, title, pen, the saved
-signatures; the PDF as payload) -> "opened" -> "signed" (marks, the
-signatures there) or "cancelled" -> "got"; "resume" (job id) after a drop;
-"ping" while the user takes their time.
+Messages (over the link): "sign" (job id, title, pen, the PDF's SHA-256,
+the saved signatures if they are shared; the PDF as payload) -> "opened"
+-> "signed" (marks, the SHA-256 of the PDF signed, the signatures there if
+shared) or "cancelled" -> "got"; "resume" (job id) after a drop; "ping"
+while the user takes their time. Marks for another PDF than the one sent
+are not taken (Mismatch).
+
+Over the link (plus-one-link: by cable too) when it reaches the tablet,
+its "sign" feature; else over the link of before.
 """
+import hashlib
 import math
 import os
 import threading
@@ -16,10 +22,15 @@ import unicodedata
 import uuid
 
 from . import log
-from .link import IO_TIMEOUT, Incompatible, Paired, PairingRefused, connect
+from .link import IO_TIMEOUT, Incompatible, Paired, PairingRefused, channels, connect
 
 PING_EVERY = 15              # seconds of silence while the user signs before asking "still there?"
 SILENT_FOR = 45              # seconds of silence after which the link is taken for dead
+
+
+class Mismatch(Exception):
+    """The tablet answered with marks for another PDF than the one sent (its
+    SHA-256 not the one sent): none of them is taken."""
 
 
 class Lost(Exception):
@@ -66,8 +77,9 @@ def next_turn():
     return _turns.ticket()
 
 
-def _answer(link, job, on_opened, name, on_signatures):
-    """Waits for the job's answer: the result, or None if cancelled. Asks
+def _answer(link, job, digest, on_opened, name, on_signatures):
+    """Waits for the job's answer: the result, or None if cancelled;
+    Mismatch for marks on another PDF than the one of digest. Asks
     whether the app is still there when it is quiet for a while: a link
     that died without a word (Wi-Fi gone) raises TimeoutError."""
     heard = time.monotonic()
@@ -90,6 +102,8 @@ def _answer(link, job, on_opened, name, on_signatures):
             # The app keeps the answer until it knows it arrived.
             link.send({"type": "got", "job": job})
             link.send({"type": "bye"})
+            if kind == "signed" and message.get("sha256") != digest:
+                raise Mismatch(f"marks for a PDF of SHA-256 {message.get('sha256')!r}")
             if on_signatures and isinstance(message.get("signatures"), dict):
                 on_signatures(message["signatures"])
             marks = message.get("marks") if kind == "signed" else None
@@ -106,7 +120,8 @@ def sign(target, path, paired=None, on_opened=None, pen=None, signatures=None,
     the user cancelled. Only to a paired tablet: pairing is link.pair()'s, when
     the user chooses a tablet in the window. pen ({"color", "width"}) and
     the saved signatures (signatures.message()) go along, so the tablet
-    signs like the PC; on_signatures(the tablet's list) runs with the answer.
+    signs like the PC; on_signatures(the tablet's list) runs with the answer,
+    if it carries one (only when they are shared: signatures, both sides).
 
     Several at once: each goes in its turn (next_turn(), or one taken now),
     and at most MAX_JOBS wait on the tablet; more wait here for a place.
@@ -116,34 +131,42 @@ def sign(target, path, paired=None, on_opened=None, pen=None, signatures=None,
     have changed) and asks for it, for resume_for seconds.
 
     Raises OSError, EOFError, ValueError, PairingRefused or Incompatible
-    before the PDF reached the tablet, Lost after."""
+    before the PDF reached the tablet, Lost or Mismatch after."""
     paired = paired or Paired()
     turn = next_turn() if turn is None else turn
     try:
         _turns.wait(turn)
         _places.acquire()
         try:
-            link, job = _send(target, path, paired, pen, signatures, expect, title)
+            link, job, digest = _send(target, path, paired, pen, signatures, expect, title)
         except BaseException:
             _places.release()
             raise
     finally:
         _turns.done(turn)
     try:
-        return _wait(link, job, target, paired, on_opened, on_signatures, locate, resume_for, expect)
+        return _wait(link, job, digest, target, paired, on_opened, on_signatures, locate, resume_for, expect)
     finally:
         _places.release()
 
 
+def _connect(target, expect, paired):
+    """The tablet's "sign" over the link if it is there (expect: its id),
+    else over the link of before (target: its addresses)."""
+    tablet = channels.connect(expect, "sign") if expect else None
+    return tablet or connect(target, expect, paired)
+
+
 def _send(target, path, paired, pen, signatures, expect, title=None):
-    """(link, job id) once the PDF is on the tablet."""
-    link = connect(target, expect, paired)
+    """(link, job id, the PDF's SHA-256) once the PDF is on the tablet."""
+    link = _connect(target, expect, paired)
     job = uuid.uuid4().hex
     try:
         with open(path, "rb") as f:
             pdf = f.read()
         link.settimeout(IO_TIMEOUT * 4)  # a big PDF over slow Wi-Fi
-        header = {"type": "sign", "job": job, "title": title or os.path.basename(path)}
+        digest = hashlib.sha256(pdf).hexdigest()
+        header = {"type": "sign", "job": job, "title": title or os.path.basename(path), "sha256": digest}
         if pen:
             header["pen"] = pen
         if signatures:
@@ -153,15 +176,17 @@ def _send(target, path, paired, pen, signatures, expect, title=None):
     except BaseException:
         link.close()
         raise
-    return link, job
+    return link, job, digest
 
 
-def _wait(link, job, target, paired, on_opened, on_signatures, locate, resume_for, expect):
+def _wait(link, job, digest, target, paired, on_opened, on_signatures, locate, resume_for, expect):
     """The job's answer, connecting again if the link drops (sign())."""
     name = link.name
     with link:
         try:
-            return _answer(link, job, on_opened, name, on_signatures)
+            return _answer(link, job, digest, on_opened, name, on_signatures)
+        except Mismatch:
+            raise
         except Exception as e:  # noqa: BLE001 - the PDF is on the tablet: whatever broke, ask again
             log("signing: lost the tablet while signing:", repr(e))
     deadline = time.monotonic() + resume_for
@@ -171,14 +196,16 @@ def _wait(link, job, target, paired, on_opened, on_signatures, locate, resume_fo
         if not where:
             continue
         try:
-            link = connect(where, expect, paired)
+            link = _connect(where, expect, paired)
         except (OSError, EOFError, ValueError, PairingRefused, Incompatible):
             continue
         with link:
             try:
                 link.send({"type": "resume", "job": job})
                 log("signing: back in touch with the tablet")
-                return _answer(link, job, None, link.name, on_signatures)
+                return _answer(link, job, digest, None, link.name, on_signatures)
+            except Mismatch:
+                raise
             except Exception as e:  # noqa: BLE001 - as above
                 log("signing: lost the tablet again:", repr(e))
     raise Lost(name)

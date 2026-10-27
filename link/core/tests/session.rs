@@ -78,6 +78,36 @@ fn control_messages_both_ways_in_order() {
 }
 
 #[test]
+fn a_big_transfer_never_runs_ahead_of_the_stream() {
+    let (pc, tablet, address) = pair();
+    let (got, total) = mpsc::channel();
+    tablet.serve("slow", 1, move |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut bytes = 0;
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+            bytes += n;
+            std::thread::sleep(Duration::from_millis(5));  // a slow reader: the stream backs up
+        }
+        let _ = got.send(bytes);
+    });
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let channel = session.open("slow", "control", Class::Control).unwrap();
+    let chunk = vec![7u8; 64 << 10];
+    let mut most = 0;
+    for _ in 0..64 {
+        channel.send(&chunk).unwrap();
+        most = most.max(session.queued());
+    }
+    drop(channel);
+    assert_eq!(total.recv_timeout(Duration::from_secs(10)).unwrap(), 64 * chunk.len());
+    // Never more queued than a realtime packet may wait behind on a stream.
+    assert!(most <= 256 << 10, "{most} bytes queued");
+}
+
+#[test]
 fn realtime_goes_over_udp_once_proven() {
     let (pc, _tablet, address) = pair();
     let session = pc.connect(address, Duration::from_secs(2)).unwrap();

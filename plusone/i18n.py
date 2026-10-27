@@ -51,8 +51,10 @@ _IT = {
     "Drag it, turn it, or resize from a corner": "Trascina, ruota o ridimensiona dagli angoli",
     "Delete": "Elimina",
     "Done with the selection": "Fine selezione",
-    "Placed with one tap when signing, here and on the tablet":
-        "Si mettono con un tocco quando firmi, qui e sul tablet",
+    "Share them with the tablet": "Condividile con il tablet",
+    "Both ways, if the tablet's app allows it for this PC too":
+        "In entrambe le direzioni, se anche l'app del tablet lo permette per questo PC",
+    "Placed with one tap when signing": "Si mettono con un tocco quando firmi",
     "New signature": "Nuova firma",
     "Sign here with the pen or the mouse": "Firma qui con la penna o il mouse",
     "Start over": "Ricomincia",
@@ -117,6 +119,9 @@ _IT = {
     "Forget {tablet}?": "Dimenticare {tablet}?",
     "Signed {count} PDFs": "{count} PDF firmati",
     "Lost the tablet": "Tablet perso",
+    "Not saved": "Non salvato",
+    "The tablet answered for another document: {name} is unchanged":
+        "Il tablet ha risposto per un altro documento: {name} non è cambiato",
     "What was signed on the tablet did not reach the PC: {name} is unchanged":
         "Quanto firmato sul tablet non è arrivato al PC: {name} è rimasto com'era",
     "Opening the desktop on {name}…": "Apro il desktop su {name}…",

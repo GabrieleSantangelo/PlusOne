@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Signatures and pairings stay off Google's cloud backup; moving to a new
-     device directly takes them along (the new device then pairs again, its
-     key never leaves the old one's keystore). -->
+<!-- Signatures and pairings stay off Google's cloud backup, and stay
+     behind when moving to a new device directly too: the new device pairs
+     again (the key never leaves the old one's keystore), and the saved
+     signatures are drawn there again. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" path="." />
@@ -10,4 +11,9 @@
         <exclude domain="sharedpref" path="." />
         <exclude domain="external" path="." />
     </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="signatures.json" />
+        <exclude domain="sharedpref" path="paired.xml" />
+        <exclude domain="sharedpref" path="pc-options.xml" />
+    </device-transfer>
 </data-extraction-rules>

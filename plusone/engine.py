@@ -41,6 +41,9 @@ class Settings:
     # The tablet by cable when it is plugged in (docs/LINK.md): plus-one-link
     # asks it to be Plus One's accessory (its file transfer off meanwhile).
     cable: bool = True
+    # The saved signatures shared with the tablet's app, both ways (the app
+    # chooses too, for each PC). Off: each side keeps its own.
+    share_signatures: bool = False
     # The Quick Settings toggle offered once, after the first pairing (gui.py).
     toggle_offered: bool = False
     # The desktop's size: "auto" (about 1920x1200) or "WxH" at the tablet's

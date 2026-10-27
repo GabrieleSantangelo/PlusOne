@@ -174,8 +174,10 @@ class MainActivity : AppCompatActivity() {
         section(R.string.heading_paired, if (paired.isEmpty()) {
             listOf(Row(row(R.drawable.ic_computer, getString(R.string.paired_none_title), getString(R.string.paired_none))))
         } else paired.map { (fingerprint, name) ->
-            Row(row(R.drawable.ic_computer, name, null,
-                iconButton(R.drawable.ic_forget, R.string.forget) { askForget(fingerprint, name) }))
+            Row(row(R.drawable.ic_computer, name, pcAllows(fingerprint),
+                iconButton(R.drawable.ic_forget, R.string.forget) { askForget(fingerprint, name) })) {
+                pcOptions(fingerprint, name)
+            }
         })
 
         val version = packageManager.getPackageInfo(packageName, 0).versionName
@@ -342,12 +344,34 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    /** What this PC may do, in a line: what is on, or a hint that there is a choice. */
+    private fun pcAllows(fingerprint: String): String =
+        if (PcOptions.shareSignatures(this, fingerprint)) getString(R.string.pc_shares_signatures)
+        else getString(R.string.pc_options_hint)
+
+    /** The choices for one PC alone. */
+    private fun pcOptions(fingerprint: String, name: String) {
+        val items = arrayOf(getString(R.string.pc_share_signatures))
+        val checked = booleanArrayOf(PcOptions.shareSignatures(this, fingerprint))
+        MaterialAlertDialogBuilder(this)
+            .setTitle(name)
+            .setMultiChoiceItems(items, checked) { _, which, on ->
+                when (which) {
+                    0 -> PcOptions.setShareSignatures(this, fingerprint, on)
+                }
+            }
+            .setPositiveButton(R.string.done) { _, _ -> }
+            .setOnDismissListener { refresh() }
+            .show()
+    }
+
     private fun askForget(fingerprint: String, name: String) {
         MaterialAlertDialogBuilder(this)
             .setTitle(getString(R.string.forget_title, name))
             .setMessage(R.string.forget_detail)
             .setPositiveButton(R.string.forget) { _, _ ->
                 Paired.forget(this, fingerprint)
+                PcOptions.forget(this, fingerprint)
                 CompanionService.instance?.disconnect(fingerprint)  // and what it has open, now
                 refresh()
             }

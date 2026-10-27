@@ -162,9 +162,27 @@ def signs(marks, seen=None):
         if seen is not None:
             seen.append((message, payload))
         wire.send({"type": "opened", "job": message["job"]})
-        wire.send({"type": "signed", "job": message["job"], "marks": marks})
+        wire.send({"type": "signed", "job": message["job"], "marks": marks, "sha256": sha256(payload)})
         assert receive(wire)[0] == {"type": "got", "job": message["job"]}
     return script
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_marks_for_another_pdf_are_not_taken(tmp_path, pc):
+    path, paired = pc
+
+    def another(wire):
+        message, _payload = receive(wire)
+        wire.send({"type": "signed", "job": message["job"], "marks": {"pages": []}, "sha256": sha256(b"other")})
+        assert receive(wire)[0] == {"type": "got", "job": message["job"]}
+
+    app = FakeApp(tmp_path, [another])
+    paired.add(link.fingerprint(app.der), "Tab")
+    with pytest.raises(sign_jobs.Mismatch):
+        sign_jobs.sign(app.target, path, paired=paired)
 
 
 def test_pairing_shows_the_same_code_on_both_sides(tmp_path, pc):
@@ -202,7 +220,7 @@ def test_a_silent_link_is_found_dead(monkeypatch):
     left, right = socket.socketpair()
     with left, right:
         with pytest.raises(TimeoutError):
-            sign_jobs._answer(link.Wire(left), "job", None, "Tab", None)
+            sign_jobs._answer(link.Wire(left), "job", "digest", None, "Tab", None)
         assert receive(link.Wire(right))[0] == {"type": "ping"}  # it asked first
 
 
@@ -218,13 +236,15 @@ def test_a_dropped_link_is_resumed(tmp_path, pc):
         message, payload = receive(wire)
         seen.append(message)
         assert message["signatures"] == ours and payload == b"%PDF-1.7"
+        assert message["sha256"] == sha256(payload)
         wire.send({"type": "opened", "job": message["job"]})
 
     def resumed(wire):
         message, _ = receive(wire)
         assert message == {"type": "resume", "job": seen[0]["job"]}
         wire.send({"type": "resumed", "job": message["job"]})
-        wire.send({"type": "signed", "job": message["job"], "marks": marks, "signatures": theirs})
+        wire.send({"type": "signed", "job": message["job"], "marks": marks, "signatures": theirs,
+                   "sha256": seen[0]["sha256"]})
         assert receive(wire)[0] == {"type": "got", "job": message["job"]}
 
     app = FakeApp(tmp_path, [drops, resumed])
@@ -242,9 +262,9 @@ def test_a_batch_arrives_in_order(tmp_path, pc):
     titles = []
 
     def queued(wire):
-        message, _ = receive(wire)
+        message, payload = receive(wire)
         titles.append(message["title"])
-        wire.send({"type": "signed", "job": message["job"], "marks": {"pages": []}})
+        wire.send({"type": "signed", "job": message["job"], "marks": {"pages": []}, "sha256": sha256(payload)})
         assert receive(wire)[0]["type"] == "got"
 
     paths = []

@@ -15,7 +15,8 @@ import java.util.concurrent.TimeUnit
  * there by its Handler of the link of before: the PC opens the feature's
  * "control" channel, whose messages are the same requests and answers
  * (ChannelLink), and the channels for its packets first ("media" and
- * "input" for the desktop, "pcm" for the speakers). Each comes on a thread
+ * "input" for the desktop, "pcm" for the speakers); a payload (a PDF to
+ * sign) follows its request on the control channel. Each comes on a thread
  * of its own: those wait here for the control channel's handler to take
  * them.
  */
@@ -40,8 +41,12 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
                     "ping" -> { link.send(JSONObject().put("type", "pong")); continue }
                     "bye" -> break
                 }
-                if (message.optString("type") !in handler.types) continue
-                if (!handler.handle(link, message, 0)) break
+                val type = message.optString("type")
+                if (type !in handler.types) continue
+                // A payload only where one goes: else it would be read as the next message.
+                val size = message.optLong("size", 0)
+                require(size == 0L || size in 1..handler.maxPayload(type)) { "unexpected payload" }
+                if (!handler.handle(link, message, size)) break
             }
         } catch (e: java.io.IOException) {
             // The PC closed it, or the session is over.

@@ -3,13 +3,20 @@ the link of before's surface (link.Link: request, hold, shutdown, close),
 so the feature's code is the same: its control channel carries the same
 JSON messages. More channels for its packets come with it (packets()):
 what Datagrams carries over the link of before, over the link's own.
+
+A payload (a PDF to sign, the app) follows its header on the control
+channel in CHUNK pieces, as on the link of before it follows on the
+socket; so does a message longer than a channel message may be (a signed
+document's marks): "long" says how long, the pieces follow.
 """
 import json
 import select
 import socket
+import threading
 
 from .. import log
 from .link import Refused
+from .wire import MAX_HEADER
 
 try:
     import plusone_link
@@ -17,6 +24,7 @@ except ImportError:  # a Plus One without the link: the link of before only
     plusone_link = None
 
 ANSWER_WAIT = 10.0  # seconds for the app's answer to a request
+CHUNK = 64 << 10   # bytes of a payload or a long message per channel message
 
 
 def connect(app_id, feature):
@@ -31,42 +39,95 @@ def connect(app_id, feature):
     except plusone_link.LinkError:
         return None
     try:
-        device = next((d["id"] for d in connection.devices() if d["id"].startswith(app_id)), None)
-        if device is None:
+        found = next((d for d in connection.devices() if d["id"].startswith(app_id)), None)
+        if found is None:
             raise plusone_link.LinkError("not a paired tablet")
-        control = connection.open(device, feature, "control", plusone_link.CONTROL)
+        control = connection.open(found["id"], feature, "control", plusone_link.CONTROL)
     except plusone_link.LinkError as e:
         log(f"{feature}: not over the link ({e})")
         connection.close()
         return None
-    return ChannelLink(connection, device, feature, control)
+    return ChannelLink(connection, found["id"], feature, control, found.get("name") or "")
+
+
+def connected(app_id):
+    """Whether plus-one-link has a session with the paired tablet whose id
+    starts with app_id now (by cable, say, with no address on the network)."""
+    if plusone_link is None:
+        return False
+    try:
+        with plusone_link.Link() as connection:
+            return any(d["id"].startswith(app_id) and d.get("connected") for d in connection.devices())
+    except plusone_link.LinkError:
+        return False
 
 
 class ChannelLink:
-    """See the module. peer: None (no address: the packets go on channels)."""
+    """See the module. peer: None (no address: the packets go on channels);
+    name: the tablet's."""
     peer = None
 
-    def __init__(self, connection, device, feature, control):
+    def __init__(self, connection, device, feature, control, name=""):
         self.connection, self.device, self.feature, self.control = connection, device, feature, control
+        self.name = name
         self._channels = []
+        self._sending = threading.Lock()  # a payload's pieces together, whatever else is sent meanwhile
 
     def send(self, header, payload=None):
+        """header, then payload's bytes if any (its "size" says how many)."""
         if payload is not None:
-            raise ValueError("no payload on a control channel")
-        self.control.send(json.dumps(header).encode())
+            header = dict(header, size=len(payload))
+        data = json.dumps(header).encode()
+        with self._sending:
+            if len(data) > CHUNK:
+                self.control.send(json.dumps({"type": "long", "size": len(data)}).encode())
+                self._pieces(data)
+            else:
+                self.control.send(data)
+            if payload:
+                self._pieces(payload)
 
-    def receive(self, timeout=ANSWER_WAIT):
+    def _pieces(self, data):
+        view = memoryview(data)
+        for start in range(0, len(view), CHUNK):
+            self.control.send(view[start:start + CHUNK])
+
+    def _next(self, timeout):
         data = self.control.recv(timeout=timeout)
         if data is None:
             raise TimeoutError(f"{self.feature}: no answer")
         if data == b"":
             raise EOFError(f"{self.feature}: the app hung up")
+        return data
+
+    def receive(self, timeout=ANSWER_WAIT, limit=MAX_HEADER):
+        """The next message; a long one put together (at most limit bytes)."""
+        message = json.loads(self._next(timeout))
+        if not (isinstance(message, dict) and message.get("type") == "long"):
+            return message
+        size = message.get("size")
+        if type(size) is not int or not 0 < size <= limit:
+            raise ValueError(f"{self.feature}: a long message of {size!r} bytes")
+        data = bytearray()
+        while len(data) < size:
+            data += self._next(timeout)
+        if len(data) != size:
+            raise ValueError(f"{self.feature}: a long message longer than it said")
         return json.loads(data)
 
-    def request(self, header, payload=None):
-        """header to the app, and its answer; Refused if the app said no."""
+    def readable(self, timeout):
+        """Whether a message came within timeout (seconds)."""
+        return bool(select.select([self.control.sock], [], [], timeout)[0])
+
+    def settimeout(self, _timeout):
+        """As the link of before's: here sending waits for the link (its
+        backlog), and the link's own liveness says when the tablet is gone."""
+
+    def request(self, header, payload=None, limit=MAX_HEADER, timeout=ANSWER_WAIT):
+        """header (and its payload) to the app, and its answer (at most
+        limit bytes, within timeout once sent); Refused if the app said no."""
         self.send(header, payload)
-        reply = self.receive()
+        reply = self.receive(timeout, limit)
         if reply.get("type") == "refused":
             raise Refused(str(reply.get("reason", "")))
         return reply

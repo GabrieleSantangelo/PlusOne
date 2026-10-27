@@ -10,7 +10,9 @@ The tablet: its app says its version in its mDNS record ("v"). Older than
 this PC, the app of this PC's version goes to it over the paired link, from
 this release on GitHub (its SHA-256 checked against the release's
 SHA256SUMS), while nothing is in use; the app installs it (Android checks
-it is signed as the app it replaces). Both sides stay at one version.
+it is signed as the app it replaces). Both sides stay at one version. It
+goes over the link (plus-one-link: by cable too) to an app that serves
+"update" there, else over the link of before.
 """
 import hashlib
 import os
@@ -23,6 +25,7 @@ import urllib.request
 from gi.repository import Gio, GLib
 
 from . import __version__, link, log, once
+from .link import channels
 
 RELEASES = "https://github.com/GabrieleSantangelo/PlusOne/releases/download"
 MAX_APK = 64 << 20         # bytes: an app is 15 MB
@@ -40,7 +43,9 @@ def update_app(targets, expect, apk, version, paired=None):
     allowed there), "invalid" or "older"."""
     with open(apk, "rb") as f:
         data = f.read()
-    with link.connect(targets, expect, paired, any_version=True) as tablet:
+    tablet = (channels.connect(expect, "update") if expect else None) or \
+        link.connect(targets, expect, paired, any_version=True)
+    with tablet:
         tablet.settimeout(link.IO_TIMEOUT * 4)  # 15 MB over a slow Wi-Fi
         try:
             reply = tablet.request({"type": "update", "version": version,

@@ -273,14 +273,18 @@ class Window(Adw.ApplicationWindow):
         page.add(group)
         group = Adw.PreferencesGroup()
         signatures = Adw.ActionRow(title=_("My signatures"), activatable=True,
-                                   subtitle=_("Placed with one tap when signing, here and on the tablet"))
+                                   subtitle=_("Placed with one tap when signing"))
         signatures.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
         signatures.connect("activated", lambda r: self._show_signatures())
+        share = Adw.SwitchRow(title=_("Share them with the tablet"), active=self.settings.share_signatures,
+                              subtitle=_("Both ways, if the tablet's app allows it for this PC too"))
+        share.connect("notify::active", lambda row, _p: self.app.set_share_signatures(row.get_active()))
         # Files and Open With are outside a Flatpak's reach.
         sign_row = Adw.SwitchRow(title=_("Sign on Tablet"), active=self.settings.sign_on_tablet,
                                  visible=not IN_FLATPAK, subtitle=_("In Files and Open With, for PDFs"))
         sign_row.connect("notify::active", lambda row, _p: self.app.set_sign_on_tablet(row.get_active()))
         group.add(signatures)
+        group.add(share)
         group.add(sign_row)
         page.add(group)
         return page

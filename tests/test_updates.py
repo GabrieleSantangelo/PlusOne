@@ -107,3 +107,36 @@ def test_this_pc_s_files_replaced_are_noticed(tmp_path, monkeypatch):
     watcher.pending = None
     watcher._look()  # the same version: nothing
     assert watcher.pending is None
+
+
+class _OverTheLink:
+    """A ChannelLink's surface, as channels.connect gives it."""
+
+    def __init__(self):
+        self.sent = None
+
+    def settimeout(self, _timeout):
+        pass
+
+    def request(self, header, payload=None, limit=None):
+        self.sent = (header, payload, limit)
+        return {"type": "updating"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+
+def test_the_update_goes_over_the_link_when_it_reaches_the_tablet(tmp_path, monkeypatch):
+    apk = tmp_path / "app.apk"
+    apk.write_bytes(b"an app")
+    tablet = _OverTheLink()
+    asked = []
+    monkeypatch.setattr(updates.channels, "connect", lambda app_id, feature: asked.append((app_id, feature)) or tablet)
+    monkeypatch.setattr(updates.link, "connect", lambda *a, **k: pytest.fail("not over the link of before"))
+    assert updates.update_app([("192.0.2.1", 1)], "abc", str(apk), 1000) is None
+    assert asked == [("abc", "update")]
+    header, payload, _limit = tablet.sent
+    assert payload == b"an app" and header["sha256"] == hashlib.sha256(b"an app").hexdigest()

@@ -45,3 +45,10 @@ def own_pairings(tmp_path, monkeypatch):
     """No test reads or writes this PC's identity or paired tablets."""
     from plusone.link import trust
     monkeypatch.setattr(trust, "CONFIG", str(tmp_path / "companion"))
+
+
+@pytest.fixture(autouse=True)
+def own_link(tmp_path, monkeypatch):
+    """No test reaches the user's plus-one-link (or a tablet through it):
+    its socket somewhere nothing listens, unless the test starts one."""
+    monkeypatch.setenv("PLUSONE_LINK_SOCKET", str(tmp_path / "no-link"))

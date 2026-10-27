@@ -66,6 +66,14 @@ const CHANNEL_BUFFER: usize = 1 << 20;
 /// A control message with no room in its channel: this long for the
 /// feature to read, then the channel is closed (it holds up the stream).
 const CONTROL_STALL: Duration = Duration::from_secs(1);
+/// A control message waits for the queue to drain below this before it
+/// joins it: a big transfer (a PDF, the app) feeds the stream as fast as
+/// the stream goes, never ahead of it, so what shares the stream (the
+/// cable's realtime packets, under STREAM_BUDGET) never waits behind more.
+const CONTROL_BACKLOG: usize = 128 << 10;
+/// How often a control message waiting for room looks again: only while
+/// a transfer is ahead of the path.
+const ROOM_POLL: Duration = Duration::from_millis(2);
 /// Reliable frames taken since the last ping that make one go at once.
 const ACK_AFTER: u64 = 32;
 const KEYS_LABEL: &[u8] = b"EXPORTER-plus-one-link datagrams";
@@ -573,7 +581,10 @@ impl Session {
                     continue;
                 }
                 match end.class {
-                    Class::Control => me.queue_reliable(frame::MESSAGE, end.id, &buf[..length]),
+                    Class::Control => {
+                        me.wait_for_room();
+                        me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
+                    }
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
                 }
             }
@@ -581,6 +592,13 @@ impl Session {
         });
         if spawned.is_err() {
             self.close_channel(id, true);
+        }
+    }
+
+    /// Until the queue is under CONTROL_BACKLOG, or the session is over.
+    fn wait_for_room(&self) {
+        while !self.is_closed() && self.outbox.lock().unwrap().len() > CONTROL_BACKLOG {
+            std::thread::sleep(ROOM_POLL);
         }
     }
 
