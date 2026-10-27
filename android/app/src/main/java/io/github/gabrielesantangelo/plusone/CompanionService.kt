@@ -93,7 +93,9 @@ class CompanionService : Service(), LinkServer.Host {
         }
         Thread({
             try {
-                val port = core.listen()
+                // The same port each time, if free: where the PC reached it
+                // last still holds (no mDNS needed, as on eduroam).
+                val port = try { core.listen(LINK_PORT) } catch (e: java.io.IOException) { core.listen() }
                 val id = io.github.gabrielesantangelo.plusone.link.Identity.fingerprint(
                     io.github.gabrielesantangelo.plusone.link.Identity.certificate.encoded)
                 linkAnnouncer = MdnsAnnouncer(this, io.github.gabrielesantangelo.plusone.link.LinkCore.SERVICE_TYPE)
@@ -293,6 +295,8 @@ class CompanionService : Service(), LinkServer.Host {
     }
 
     companion object {
+        /** The link's core listens here, if it can. */
+        const val LINK_PORT = 47101
         const val TAG = io.github.gabrielesantangelo.plusone.link.TAG
         const val ELEVATE_WAIT = 5_000L        // ms for CaptureActivity to bring the app in front
         const val IDLE_CHECK = 60_000L         // ms

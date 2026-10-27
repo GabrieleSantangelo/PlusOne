@@ -138,7 +138,8 @@ def link(seconds, binaries):
         port = int(tablet.stdout.readline().split()[1])
         path = os.path.join(work, "run", "link")
         daemon = subprocess.Popen([os.path.join(binaries, "plus-one-link"), "--socket", path,
-                                   "--config", os.path.join(work, "pc")], stderr=subprocess.DEVNULL)
+                                   "--config", os.path.join(work, "pc"), "--state", os.path.join(work, "state.json")],
+                                  stderr=subprocess.DEVNULL)
         while not os.path.exists(path):
             time.sleep(0.02)
         connection = Link(path)

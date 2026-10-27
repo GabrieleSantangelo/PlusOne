@@ -43,7 +43,8 @@ def world(tmp_path):
     port = int(tablet.stdout.readline().split()[1])
     path = str(tmp_path / "run" / "link")
     daemon = subprocess.Popen([os.path.join(BIN, "plus-one-link"), "--socket", path, "--config", str(pc),
-                               "--name", "test-pc"], stderr=subprocess.DEVNULL)
+                               "--name", "test-pc", "--state", str(tmp_path / "state.json")],
+                              stderr=subprocess.DEVNULL)
     for _ in range(100):
         if os.path.exists(path):
             break
@@ -84,13 +85,26 @@ def test_control_and_realtime_channels(world):
 
 def test_refused_and_unknown(world):
     link, address, tablet_id, _ = world
-    with pytest.raises(LinkError, match="not connected"):
+    with pytest.raises(LinkError):  # never reached: nowhere to look (not announced)
         link.open(tablet_id, "echo", "x", CONTROL)
+    with pytest.raises(LinkError, match="not a paired tablet"):
+        link.open("0" * 64, "echo", "x", CONTROL)
     link.connect(address)
     with pytest.raises(LinkError, match="not served"):
         link.open(tablet_id, "camera", "video", REALTIME)
     with pytest.raises(LinkError):
         link.connect("127.0.0.1:1", timeout=1)
+
+
+def test_open_reconnects_where_the_tablet_was(world):
+    link, address, tablet_id, _ = world
+    link.connect(address)
+    link.disconnect(tablet_id)
+    time.sleep(0.2)
+    assert not link.devices()[0]["connected"]
+    with link.open(tablet_id, "echo", "x", CONTROL) as channel:
+        channel.send(b"again")
+        assert channel.recv(timeout=5) == b"again"
 
 
 def test_serve_takes_the_tablet_s_channels(world):

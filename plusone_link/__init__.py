@@ -151,12 +151,30 @@ class Link:
         "rtt_ms", "dropped"}]."""
         return self._request({"op": "devices"})[0]["devices"]
 
-    def connect(self, address, timeout=5.0):
-        """A session with the tablet at address ("IP:PORT"): its id."""
-        return self._request({"op": "connect", "address": address, "timeout": timeout})[0]["device"]
+    def connect(self, address=None, device=None, timeout=5.0):
+        """A session with the tablet at address ("IP:PORT"), or with device
+        (its id) wherever it is: its id. open() makes one when needed."""
+        request = {"op": "connect", "timeout": timeout}
+        request.update({"address": address} if address else {"device": device})
+        return self._request(request)[0]["device"]
+
+    def disconnect(self, device):
+        """The session with the tablet over (its channels with it)."""
+        self._request({"op": "close", "device": device})
+
+    def browse(self, wait=1.5):
+        """The tablets announcing the link nearby (mDNS): [{"id" (its start),
+        "name", "version", "address"}]."""
+        return self._request({"op": "browse", "wait": wait})[0]["tablets"]
+
+    def queued(self, device):
+        """Bytes on their way to the tablet not yet sent: how far behind the
+        network is."""
+        return self._request({"op": "queued", "device": device})[0]["queued"]
 
     def open(self, device, feature, name, kind=CONTROL):
-        """A channel with the tablet (its id, or a device from devices())."""
+        """A channel with the tablet (its id, or a device from devices()); the
+        session made first if there is none."""
         device = device["id"] if isinstance(device, dict) else device
         reply, fd = self._request({"op": "open", "device": device, "feature": feature, "channel": name,
                                    "class": kind})

@@ -2,7 +2,7 @@
 //! It keeps the sessions with the paired tablets; apps (Plus One's
 //! features, in any language) ask it for channels through its socket.
 //!
-//!   plus-one-link [--socket PATH] [--config DIR] [--name NAME] [--listen ADDRESS]
+//!   plus-one-link [--socket PATH] [--config DIR] [--state FILE] [--name NAME] [--listen ADDRESS]
 //!
 //! The socket: $XDG_RUNTIME_DIR/plus-one/link (or systemd's). The identity
 //! and the paired tablets: what Plus One keeps in ~/.config/plus-one/companion
@@ -11,10 +11,16 @@
 //! Requests, each answered {"ok": true, ...} or {"ok": false, "error"}:
 //!   {"op": "devices"}            the paired tablets: id, name, connected,
 //!                                features, rtt_ms, dropped
-//!   {"op": "connect", "address": "IP:PORT"[, "timeout": S]}
-//!                                a session with the tablet there: its id
+//!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]}
+//!                                a session with the tablet there (or with
+//!                                that one, wherever it is): its id
+//!   {"op": "browse"[, "wait": S]}  the tablets announcing the link nearby
+//!                                (mDNS): id (its start), name, address
+//!   {"op": "queued", "device"}   bytes on their way to it, not yet sent
+//!   {"op": "close", "device"}    its session over (its channels with it)
 //!   {"op": "open", "device", "feature", "channel", "class"}
 //!                                a channel, its descriptor with the answer
+//!                                (the session made first if there is none)
 //!   {"op": "serve", "feature"[, "version"]}
 //!                                the tablet's channels for this feature, from
 //!                                then on, as {"event": "incoming", "device",
@@ -24,6 +30,10 @@
 //!   {"op": "watch"}              {"event": "up"|"gone", "device", ...} from
 //!                                then on
 //! A connection that served or watched carries only events after that.
+//!
+//! Sessions are made when an app needs one, where the tablet was last
+//! reached or where mDNS finds it, and closed after IDLE with no channel:
+//! nothing wakes the tablet's Wi-Fi while nothing is in use.
 
 mod api;
 
@@ -36,10 +46,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const REQUEST: usize = 64 << 10;
+const SERVICE: &str = "_plusone-link._tcp.local";
+/// A session with no channel this long: closed.
+const IDLE: Duration = Duration::from_secs(60);
+const FIND: Duration = Duration::from_secs(4);
 
 struct Daemon {
     node: Node,
     config: PathBuf,
+    /// Where each tablet was last reached: {id: "IP:PORT"}.
+    state: PathBuf,
+    finding: Mutex<()>,
     watchers: Mutex<Vec<Arc<OwnedFd>>>,
     /// Who serves each feature now (a serial: the last one to ask).
     serving: Mutex<std::collections::HashMap<String, u64>>,
@@ -76,16 +93,131 @@ impl Daemon {
     }
 
     fn connect(&self, request: &Value) -> Result<Value, String> {
-        let address = request["address"].as_str().ok_or("no address")?
-            .parse().map_err(|e| format!("the address: {e}"))?;
         let timeout = Duration::from_secs_f64(request["timeout"].as_f64().unwrap_or(5.0).clamp(0.1, 60.0));
-        let session = self.node.connect(address, timeout)?;
+        let session = match (request["address"].as_str(), request["device"].as_str()) {
+            (Some(address), _) => {
+                let address = address.parse().map_err(|e| format!("the address: {e}"))?;
+                let session = self.node.connect(address, timeout)?;
+                self.reached(&session.peer, address);
+                session
+            }
+            (None, Some(device)) => self.session(device)?,
+            (None, None) => return Err("no address or device".into()),
+        };
         Ok(json!({"ok": true, "device": session.peer, "name": session.name}))
+    }
+
+    fn remembered(&self) -> serde_json::Map<String, Value> {
+        std::fs::read(&self.state).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned()).unwrap_or_default()
+    }
+
+    fn reached(&self, device: &str, address: std::net::SocketAddr) {
+        let mut state = self.remembered();
+        if state.get(device).and_then(Value::as_str) == Some(&address.to_string()) {
+            return;
+        }
+        state.insert(device.to_owned(), json!(address.to_string()));
+        if let Some(parent) = self.state.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let part = self.state.with_extension("part");
+        if std::fs::write(&part, Value::Object(state).to_string()).is_ok() {
+            let _ = std::fs::rename(&part, &self.state);
+        }
+    }
+
+    /// The session with a paired tablet: the one up, or a new one where it
+    /// was last reached and wherever mDNS finds it, at once (the first to
+    /// answer wins).
+    fn session(&self, device: &str) -> Result<Arc<plusone_link::Session>, String> {
+        if let Some(session) = self.node.session(device) {
+            return Ok(session);
+        }
+        if !paired(&self.config).contains_key(device) {
+            return Err("not a paired tablet".into());
+        }
+        let _one_at_a_time = self.finding.lock().unwrap();
+        if let Some(session) = self.node.session(device) {
+            return Ok(session);  // made while this waited
+        }
+        let (found, first) = std::sync::mpsc::channel();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(address) = self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok()) {
+            let (node, found) = (self.node.clone(), found.clone());
+            std::thread::spawn(move || {
+                let _ = found.send(node.connect(address, Duration::from_millis(1500)).map(|s| (s, address)));
+            });
+        }
+        {
+            let (node, found, done, id) = (self.node.clone(), found.clone(), done.clone(), device.to_owned());
+            std::thread::spawn(move || {
+                let mine = |f: &plusone_link::mdns::Found| f.txt.get("id").is_some_and(|i| i.len() >= 8 && id.starts_with(i.as_str()));
+                let result = plusone_link::mdns::browse(SERVICE, Duration::from_secs(3), mine)
+                    .map_err(|e| e.to_string())
+                    .and_then(|all| all.into_iter().find(|f| mine(f)).ok_or_else(|| "not found nearby".to_owned()))
+                    .and_then(|f| {
+                        if done.load(Ordering::SeqCst) {
+                            return Err("reached already".into());
+                        }
+                        node.connect(f.address, Duration::from_secs(2)).map(|s| (s, f.address))
+                    });
+                let _ = found.send(result);
+            });
+        }
+        drop(found);
+        let mut why = Vec::new();
+        let until = std::time::Instant::now() + FIND;
+        while let Ok(result) = first.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+            match result {
+                Ok((session, address)) if session.peer == device => {
+                    done.store(true, Ordering::SeqCst);
+                    self.reached(device, address);
+                    return Ok(session);
+                }
+                Ok((session, _)) => why.push(format!("{} answered there", &session.peer[..8])),
+                Err(e) => why.push(e),
+            }
+        }
+        Err(if why.is_empty() { "not reached in time".into() } else { why.join("; ") })
+    }
+
+    fn browse(&self, request: &Value) -> Result<Value, String> {
+        let wait = Duration::from_secs_f64(request["wait"].as_f64().unwrap_or(1.5).clamp(0.1, 10.0));
+        let found = plusone_link::mdns::browse(SERVICE, wait, |_| false).map_err(|e| e.to_string())?;
+        let tablets: Vec<Value> = found.iter().map(|f| json!({
+            "id": f.txt.get("id"), "name": f.txt.get("name"), "version": f.txt.get("v"),
+            "address": f.address.to_string()})).collect();
+        Ok(json!({"ok": true, "tablets": tablets}))
+    }
+
+    fn queued(&self, request: &Value) -> Result<Value, String> {
+        let session = self.node.session(request["device"].as_str().ok_or("no device")?).ok_or("not connected")?;
+        Ok(json!({"ok": true, "queued": session.queued()}))
+    }
+
+    /// Sessions with no channel for IDLE: closed.
+    fn reap(&self) {
+        let mut idle: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+        loop {
+            std::thread::sleep(IDLE / 4);
+            let now = std::time::Instant::now();
+            let sessions = self.node.sessions();
+            idle.retain(|peer, _| sessions.iter().any(|s| &s.peer == peer));
+            for session in sessions {
+                if session.channels() > 0 {
+                    idle.remove(&session.peer);
+                } else if now.duration_since(*idle.entry(session.peer.clone()).or_insert(now)) >= IDLE {
+                    log!("{}: idle, closed", session.name);
+                    session.close();
+                }
+            }
+        }
     }
 
     fn open(&self, request: &Value) -> Result<(Value, OwnedFd), String> {
         let device = request["device"].as_str().ok_or("no device")?;
-        let session = self.node.session(device).ok_or("not connected")?;
+        let session = self.session(device)?;
         let class = request["class"].as_str().and_then(Class::parse).ok_or("no class")?;
         let feature = request["feature"].as_str().ok_or("no feature")?;
         let channel = session.open(feature, request["channel"].as_str().unwrap_or(""), class)?;
@@ -132,6 +264,14 @@ impl Daemon {
             let (reply, fd) = match request["op"].as_str().unwrap_or("") {
                 "devices" => (Ok(self.devices()), None),
                 "connect" => (self.connect(&request), None),
+                "browse" => (self.browse(&request), None),
+                "queued" => (self.queued(&request), None),
+                "close" => {
+                    if let Some(session) = request["device"].as_str().and_then(|d| self.node.session(d)) {
+                        session.close();
+                    }
+                    (Ok(json!({"ok": true})), None)
+                }
                 "open" => match self.open(&request) {
                     Ok((reply, fd)) => (Ok(reply), Some(fd)),
                     Err(e) => (Err(e), None),
@@ -198,8 +338,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let daemon = Arc::new(Daemon { node: node.clone(), config, watchers: Mutex::default(), serving: Mutex::default(),
-                                   serial: AtomicU64::new(0) });
+    let state = PathBuf::from(value("--state").unwrap_or_else(|| {
+        let base = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{home}/.local/state"));
+        format!("{base}/plus-one/link.json")
+    }));
+    let daemon = Arc::new(Daemon { node: node.clone(), config, state, finding: Mutex::default(), watchers: Mutex::default(),
+                                   serving: Mutex::default(), serial: AtomicU64::new(0) });
+    let reaper = daemon.clone();
+    std::thread::Builder::new().name("link-idle".into()).spawn(move || reaper.reap()).unwrap();
     let events = daemon.clone();
     node.on_event(move |event| events.event(event));
     if let Some(address) = value("--listen") {

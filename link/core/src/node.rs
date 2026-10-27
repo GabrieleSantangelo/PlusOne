@@ -76,7 +76,16 @@ impl NodeInner {
     /// is the one that went quiet: the device came back by another way).
     fn add(self: &Arc<Self>, established: session::Established) -> std::io::Result<Arc<Session>> {
         let session = Session::start(self, established)?;
-        let before = self.sessions.lock().unwrap().insert(session.peer.clone(), session.clone());
+        let before = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // Made while the node closed (close() saw none of it): not kept.
+            if self.closed.load(Ordering::SeqCst) {
+                drop(sessions);
+                session.close();
+                return Err(std::io::Error::other("the node is closed"));
+            }
+            sessions.insert(session.peer.clone(), session.clone())
+        };
         // Served since the hello went (the session was not among them yet).
         session.our_features(self.features());
         if let Some(before) = before {
@@ -165,7 +174,10 @@ impl Node {
 
     /// Everything over: no more listening, every session closed.
     pub fn close(&self) {
+        // Under the sessions' lock: a session being added sees it, or is seen.
+        let sessions = self.0.sessions.lock().unwrap();
         self.0.closed.store(true, Ordering::SeqCst);
+        drop(sessions);
         for listener in self.0.listeners.lock().unwrap().drain(..) {
             // A listening socket shut down: its accept() returns at once.
             crate::sys::shutdown(listener.as_raw_fd());

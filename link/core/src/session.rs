@@ -41,6 +41,8 @@ const OPEN_WAIT: Duration = Duration::from_secs(5);
 pub const MAX_DATAGRAM: usize = 1400;
 /// Realtime over the stream: dropped while this much waits to be sent.
 const STREAM_BUDGET: usize = 256 << 10;
+/// Room in the UDP socket, each way: a keyframe's packets at once.
+const UDP_BUFFER: libc::c_int = 4 << 20;
 /// Room in a channel's socket, each way (the system caps it: a control
 /// message is at most about 200 KB; more goes on a bulk channel).
 const CHANNEL_BUFFER: usize = 1 << 20;
@@ -171,6 +173,9 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut tcp: TcpStream, dialer
 
     let local = tcp.local_addr()?;
     let udp = UdpSocket::bind(SocketAddr::new(local.ip(), 0))?;
+    // As much as the system allows (net.core.wmem_max, rmem_max).
+    sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, UDP_BUFFER);
+    sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, UDP_BUFFER);
     let mut hello = hello;
     hello["udp"] = json!(udp.local_addr()?.port());
     let mut bytes = Vec::new();
@@ -279,6 +284,20 @@ impl Session {
     /// The last round trip over UDP, if it works.
     pub fn rtt(&self) -> Option<Duration> {
         self.udp_works().then(|| Duration::from_micros(self.rtt_us.load(Ordering::Relaxed)))
+    }
+
+    /// Bytes sent and not yet on the air (the UDP socket's, the queue's,
+    /// the Wi-Fi driver's: each packet counts until it is transmitted) and
+    /// the stream's backlog: how far behind the network is.
+    pub fn queued(&self) -> usize {
+        let mut udp: libc::c_int = 0;
+        unsafe { libc::ioctl(self.udp.as_raw_fd(), libc::TIOCOUTQ, &mut udp) };
+        udp.max(0) as usize + self.outbox.lock().unwrap().len()
+    }
+
+    /// The channels open now.
+    pub fn channels(&self) -> usize {
+        self.channels.lock().unwrap().len()
     }
 
     /// Input and realtime messages dropped (no room on the way).

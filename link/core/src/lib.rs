@@ -8,6 +8,7 @@
 
 pub mod frame;
 pub mod identity;
+pub mod mdns;
 pub mod node;
 pub mod seal;
 pub mod session;
