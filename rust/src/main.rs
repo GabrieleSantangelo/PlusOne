@@ -4,12 +4,16 @@
 //!   plus-one-rs ping          finds the tablet in use (mDNS), links, pings
 //!   plus-one-rs display [--size WxH] [--fps N] [--bitrate KBPS] [--encoder E]
 //!                       [--test] [--no-input] [--seconds N]
+//!                       [--at HOST:PORT]
 //!                             the desktop on the tablet in use, as plus-one --cli
+//!   plus-one-rs fake-app DIR [--port P] [--screen WxH]
+//!                             a tablet of pretend, to measure the PC's side (bench.rs)
 
 // The port is underway: what the next parts use (pairing from the window,
 // a link's shutdown, the GUI's discovery) is here before them.
 #![allow(dead_code)]
 
+mod bench;
 mod display;
 mod link;
 
@@ -32,6 +36,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("ping") => ping(),
         Some("display") => show_desktop(&args[2..]),
+        Some("fake-app") => bench::fake_app(&args[2..]),
         _ => {
             eprintln!("plus-one-rs {}: ping | display [options]", env!("CARGO_PKG_VERSION"));
             std::process::exit(2);
@@ -96,6 +101,10 @@ fn show_desktop(args: &[String]) {
         test: args.iter().any(|a| a == "--test"),
     };
     let seconds: Option<u32> = value("--seconds").and_then(|v| v.parse().ok());
+    let at: Option<link::Target> = value("--at").and_then(|a| {
+        let (host, port) = a.rsplit_once(':')?;
+        Some(link::Target::Tcp(host.to_owned(), port.parse().ok()?))
+    });
     let main = glib::MainLoop::new(None, false);
     let nearby = link::Nearby::new(|| {});
     nearby.start();
@@ -110,7 +119,7 @@ fn show_desktop(args: &[String]) {
             log!("no tablet paired");
             return quit.quit();
         };
-        let targets = tablets.targets(&tablet);
+        let targets = at.clone().map(|t| vec![t]).unwrap_or_else(|| tablets.targets(&tablet));
         let done = quit.clone();
         *started.borrow_mut() = Some(display::Session::start(targets, tablet.app_id().to_owned(), options.take().unwrap(),
             move |error, _started| {
