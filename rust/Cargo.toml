@@ -1,0 +1,32 @@
+[package]
+name = "plus-one"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "A Samsung Galaxy Tab as a second screen, signing tablet, webcam, microphone and speakers for GNOME"
+resolver = "3"
+
+[[bin]]
+name = "plus-one-rs"
+path = "src/main.rs"
+
+[dependencies]
+glib = "0.20"
+gio = "0.20"
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+gst = { package = "gstreamer", version = "0.23", features = ["v1_24"] }
+gst-app = { package = "gstreamer-app", version = "0.23", features = ["v1_24"] }
+gst-video = { package = "gstreamer-video", version = "0.23", features = ["v1_24"] }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.23", features = ["v1_24"] }
+gst-sdp = { package = "gstreamer-sdp", version = "0.23", features = ["v1_24"] }
+openssl = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = 1

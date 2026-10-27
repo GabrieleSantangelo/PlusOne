@@ -1,0 +1,14 @@
+# Build environment for Plus One in Rust (rust/): the toolchain Ubuntu
+# packages (signed, no curl | sh) and the libraries the app links: GTK 4,
+# libadwaita, GStreamer, Poppler, OpenSSL. Used by tools/rust-docker.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        rustc-1.85 cargo-1.85 build-essential pkg-config ca-certificates \
+        libssl-dev libgtk-4-dev libadwaita-1-dev libpoppler-glib-dev \
+        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/lib/rust-1.85/bin:$PATH CARGO_HOME=/cargo
+WORKDIR /src/rust
