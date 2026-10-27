@@ -283,8 +283,14 @@ impl Node {
     /// A session (or a path for the one we have) with the device listening
     /// at address.
     pub fn connect(&self, address: SocketAddr, timeout: Duration) -> Result<Arc<Session>, String> {
+        self.connect_as(address, timeout, "lan")
+    }
+
+    /// As connect(), the path of that kind ("lan", "p2p": a Wi-Fi Direct
+    /// group's, ranked above the LAN's).
+    pub fn connect_as(&self, address: SocketAddr, timeout: Duration, kind: &str) -> Result<Arc<Session>, String> {
         let tcp = TcpStream::connect_timeout(&address, timeout).map_err(|e| format!("{address}: {e}"))?;
         crate::stream::tune_tcp(&tcp);
-        self.connect_stream(Box::new(tcp), "lan").map_err(|e| format!("{address}: {e}"))
+        self.connect_stream(Box::new(tcp), kind).map_err(|e| format!("{address}: {e}"))
     }
 }

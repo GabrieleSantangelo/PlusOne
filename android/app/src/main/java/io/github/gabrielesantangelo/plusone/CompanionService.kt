@@ -103,7 +103,7 @@ class CompanionService : Service(), LinkServer.Host {
             }
         }
         // The features moved over so far: their handlers of the link of before.
-        LinkFeatures(this, core, listOf(DisplayHandler(this), SpeakersHandler(this), CaptureHandler(this), sign, update))
+        LinkFeatures(this, core, listOf(DisplayHandler(this), SpeakersHandler(this), CaptureHandler(this), sign, update, P2pHandler(this)))
         Thread({
             try {
                 // The same port each time, if free: where the PC reached it

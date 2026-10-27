@@ -232,7 +232,9 @@ class MainActivity : AppCompatActivity() {
         val notifications = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
         val overlay = Settings.canDrawOverlays(this)
-        if (notifications && overlay) return null
+        // Wi-Fi Direct with the PC (P2pHandler): asked with the notifications.
+        val nearby = checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+        if (notifications && nearby && overlay) return null
         return MaterialCardView(this, null, M.attr.materialCardViewFilledStyle).apply {
             radius = dp(28f)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -245,7 +247,9 @@ class MainActivity : AppCompatActivity() {
                     M.attr.colorOnSurfaceVariant).apply { setPadding(0, dp(8), 0, dp(12)) })
                 addView(button(getString(R.string.overlay_allow), Look.FILLED) {
                     // Notifications first (a question here), then "display over other apps" (a settings page).
-                    if (!notifications) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                    val missing = listOfNotNull(Manifest.permission.POST_NOTIFICATIONS.takeIf { !notifications },
+                                                Manifest.permission.NEARBY_WIFI_DEVICES.takeIf { !nearby })
+                    if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
                     else allowOverlay()
                 }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                     .apply { gravity = Gravity.END })

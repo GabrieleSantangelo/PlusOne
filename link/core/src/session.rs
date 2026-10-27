@@ -109,7 +109,8 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// How good a path is: a better one takes over from a worse.
 fn rank(kind: &str) -> u8 {
     match kind {
-        "usb" => 3,
+        "usb" => 4,
+        "p2p" => 3,  // Wi-Fi Direct: once through the air, no access point's queue
         "lan" => 2,
         _ => 1,
     }

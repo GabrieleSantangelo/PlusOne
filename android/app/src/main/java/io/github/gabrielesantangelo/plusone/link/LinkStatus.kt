@@ -55,7 +55,7 @@ object LinkStatus {
     fun name(context: Context, path: String?, inSentence: Boolean = false): String = context.getString(when (path) {
         "usb" -> if (inSentence) R.string.path_cable_lc else R.string.path_cable
         "lan" -> R.string.path_wifi
-        "wifi-direct", "ap" -> R.string.path_wifi_direct
+        "p2p", "wifi-direct", "ap" -> R.string.path_wifi_direct
         "bluetooth" -> R.string.path_bluetooth
         "relay" -> if (inSentence) R.string.path_internet_lc else R.string.path_internet
         null -> R.string.path_reconnecting
