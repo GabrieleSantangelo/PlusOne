@@ -38,6 +38,115 @@ struct Core {
 /// error, not a crash.
 static CORES: LazyLock<Mutex<HashMap<jlong, Arc<Core>>>> = LazyLock::new(Mutex::default);
 static NEXT: AtomicI64 = AtomicI64::new(1);
+/// Whether the cable has its owner (cable() running).
+static CABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The USB accessory, from its opening until the cable is out: sessions on
+/// it one after the other. Each: READY and a number, again every
+/// USB_AGAIN, until the PC's GO with it; then the session's bytes both
+/// ways, until its stream ends (the session over, or on another path);
+/// then the next READY. One reader of the accessory throughout: a stale
+/// reader never holds it, nor reads another session's bytes.
+fn cable(node: Node, file: std::fs::File, kind: &str) {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicBool;
+    let Ok(mut reader) = file.try_clone() else { return };
+    let writer = Arc::new(Mutex::new(file));
+    // Where what the PC sends goes: the session's stream, or (none) the handshake.
+    let sink: Arc<Mutex<Option<UnixStream>>> = Arc::default();
+    let gone = Arc::new(AtomicBool::new(false));
+    let (handshake, transfers) = mpsc::channel::<Vec<u8>>();
+    {
+        let (sink, gone) = (sink.clone(), gone.clone());
+        let _ = std::thread::Builder::new().name("link-cable-in".into()).spawn(move || {
+            let mut buf = vec![0u8; 16 << 10];
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,  // the cable out
+                    Ok(n) => n,
+                };
+                let mut sink = sink.lock().unwrap();
+                match sink.as_mut() {
+                    Some(stream) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            *sink = None;
+                        }
+                    }
+                    None => {
+                        let _ = handshake.send(buf[..n].to_vec());
+                    }
+                }
+            }
+            gone.store(true, Ordering::SeqCst);
+            if let Some(stream) = sink.lock().unwrap().take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+    }
+    while !gone.load(Ordering::SeqCst) {
+        let number: [u8; 8] = std::array::from_fn(|i| (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos() >> (i * 8)) as u8);
+        let mut ready = plusone_link::stream::USB_READY.to_vec();
+        ready.extend_from_slice(&number);
+        // READY, again until GO: what comes meanwhile (an attempt's of before) dropped.
+        let mut said = std::time::Instant::now() - plusone_link::stream::USB_AGAIN;
+        let answered = loop {
+            if gone.load(Ordering::SeqCst) {
+                return;
+            }
+            if said.elapsed() >= plusone_link::stream::USB_AGAIN {
+                let _ = writer.lock().unwrap().write_all(&ready);  // the cable out a moment: again later
+                said = std::time::Instant::now();
+            }
+            match transfers.recv_timeout(Duration::from_millis(200)) {
+                Ok(transfer) if plusone_link::stream::usb_number(plusone_link::stream::USB_GO, &transfer) == Some(number) => break true,
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+            }
+        };
+        if !answered {
+            return;
+        }
+        let Ok((ours, theirs)) = UnixStream::pair() else { return };
+        let Ok(inward) = ours.try_clone() else { return };
+        {
+            // What came after GO (the PC's first TLS bytes) first, then the rest directly.
+            let mut sink = sink.lock().unwrap();
+            let mut inward = inward;
+            while let Ok(transfer) = transfers.try_recv() {
+                let _ = inward.write_all(&transfer);
+            }
+            *sink = Some(inward);
+        }
+        let out = {
+            let (writer, sink) = (writer.clone(), sink.clone());
+            let mut ours = ours;
+            std::thread::Builder::new().name("link-cable-out".into()).spawn(move || {
+                let mut buf = vec![0u8; 16 << 10];
+                loop {
+                    let n = match ours.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let mut writer = writer.lock().unwrap();
+                    if plusone_link::stream::usb_pieces(&buf[..n]).any(|piece| writer.write_all(piece).is_err()) {
+                        break;
+                    }
+                }
+                // The session's stream over: the next attempt's.
+                if let Some(stream) = sink.lock().unwrap().take() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            })
+        };
+        let Ok(out) = out else { return };
+        match node.accept_stream(Box::new(theirs), kind) {
+            Ok(session) => plusone_link::log!("{}: a session by cable", session.name),
+            Err(e) => plusone_link::log!("by cable: {e}"),
+        }
+        let _ = out.join();
+    }
+}
 
 fn core(handle: jlong) -> Option<Arc<Core>> {
     CORES.lock().unwrap().get(&handle).cloned()
@@ -113,63 +222,19 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
             Ok(json!({"ok": true, "device": session.peer}))
         }
         "accept_fd" => {
+            // The cable's for as long as it is plugged in: one owner, which
+            // opened it once (Android's accessory opens only once).
             let fd = request["fd"].as_i64().filter(|fd| *fd >= 0).ok_or("no fd")? as i32;
             let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-            let (mut reader, mut writer) = (file.try_clone().map_err(|e| e.to_string())?, file);
-            // READY and our number, again every USB_AGAIN, until the PC's GO
-            // with it; what comes before (an attempt's of before) dropped.
-            let number: [u8; 8] = std::array::from_fn(|i| (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_nanos() >> (i * 8)) as u8);
-            let mut ready = plusone_link::stream::USB_READY.to_vec();
-            ready.extend_from_slice(&number);
-            let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let repeater = {
-                let (mut writer, answered, ready) = (writer.try_clone().map_err(|e| e.to_string())?, answered.clone(), ready.clone());
-                std::thread::spawn(move || {
-                    let step = std::time::Duration::from_millis(50);
-                    loop {
-                        // Not written (the cable out for a moment, the PC
-                        // switching it back): again, as long as nobody answered.
-                        let _ = writer.write_all(&ready);
-                        let mut waited = std::time::Duration::ZERO;
-                        while waited < plusone_link::stream::USB_AGAIN {
-                            if answered.load(std::sync::atomic::Ordering::SeqCst) {
-                                return;
-                            }
-                            std::thread::sleep(step);
-                            waited += step;
-                        }
-                    }
-                })
-            };
-            let mut buf = vec![0u8; 16 << 10];
-            let got = loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break false,
-                    Ok(n) if plusone_link::stream::usb_number(plusone_link::stream::USB_GO, &buf[..n]) == Some(number) => break true,
-                    Ok(_) => continue,
-                }
-            };
-            answered.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = repeater.join();  // no READY after this: the session's bytes only
-            if !got {
-                return Err("the cable went before the PC answered".into());
+            if CABLE.swap(true, Ordering::SeqCst) {
+                return Err("the cable has an owner already".into());
             }
-            let stream = plusone_link::stream::bridge(
-                // The accessory's reads: 0 is the cable gone.
-                move |buf| match reader.read(buf) {
-                    Ok(0) => Err(std::io::ErrorKind::UnexpectedEof.into()),
-                    other => other,
-                },
-                move |data| {
-                    for piece in plusone_link::stream::usb_pieces(data) {
-                        writer.write_all(piece)?;
-                    }
-                    Ok(())
-                },
-                16 << 10).map_err(|e| e.to_string())?;
-            let session = core.node.accept_stream(Box::new(stream), text("path").unwrap_or("usb"))?;
-            Ok(json!({"ok": true, "device": session.peer}))
+            let (node, kind) = (core.node.clone(), text("path").unwrap_or("usb").to_owned());
+            std::thread::Builder::new().name("link-cable".into()).spawn(move || {
+                cable(node, file, &kind);
+                CABLE.store(false, Ordering::SeqCst);
+            }).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true}))
         }
         "open" => {
             let session = core.node.session(text("device")?).ok_or("not connected")?;

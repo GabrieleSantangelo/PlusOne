@@ -304,3 +304,47 @@ fn a_session_on_a_stream_with_no_ip_carries_everything() {
     assert!(session.rtt().is_none(), "no UDP to measure");
     assert!(!session.is_closed());
 }
+
+#[test]
+fn a_path_the_other_side_lost_is_replaced_even_by_a_worse_one() {
+    // The cable dies on the PC's side only: the tablet goes on believing in
+    // it (nothing tells it until its silence). The PC's Wi-Fi path must be
+    // taken at once, not refused as worse than the cable.
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let (pc, tablet, address) = pair();
+    let (pc_end, relay_pc) = UnixStream::pair().unwrap();
+    let (tablet_end, relay_tablet) = UnixStream::pair().unwrap();
+    let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for (mut from, mut to) in [(relay_pc.try_clone().unwrap(), relay_tablet.try_clone().unwrap()),
+                               (relay_tablet.try_clone().unwrap(), relay_pc.try_clone().unwrap())] {
+        let frozen = frozen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16384];
+            while let Ok(n) = from.read(&mut buf) {
+                if n == 0 || frozen.load(std::sync::atomic::Ordering::SeqCst) || to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let accepter = tablet.clone();
+    std::thread::spawn(move || accepter.accept_stream(Box::new(tablet_end), "usb").map(|_| ()));
+    let session = pc.connect_stream(Box::new(pc_end), "usb").unwrap();
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let mut buf = vec![0u8; 64];
+    control.send(b"cable").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
+    // The PC's end of the cable goes; the tablet's stays (the relay keeps it open).
+    frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+    relay_pc.shutdown(std::net::Shutdown::Both).unwrap();
+    until("the PC's path lost", || session.path().is_none());
+    assert_eq!(tablet.sessions()[0].path().as_deref(), Some("usb"), "the tablet still believes in it");
+    let again = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert!(Arc::ptr_eq(&again, &session));
+    until("the PC on the network", || session.path().as_deref() == Some("lan"));
+    until("the tablet on the network", || tablet.sessions()[0].path().as_deref() == Some("lan"));
+    control.send(b"still").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
+    drop(relay_tablet);
+}

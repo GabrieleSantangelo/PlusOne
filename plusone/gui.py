@@ -449,9 +449,11 @@ class Window(Adw.ApplicationWindow):
             # Nothing happening: where the tablet is.
             return _("Ready") if self.app.tablets.addresses(tablet) else _("Not found: open Plus One on the tablet")
         mode = getattr(self.controller, "mode", None)
+        by = self.app.connected_by()
         if state == State.STREAMING and mode:
-            return _("Second screen · {width} × {height} at {fps} Hz").format(width=mode[0], height=mode[1],
+            text = _("Second screen · {width} × {height} at {fps} Hz").format(width=mode[0], height=mode[1],
                                                                               fps=mode[2])
+            return _("{detail} · {path}").format(detail=text, path=_(by)) if by else text
         return detail or title
 
     def _refresh_tablets(self, active):

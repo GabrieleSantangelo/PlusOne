@@ -78,15 +78,19 @@ class MainActivity : AppCompatActivity() {
         CompanionService.start(this)  // ready now (for a while, if not always)
         CompanionService.instance?.elevate()  // in front: camera and microphone for the PC, if let
         Jobs.listen(queueChanged)
+        io.github.gabrielesantangelo.plusone.link.LinkStatus.listen(pathChanged)
         refresh()
     }
 
     override fun onPause() {
         Jobs.unlisten(queueChanged)
+        io.github.gabrielesantangelo.plusone.link.LinkStatus.unlisten(pathChanged)
         super.onPause()
     }
 
     private val queueChanged: () -> Unit = { refresh() }
+    private val pathChanged: (io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?,
+                              io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?) -> Unit = { _, _ -> refresh() }
 
     private fun refresh() {
         // Made again from scratch: where the user had scrolled to stays.
@@ -186,24 +190,35 @@ class MainActivity : AppCompatActivity() {
     private fun hero() = MaterialCardView(this, null, M.attr.materialCardViewFilledStyle).apply {
         setCardBackgroundColor(themeColor(M.attr.colorPrimaryContainer))
         radius = dp(28f)
+        // Connected to a PC over the link's core: to which, and by what (the cable, the Wi-Fi...).
+        val pc = io.github.gabrielesantangelo.plusone.link.LinkStatus.current()
         addView(LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(20), dp(20), dp(24), dp(20))
-            addView(icon(R.drawable.ic_ready, M.attr.colorOnPrimary, size = 28).apply {
+            val heroIcon = if (pc != null) io.github.gabrielesantangelo.plusone.link.LinkStatus.icon(pc.path) else R.drawable.ic_ready
+            addView(icon(heroIcon, M.attr.colorOnPrimary, size = 28).apply {
                 background = surface(androidx.appcompat.R.attr.colorPrimary, dp(28f))
                 setPadding(dp(14), dp(14), dp(14), dp(14))
                 layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { marginEnd = dp(16) }
             })
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
-                // Not paired: what to do on the PC. Paired: what this tablet is for.
+                // Not paired: what to do on the PC. Paired: what this tablet is for, or whom it is connected to.
                 val paired = Paired.all(this@MainActivity).isNotEmpty()
-                addView(label(getString(if (paired) R.string.ready else R.string.not_paired_title),
-                    M.attr.textAppearanceTitleLarge, M.attr.colorOnPrimaryContainer))
-                addView(label(if (paired) getString(R.string.status_ready)
-                    else getString(R.string.status_unpaired, CompanionService.deviceName(this@MainActivity)),
-                    M.attr.textAppearanceBodyMedium, M.attr.colorOnPrimaryContainer))
+                if (pc != null) {
+                    addView(label(getString(R.string.connected_to, pc.name.ifEmpty { "PC" }),
+                        M.attr.textAppearanceTitleLarge, M.attr.colorOnPrimaryContainer))
+                    val by = io.github.gabrielesantangelo.plusone.link.LinkStatus.name(this@MainActivity, pc.path, inSentence = true)
+                    addView(label(if (pc.path == null) by else getString(R.string.via, by),
+                        M.attr.textAppearanceBodyMedium, M.attr.colorOnPrimaryContainer))
+                } else {
+                    addView(label(getString(if (paired) R.string.ready else R.string.not_paired_title),
+                        M.attr.textAppearanceTitleLarge, M.attr.colorOnPrimaryContainer))
+                    addView(label(if (paired) getString(R.string.status_ready)
+                        else getString(R.string.status_unpaired, CompanionService.deviceName(this@MainActivity)),
+                        M.attr.textAppearanceBodyMedium, M.attr.colorOnPrimaryContainer))
+                }
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         })
     }

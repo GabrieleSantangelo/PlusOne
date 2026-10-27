@@ -81,6 +81,7 @@ class CompanionService : Service(), LinkServer.Host {
             return
         }
         link = core
+        core.onEvent = { io.github.gabrielesantangelo.plusone.link.LinkStatus.event(it) }
         core.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         // A cable plugged in before the service was up, or while it was not.
         (pendingCable ?: getSystemService(android.hardware.usb.UsbManager::class.java).accessoryList
@@ -114,38 +115,24 @@ class CompanionService : Service(), LinkServer.Host {
         }, "link-start").start()
     }
 
-    private val cableBusy = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** The accessory's stream to the link's core, which accepts the PC's
-     * session on it (TLS, as over the network): again and again, as long as
-     * the cable is plugged in (the PC's plus-one-link restarted, say). */
+    /** The accessory, opened once, to the link's core: it owns it until the
+     * cable is out (sessions on it one after the other; Android's accessory
+     * opens only once). */
     fun openCable(accessory: android.hardware.usb.UsbAccessory) {
+        val core = link ?: return
         val usb = getSystemService(android.hardware.usb.UsbManager::class.java)
         if (!usb.hasPermission(accessory)) return  // the user said no to "open Plus One"
-        if (!cableBusy.compareAndSet(false, true)) return
         Thread({
+            val fd = try { usb.openAccessory(accessory)?.detachFd() } catch (e: Exception) { null }
+            if (fd == null) {
+                Log.i(TAG, "link: the cable's accessory did not open (it has its owner already)")
+                return@Thread
+            }
             try {
-                while (true) {
-                    val core = link ?: break
-                    if (usb.accessoryList?.contains(accessory) != true) break
-                    val fd = try { usb.openAccessory(accessory)?.detachFd() } catch (e: Exception) { null }
-                    if (fd == null) {
-                        Log.w(TAG, "link: the cable's accessory did not open")
-                        Thread.sleep(CABLE_AGAIN)
-                        continue
-                    }
-                    try {
-                        core.accept(fd, "usb")
-                        Log.i(TAG, "link: a session by cable")
-                        while (core.devices().any { it.optString("path") == "usb" }) Thread.sleep(1000)
-                        Log.i(TAG, "link: the session by cable is over")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "link: by cable: $e")
-                        Thread.sleep(CABLE_AGAIN)
-                    }
-                }
-            } finally {
-                cableBusy.set(false)
+                core.accept(fd, "usb")
+                Log.i(TAG, "link: the cable is the link's")
+            } catch (e: Exception) {
+                Log.w(TAG, "link: by cable: $e")
             }
         }, "link-cable").start()
     }
@@ -342,7 +329,6 @@ class CompanionService : Service(), LinkServer.Host {
     companion object {
         /** The link's core listens here, if it can. */
         const val LINK_PORT = 47101
-        const val CABLE_AGAIN = 2_000L  // ms before the cable's next try
         const val TAG = io.github.gabrielesantangelo.plusone.link.TAG
         const val ELEVATE_WAIT = 5_000L        // ms for CaptureActivity to bring the app in front
         const val IDLE_CHECK = 60_000L         // ms

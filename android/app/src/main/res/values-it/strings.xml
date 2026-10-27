@@ -135,4 +135,20 @@
     <string name="update_waiting_text">Tocca per installare la versione del tuo PC</string>
     <string name="updated_title">Plus One aggiornato alla %1$s</string>
     <string name="updated_text">La stessa versione del tuo PC</string>
+
+    <!-- What the tablet is connected by (LinkStatus, DisplayActivity's overlay) -->
+    <string name="path_cable">Cavo</string>
+    <string name="path_wifi">Wi-Fi</string>
+    <string name="path_wifi_direct">Wi-Fi Direct</string>
+    <string name="path_bluetooth">Bluetooth</string>
+    <string name="path_internet">Internet</string>
+    <string name="path_reconnecting">Riconnessione…</string>
+    <string name="connected_to">Connesso a %1$s</string>
+    <string name="via">via %1$s</string>
+    <string name="switch_lost">Collegamento via %1$s perso: il desktop torna appena c\'è un\'altra via</string>
+    <string name="switch_waiting">Cerco un\'altra via verso il PC…</string>
+    <string name="switch_now">Ora via %1$s</string>
+    <string name="switch_steadying">Si stabilizza…</string>
+    <string name="path_cable_lc">cavo</string>
+    <string name="path_internet_lc">internet</string>
 </resources>

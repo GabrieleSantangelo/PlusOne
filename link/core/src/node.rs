@@ -64,9 +64,10 @@ impl NodeInner {
         json!({"t": "hello", "name": self.name, "features": self.features()})
     }
 
-    /// The session we have with peer, its id: a new path goes on with it.
-    fn ours(&self, peer: &str) -> Option<String> {
-        self.sessions.lock().unwrap().get(peer).filter(|s| !s.is_closed()).map(|s| s.id.clone())
+    /// The session we have with peer, its id (a new path goes on with it),
+    /// and whether it has no path now.
+    fn ours(&self, peer: &str) -> Option<(String, bool)> {
+        self.sessions.lock().unwrap().get(peer).filter(|s| !s.is_closed()).map(|s| (s.id.clone(), s.path().is_none()))
     }
 
     fn features_changed(&self) {

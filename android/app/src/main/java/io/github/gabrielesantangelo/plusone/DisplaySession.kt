@@ -32,6 +32,11 @@ import io.github.gabrielesantangelo.plusone.link.Packets
  * "rendered" times only gave back the time it was released with.)
  */
 class DisplaySession(private val packets: Packets) {
+    /** The PC's id over the link's core (its path is LinkStatus's); null over the link of before. */
+    val device: String? = (packets as? io.github.gabrielesantangelo.plusone.link.LinkPackets)?.device
+    /** Uptime ms of the last frame put on the screen (PathOverlay: steady again after a change). */
+    @Volatile var lastFrameAt = 0L
+        private set
     @Volatile private var running = true
     // Packets to the PC go out in order from this thread (input comes on
     // the main one, where Android allows no network).
@@ -131,6 +136,7 @@ class DisplaySession(private val packets: Packets) {
                 decoded(info.presentationTimeUs, System.nanoTime())
                 try {
                     codec.releaseOutputBuffer(index, true)  // now: no waiting for a presentation time
+                    lastFrameAt = android.os.SystemClock.uptimeMillis()
                 } catch (e: IllegalStateException) {
                 }
             }

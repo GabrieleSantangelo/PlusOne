@@ -29,6 +29,7 @@ from .i18n import _  # noqa: E402
 from .signing import Signing  # noqa: E402
 from .devices import SPEAKERS_NAME, Devices, make_default_sink  # noqa: E402
 from .link import Discovery, Nearby, Tablets  # noqa: E402
+from .link.paths import Paths  # noqa: E402
 from .updates import UPDATED_FROM, SelfUpdate, TabletUpdates  # noqa: E402
 
 APP_ID = "io.github.gabrielesantangelo.PlusOne"
@@ -222,6 +223,8 @@ class PlusOneApp(Adw.Application):
         # Every way of finding the tablets' apps: mDNS for now.
         self.discovery = Discovery([Nearby(on_change=self._on_nearby)])
         self.tablets = Tablets(self.settings, self.save_settings, self.discovery)
+        # What the tablet is connected by (the link's events): in the status.
+        self.paths = Paths(self._path_changed)
         self.controller = Controller(self.settings, self._on_state, self.tablets)
         self.listeners = []      # windows following the state
         self.log_listeners = []  # windows showing the log
@@ -362,11 +365,33 @@ class PlusOneApp(Adw.Application):
 
     # -- state -------------------------------------------------------------
     def status_text(self):
-        """(title, detail) for the current state, in the current language."""
+        """(title, detail) for the current state, in the current language;
+        while connected, what by (the cable, the Wi-Fi...)."""
         state = self.controller.state
         template, args = self.controller.detail
         detail = _(template).format(**args) if template else ""
-        return _(TITLES[state]), detail
+        title = _(TITLES[state])
+        by = self.connected_by()
+        if by and state in (State.CONNECTING, State.STREAMING):
+            title = _("{state} · {path}").format(state=title, path=_(by))
+            detail = _("{detail} · {path}").format(detail=detail, path=_(by)) if detail else _(by)
+        return title, detail
+
+    def connected_by(self):
+        """What the tablet in use is connected by now: "cable", "Wi-Fi"...,
+        "reconnecting…"; "Wi-Fi" over the link of before; None if not connected."""
+        tablet = self.tablets.active()
+        if tablet is None:
+            return None
+        by = self.paths.path(tablet.fingerprint)
+        if by is None and self.controller.state == State.STREAMING:
+            return "Wi-Fi"  # the link of before goes over the network only
+        return by
+
+    def _path_changed(self):
+        self._emit_properties()
+        for listener in list(self.listeners):
+            listener()
 
     def _on_state(self, state, template, args):
         self._update_hold()

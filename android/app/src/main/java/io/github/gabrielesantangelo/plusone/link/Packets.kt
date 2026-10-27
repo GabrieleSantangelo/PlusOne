@@ -20,6 +20,9 @@ class LinkPackets(private val media: LinkChannel, private val input: LinkChannel
     : Packets {
     private val buffer = ByteArray(2048)
 
+    /** The PC's id (its certificate's fingerprint). */
+    val device: String get() = media.device
+
     override fun send(body: ByteArray) {
         if (input != null && body.isNotEmpty() && body[0] == inputKind) input.send(body) else media.send(body)
     }

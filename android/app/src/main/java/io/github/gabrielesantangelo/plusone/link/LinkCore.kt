@@ -47,8 +47,8 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
     /** PCs connect here (0: any port): the port. */
     fun listen(port: Int = 0): Int = request(JSONObject().put("op", "listen").put("port", port)).getInt("port")
 
-    /** A session the PC starts on fd (a USB accessory's: path "usb"), its
-     * bytes bridged by the core. Blocks until it is up; the fd is the core's. */
+    /** fd (a USB accessory's: path "usb") to the core, which owns it until
+     * the cable is out: the PC's sessions on it, one after the other. */
     fun accept(fd: Int, path: String) {
         request(JSONObject().put("op", "accept_fd").put("fd", fd).put("path", path))
     }

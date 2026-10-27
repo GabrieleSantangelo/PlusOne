@@ -41,7 +41,7 @@ Device machine with candidates.
 | `PATH_SILENCE` | 5 s | nothing heard on a path (stream frames and datagrams alike): the path is lost **[built]** |
 | `PATH_SUSPECT` | 1.5 s | nothing heard: look for a better/other path already, keep this one |
 | `UDP_PROOF` | 3 s | a pong this recent: datagrams go both ways **[built]** |
-| `RESUME_WAIT` | 15 s | a session with no path this long is over **[built]** |
+| `RESUME_WAIT` | 15 s; 60 s with a channel open | a session with no path this long is over (60 s: time to move both devices to another network by hand) **[built]** |
 | `IDLE` | 60 s | a session with no channel, not wanted, not by cable: closed **[built]** |
 | `DISCOVERY_ROUND` | 3 s | one round of the cascade |
 | `BACKOFF` | 1, 2, 4, … 30 s | between failed rounds while wanted |

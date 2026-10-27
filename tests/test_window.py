@@ -53,6 +53,7 @@ def make(monkeypatch, tmp_path, tablets=()):
                                            start=lambda: None, stop=lambda: None)
     app.listeners, app.log_listeners, app.log_lines = [], [], ["a line of the log"]
     app.status_text = lambda: ("Ready", "")
+    app.connected_by = lambda: None
     app.save_settings = lambda: None
     app.window_closed = lambda: None
     app.set_sign_on_tablet = lambda on: setattr(app.settings, "sign_on_tablet", on)

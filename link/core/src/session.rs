@@ -41,6 +41,9 @@ pub const PING_EVERY: Duration = Duration::from_secs(1);
 pub const PATH_SILENCE: Duration = Duration::from_secs(5);
 /// No path this long: the session is over.
 pub const RESUME_WAIT: Duration = Duration::from_secs(15);
+/// The same with a channel open (the desktop, the speakers...): time for
+/// both devices to be moved to another network by hand.
+pub const RESUME_WAIT_IN_USE: Duration = Duration::from_secs(60);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
@@ -221,6 +224,9 @@ pub(crate) struct Established {
     id: String,
     /// The session both hellos named (the same one): this is a path for it.
     pub(crate) resumes: Option<String>,
+    /// The other side has no path for it now: this one is taken, whatever
+    /// we believe of ours (it is gone for them).
+    forced: bool,
 }
 
 impl Established {
@@ -235,10 +241,10 @@ impl Established {
 
 /// The TLS handshake, the keys and the hellos, on a new connection. The
 /// verifier has checked the other side is paired. kind: what it runs on;
-/// ours: the id of the session we have with that device, if any (to go on
-/// with it: both hellos name it, or a new one starts).
+/// ours: the session we have with that device, if any (to go on with it:
+/// both hellos name it, or a new one starts), and whether it has no path.
 pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream>, dialer: bool, hello: Value,
-                        kind: &str, ours: &dyn Fn(&str) -> Option<String>) -> io::Result<Established> {
+                        kind: &str, ours: &dyn Fn(&str) -> Option<(String, bool)>) -> io::Result<Established> {
     stream.set_timeouts(Some(HANDSHAKE))?;
     while conn.is_handshaking() {
         conn.complete_io(&mut stream)?;
@@ -265,12 +271,16 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
         }
         None => None,
     };
-    let resume = ours(&peer);
+    let (resume, detached) = match ours(&peer) {
+        Some((id, detached)) => (Some(id), detached),
+        None => (None, false),
+    };
     let mut hello = hello;
     if let Some(udp) = &udp {
         hello["udp"] = json!(udp.local_addr()?.port());
     }
     hello["resume"] = json!(resume);
+    hello["detached"] = json!(detached);
     let mut bytes = Vec::new();
     let mut body = 0u64.to_be_bytes().to_vec();  // numbered 0: before the session's own
     body.extend_from_slice(hello.to_string().as_bytes());
@@ -299,8 +309,9 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
     };
     let udp = if udp_peer.is_some() { udp } else { None };
     let resumes = resume.filter(|r| theirs["resume"].as_str() == Some(r.as_str()));
+    let forced = theirs["detached"].as_bool().unwrap_or(false);
     Ok(Established { conn, stream, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer,
-                     kind: kind.to_owned(), id, resumes })
+                     kind: kind.to_owned(), id, resumes, forced })
 }
 
 /// A connection made ready to be a path: non-blocking from now on, its
@@ -374,14 +385,16 @@ impl Session {
     }
 
     /// Another path for this session (both hellos named it): it takes over
-    /// if it is better than the one now, or if there is none; else closed.
+    /// if it is better than the one now, if there is none, or if the other
+    /// side has none (the one we believe in is dead for them); else closed.
     pub(crate) fn adopt(&self, established: Established) -> bool {
         if self.is_closed() {
             established.close();
             return false;
         }
         let now = self.path.lock().unwrap().clone();
-        if now.is_some_and(|path| !path.gone.load(Ordering::SeqCst) && rank(&path.kind) >= rank(&established.kind)) {
+        if !established.forced
+            && now.is_some_and(|path| !path.gone.load(Ordering::SeqCst) && rank(&path.kind) >= rank(&established.kind)) {
             established.close();
             return false;
         }
@@ -665,7 +678,8 @@ impl Session {
             if let Some(node) = self.node.upgrade() {
                 node.detached(&self);
             }
-            let until = Instant::now() + RESUME_WAIT;
+            let wait = if self.channels() > 0 { RESUME_WAIT_IN_USE } else { RESUME_WAIT };
+            let until = Instant::now() + wait;
             while next.is_none() {
                 if self.is_closed() {
                     return;
@@ -676,7 +690,7 @@ impl Session {
                 }
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    self.end(&format!("no path for {} s", RESUME_WAIT.as_secs()));
+                    self.end(&format!("no path for {} s", wait.as_secs()));
                     return;
                 }
                 let _ = sys::readable(self.wake.fd(), Some(left.min(Duration::from_millis(500))));
