@@ -255,6 +255,28 @@ in a test.
 
 ## Measured
 
+### The emulated grid, the reference
+
+`tools/netbench-grid.sh 3 6 100` at c7e3127 (2026-10-28), every number in
+`docs/netbench/2026-10-28-c7e3127.txt`: 11 networks, 3 runs each, no run
+failed. QUIC, against the same commit before the controller's fixes of
+that evening (87dcb72 → c7e3127):
+
+| Network | Video, adaptive | Whole frames (video; under upload) | Realtime under bulk, p99 | Channel opens under upload, p99 |
+|---|---|---|---|---|
+| adsl 15 Mbit/s | 12.3 → 12.5 Mbit/s | 97.5 → 99.4 %; 97.8 → 98.6 % | 128 → 122 ms | 369 → 424 ms |
+| long (80 ms) | 11.9 → 17.1 | 95.3 → 99.2; 90.6 → 97.2 | 399 → 366 | 821 → 906 |
+| hotspot 50 | 20.5 → 20.8 | 98.1 → 99.4; 97.8 → 97.8 | 76 → 89 | 250 → 202 |
+| shallow (15 ms queue) | 11.6 → 13.0 | 94.5 → 89.5; 86.4 → 78.1 | 71 → 89 | 397 → 429 |
+| steps (rate a third, 5 s) | 5.9 → 8.1 | 99.4 → 94.2; 94.2 → 91.4 | 139 → 264 | 716 → 714 |
+| cross (a TCP download) | 2.6 → 7.5 | 99.4 → 99.7; 86.1 → 99.4 | 91 → 214 | 409 → 923 |
+| p2p 300 | 20.8 → 20.8 | 99.7 → 99.7; 75.9 → 77.0 | 29 → 30 | 69 → 67 |
+
+Better where the controller spiralled down (long, cross, adsl); worse
+where the queue is small or the rate changes (shallow, steps) and on
+realtime beside a download: the stage 6 work (the controller on the
+packets' arrival times) starts from here.
+
 On loopback, the flows of the tablet in use at once from Python (video,
 1200-byte packets at 20 Mbit/s in 60 bursts a second; sound, a packet each
 5 ms; input, 285 a second), each packet from Python's write to the other
