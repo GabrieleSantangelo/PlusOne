@@ -41,6 +41,11 @@ const BRIDGE_CHUNK: usize = 16 << 10;
 /// opened channel was never answered. As TCP_NOTSENT_LOWAT on a TCP path.
 const AHEAD: Duration = Duration::from_millis(30);
 const AHEAD_LEAST: f64 = 32.0 * 1024.0;
+/// How often quinn's send window follows the rate (Bridge): what it holds
+/// unacknowledged, sent or not, the rate's worth of a round trip and AHEAD
+/// (handed a quarter over the rate, it kept up to SEND_WINDOW unsent: a
+/// second on a 15 Mbit/s path, and a channel's open waited behind it).
+const WINDOW_EVERY: Duration = Duration::from_millis(10);
 
 /// The core's own runtime for quinn: two threads, whatever the program.
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
@@ -163,7 +168,7 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
         // session's TLS hello, which the dialer writes first.
         let (send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let realtime: Arc<AtomicU64> = Arc::default();
-        let stream = bridge(send, recv, rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
+        let stream = bridge(&conn, send, recv, rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
         Ok((stream, Quic { conn, rate, realtime }))
     })
 }
@@ -193,7 +198,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, hand
                         .map_err(|e| e.to_string())?;
                     let (send, recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
                     let realtime: Arc<AtomicU64> = Arc::default();
-                    let stream = bridge(send, recv, rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
+                    let stream = bridge(&conn, send, recv, rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
                     Ok::<_, String>((stream, Quic { conn, rate, realtime }))
                 };
                 match tokio::time::timeout(whole, accepted).await {
@@ -224,8 +229,9 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, hand
 
 /// A QUIC stream bridged to a socket pair: the session runs on the pair's
 /// end this returns, as on a TCP connection. Either side over ends both.
-fn bridge(mut send: quinn::SendStream, mut recv: quinn::RecvStream, rate: Arc<AtomicU64>, realtime: Arc<AtomicU64>)
-          -> io::Result<UnixStream> {
+fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvStream, rate: Arc<AtomicU64>,
+          realtime: Arc<AtomicU64>) -> io::Result<UnixStream> {
+    let conn = conn.clone();
     let (ours, theirs) = UnixStream::pair()?;
     crate::stream::little_room(&theirs);
     ours.set_nonblocking(true)?;
@@ -252,12 +258,18 @@ fn bridge(mut send: quinn::SendStream, mut recv: quinn::RecvStream, rate: Arc<At
         // the bulk on what is left (§3.11), the realtime ahead.
         let (mut tokens, mut refilled) = (AHEAD_LEAST, tokio::time::Instant::now());
         let (mut realtime_rate, mut realtime_seen) = (0.0f64, realtime.load(Ordering::Relaxed));
+        let mut windowed = refilled;
         loop {
             match from_session.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     loop {
                         let now = tokio::time::Instant::now();
+                        if now.duration_since(windowed) >= WINDOW_EVERY {
+                            let held = rate.load(Ordering::Relaxed) as f64 * (conn.rtt() + AHEAD).as_secs_f64();
+                            conn.set_send_window((held as u64).max(2 * BRIDGE_CHUNK as u64));
+                            windowed = now;
+                        }
                         let elapsed = now.duration_since(refilled).as_secs_f64();
                         let sent = realtime.load(Ordering::Relaxed);
                         if elapsed > 0.0 {
