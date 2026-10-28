@@ -509,21 +509,22 @@ def test_a_paused_stream_is_no_program_playing():
 
 
 def test_the_tablets_own_bluetooth_audio_is_off_while_it_is_the_speakers_and_back_after(tmp_path, monkeypatch):
-    cards = [{"name": "bluez_card.54_DD_4F_07_78_77", "active_profile": "a2dp-source",
-              "properties": {"device.description": "Tab"}},
-             {"name": "bluez_card.88_8E", "active_profile": "a2dp-sink",
-              "properties": {"device.description": "Earbuds"}}]
+    tablet, earbuds = "/org/bluez/hci0/dev_54_DD", "/org/bluez/hci0/dev_88_8E"
+    objects = {tablet: {"org.bluez.Device1": {"Name": "Tab", "Connected": True}},
+               tablet + "/sep1/fd0": {"org.bluez.MediaTransport1": {}},
+               earbuds: {"org.bluez.Device1": {"Name": "Earbuds", "Connected": True}},
+               earbuds + "/sep1/fd0": {"org.bluez.MediaTransport1": {}}}
     calls = []
     monkeypatch.setattr(devices.BluetoothAudio, "STATE", str(tmp_path / "bluetooth-audio.json"))
-    monkeypatch.setattr(devices.BluetoothAudio, "_cards", staticmethod(lambda: cards))
-    monkeypatch.setattr(devices, "_pactl", lambda *args: calls.append(args))
+    monkeypatch.setattr(devices, "_bluez_objects", lambda: objects)
+    monkeypatch.setattr(devices, "_bluez_call", lambda path, method, uuid: calls.append((path, method, uuid)))
     audio = devices.BluetoothAudio(lambda: "Tab")
     audio._check()
-    assert calls == [("set-card-profile", "bluez_card.54_DD_4F_07_78_77", "off")]  # the tablet's only
-    cards[0]["active_profile"] = "off"
+    assert calls == [(tablet, "DisconnectProfile", devices.BluetoothAudio.A2DP_SOURCE)]  # the tablet's only
+    del objects[tablet + "/sep1/fd0"]  # its A2DP gone
     audio._check()
     assert len(calls) == 1
-    # Plus One gone without a word: the next one puts it back.
+    # Plus One gone without a word: the next one connects it again.
     devices.BluetoothAudio.restore()
-    assert calls[-1] == ("set-card-profile", "bluez_card.54_DD_4F_07_78_77", "a2dp-source")
+    assert calls[-1] == (tablet, "ConnectProfile", devices.BluetoothAudio.A2DP_SOURCE)
     assert not (tmp_path / "bluetooth-audio.json").exists()

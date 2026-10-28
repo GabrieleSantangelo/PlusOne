@@ -884,12 +884,16 @@ def make_default_sink(name):
 class BluetoothAudio:
     """The tablet's own Bluetooth audio, off while the tablet is this PC's
     speakers (l15): else Android sends the tablet's sound to the PC over
-    A2DP (PipeWire takes it, the PC's default output plays it), the PC
-    plays it back on the tablet, and round. Every CHECK while the speakers
-    are on, its card's profile is "off" (kept in STATE as it was); it goes
-    back when they go, and at the next start after a crash."""
+    A2DP, the PC's default output (the tablet) plays it, and round. Off as
+    Bluetooth goes: BlueZ disconnects the tablet's A2DP source, and Android
+    plays on its own speaker again (PipeWire's card profile "off" was not
+    enough: the A2DP link stayed, Android kept sending on it, and the PC
+    dropped it: nothing heard at all). Every CHECK while the speakers are
+    on; connected again when they go, and at the next start after a crash
+    (STATE)."""
 
     CHECK = 5  # seconds
+    A2DP_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"  # the tablet's role: it sends
     STATE = os.path.join(GLib.get_user_state_dir(), "plus-one", "bluetooth-audio.json")
 
     def __init__(self, tablet_name):
@@ -909,60 +913,75 @@ class BluetoothAudio:
 
     def _check(self):
         name = self.tablet_name()
-        for card in self._cards():
-            props = card.get("properties", {})
-            if not card.get("name", "").startswith("bluez_card.") or props.get("device.description") != name:
+        objects = _bluez_objects()
+        for path, interfaces in objects.items():
+            device = interfaces.get("org.bluez.Device1")
+            if not device or not device.get("Connected") or name not in (device.get("Name"), device.get("Alias")):
                 continue
-            profile = card.get("active_profile")
-            if profile and profile != "off":
-                self._save(card["name"], profile)
-                log(f"speakers: {name}'s own Bluetooth audio off ({profile}): no sound round and round")
-                _pactl("set-card-profile", card["name"], "off")
+            # Its A2DP up: a media transport of the device's.
+            if not any(p.startswith(path + "/") and "org.bluez.MediaTransport1" in i for p, i in objects.items()):
+                continue
+            self._save(path)
+            log(f"speakers: {name}'s own Bluetooth audio disconnected: no sound round and round")
+            _bluez_call(path, "DisconnectProfile", self.A2DP_SOURCE)
         return True
 
     @classmethod
     def restore(cls):
-        """Each profile turned off back as it was (also after a crash)."""
+        """Each A2DP disconnected connected again (also after a crash)."""
         try:
             with open(cls.STATE) as f:
                 saved = json.load(f)
         except (OSError, ValueError):
             return
-        for card, profile in saved.items():
-            if isinstance(card, str) and isinstance(profile, str):
-                _pactl("set-card-profile", card, profile)
-                log(f"speakers: the tablet's Bluetooth audio back ({profile})")
+        for path in saved if isinstance(saved, list) else []:
+            if isinstance(path, str) and path.startswith("/org/bluez/"):
+                _bluez_call(path, "ConnectProfile", cls.A2DP_SOURCE)
+                log("speakers: the tablet's Bluetooth audio connected again")
         try:
             os.remove(cls.STATE)
         except OSError:
             pass
 
-    def _save(self, card, profile):
+    def _save(self, path):
         try:
             with open(self.STATE) as f:
                 saved = json.load(f)
         except (OSError, ValueError):
-            saved = {}
-        saved.setdefault(card, profile)  # as it was first, not "off"
-        os.makedirs(os.path.dirname(self.STATE), exist_ok=True)
-        with open(self.STATE, "w") as f:
-            json.dump(saved, f)
-
-    @staticmethod
-    def _cards():
-        try:
-            out = subprocess.run(["pactl", "-f", "json", "list", "cards"], capture_output=True, text=True,
-                                 timeout=5).stdout
-            return json.loads(out or "[]")
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return []
+            saved = []
+        if not isinstance(saved, list):
+            saved = []
+        if path not in saved:
+            saved.append(path)
+            os.makedirs(os.path.dirname(self.STATE), exist_ok=True)
+            with open(self.STATE, "w") as f:
+                json.dump(saved, f)
 
 
-def _pactl(*args):
+def _bluez_objects():
     try:
-        subprocess.run(["pactl", *args], capture_output=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        return bus.call_sync("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", None,
+                             None, Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+    except GLib.Error:
+        return {}
+
+
+def _bluez_call(path, method, uuid):
+    """Device1.method(uuid), not waited for (connecting takes seconds)."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        bus.call("org.bluez", path, "org.bluez.Device1", method, GLib.Variant("(s)", (uuid,)), None,
+                 Gio.DBusCallFlags.NONE, 20000, None, lambda b, r: _bluez_done(b, r, method), None)
+    except GLib.Error as e:
+        log(f"speakers: Bluetooth {method}: {e.message}")
+
+
+def _bluez_done(bus, result, method):
+    try:
+        bus.call_finish(result)
+    except GLib.Error as e:
+        log(f"speakers: Bluetooth {method}: {e.message}")
 
 
 class Speakers(AudioDevice):

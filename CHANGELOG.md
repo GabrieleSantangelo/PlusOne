@@ -10,8 +10,9 @@
 - **No sound round and round over Bluetooth**: with the PC and the tablet
   connected by Bluetooth, Android sent the tablet's sound to the PC, which
   played it back on the tablet's speakers. While the tablet is this PC's
-  speakers, its own Bluetooth audio is off on the PC, and back as it was
-  when they go (after a crash too).
+  speakers, the PC disconnects the tablet's Bluetooth audio (A2DP), so it
+  plays on its own speaker, and connects it again when they go (after a
+  crash too).
 - **The PC locked, the tablet touches nothing**: while this PC's session
   is locked (or another user's is in front), the tablet's fingers and pen
   reach nothing, whatever touched is let go at once, and the tablet's
