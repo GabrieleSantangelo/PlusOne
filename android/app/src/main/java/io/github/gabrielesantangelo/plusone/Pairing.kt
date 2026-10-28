@@ -23,7 +23,7 @@ import com.google.android.material.R as M
  * accepted, longer each time from the same address, so nobody on the
  * network can keep the screen covered (or wait for a mistaken tap). */
 object Pairing {
-    private class Request(val code: String, val pc: String) {
+    private class Request(val code: String, val pc: String, val from: String) {
         val answered = CountDownLatch(1)
         @Volatile var accepted = false
         @Volatile var updates = true  // the app's updates taken from that PC (PcOptions), unless unticked
@@ -31,6 +31,24 @@ object Pairing {
     }
 
     @Volatile private var current: Request? = null
+
+    /** Until when (elapsedRealtime ms) a PC not paired may ask: the user
+     * opens the window here (MainActivity: "Pair a new PC"), for WINDOW; a
+     * pairing done closes it (PairingPolicy, CC-03). */
+    @Volatile var windowUntil = 0L
+        private set
+
+    fun openWindow() {
+        windowUntil = SystemClock.elapsedRealtime() + WINDOW
+        CompanionService.instance?.let { main.post { it.announce(force = true) } }  // the name and id, for the new PC
+    }
+
+    fun closeWindow() {
+        windowUntil = 0L
+        CompanionService.instance?.let { main.post { it.announce(force = true) } }
+    }
+
+    fun windowOpen() = SystemClock.elapsedRealtime() < windowUntil
     private var quietUntil = 0L  // under this
     private val strikes = HashMap<String, Pair<Int, Long>>()  // address -> (questions not accepted, quiet until)
     private val main = Handler(Looper.getMainLooper())
@@ -39,7 +57,7 @@ object Pairing {
      * minutes at most: whether they accepted; null when no question may be
      * asked now (another is up, or one from there was just not accepted). */
     fun ask(context: Context, pc: String, code: String, from: String, fingerprint: String): Boolean? {
-        val request = Request(code, pc)
+        val request = Request(code, pc, from)
         synchronized(this) {
             val now = SystemClock.elapsedRealtime()
             if (current != null || now < quietUntil || now < (strikes[from]?.second ?: 0L)) return null
@@ -57,6 +75,7 @@ object Pairing {
             current = null
             val now = SystemClock.elapsedRealtime()
             if (accepted) {
+                closeWindow()  // one PC a window
                 strikes.remove(from)
                 PcOptions.setUpdates(context, fingerprint, request.updates)
             } else {
@@ -81,6 +100,9 @@ object Pairing {
     /** The PC's name, while its pairing waits for an answer. */
     fun pending(code: String): String? = current?.takeIf { it.code == code }?.pc
 
+    /** The address it asks from, while it waits. */
+    fun from(code: String): String? = current?.takeIf { it.code == code }?.from
+
     /** The user's answer, or the PC's refusal (which ends the question here too). */
     fun answer(code: String, accepted: Boolean) {
         current?.takeIf { it.code == code }?.let {
@@ -95,6 +117,7 @@ object Pairing {
     }
 
     private const val QUIET = 10_000L  // ms without questions after one was not accepted
+    private const val WINDOW = 120_000L  // ms the pairing window stays open
 }
 
 /** The pairing question, over whatever is on screen. Its own layout: an
@@ -106,6 +129,10 @@ class PairActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)  // the wallpaper's colours, as the app's other screens
         super.onCreate(savedInstanceState)
+        protect(this)
+        // No other app's window over the question (a fake one could cover
+        // the code and pass a tap through to Pair).
+        window.setHideOverlayWindows(true)
         setFinishOnTouchOutside(false)
         val code = intent.getStringExtra(EXTRA_CODE) ?: return finish()
         val pc = Pairing.pending(code) ?: return finish()
@@ -128,7 +155,13 @@ class PairActivity : AppCompatActivity() {
             addView(icon(R.drawable.ic_computer, M.attr.colorSecondary))
             addView(label(getString(R.string.pair_title, pc), M.attr.textAppearanceHeadlineSmall).apply {
                 gravity = Gravity.CENTER
-                setPadding(0, dp(16), 0, dp(16))
+                setPadding(0, dp(16), 0, dp(4))
+            })
+            // Where it asks from: a name anyone can choose, an address less so.
+            addView(label(getString(R.string.pair_from, Pairing.from(code) ?: "?"), M.attr.textAppearanceBodySmall,
+                M.attr.colorOnSurfaceVariant).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(16))
             })
             addView(label(getString(R.string.pair_compare), M.attr.textAppearanceBodyMedium,
                 M.attr.colorOnSurfaceVariant))
@@ -153,13 +186,21 @@ class PairActivity : AppCompatActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.END
                 addView(button(getString(R.string.cancel), Look.TEXT) { answer(false) })
-                val yes = button(getString(R.string.pair), Look.FILLED) { answer(true) }.apply { isEnabled = false }
+                val yes = button(getString(R.string.pair), Look.FILLED) { answer(true) }.apply {
+                    isEnabled = false
+                    filterTouchesWhenObscured = true  // not a tap through something over it
+                }
                 pair = yes
                 addView(yes, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         })
         window.setLayout(minOf(resources.displayMetrics.widthPixels - dp(48), dp(400)), ViewGroup.LayoutParams.WRAP_CONTENT)
+        // The code and the buttons only for accessibility tools the user
+        // chose as such, not for any app with an accessibility service.
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            window.decorView.setAccessibilityDataSensitive(android.view.View.ACCESSIBILITY_DATA_SENSITIVE_YES)
+        }
     }
 
     /** A tap meant for what was under the question when it opened is not a
@@ -176,6 +217,19 @@ class PairActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_CODE = "code"
         const val ARM_DELAY = 800L  // ms
+    }
+}
+
+/** Stop on the notification that a PC uses the camera or the microphone. */
+class CaptureStopReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val kind = intent.getStringExtra(EXTRA_KIND) ?: return
+        CompanionService.instance?.stopCaptures(kind)
+        Notifications.cancelInUse(context, kind)
+    }
+
+    companion object {
+        const val EXTRA_KIND = "kind"
     }
 }
 

@@ -34,9 +34,28 @@ class CompanionService : Service(), LinkServer.Host {
     var link: io.github.gabrielesantangelo.plusone.link.LinkCore? = null
         private set
     private var linkAnnouncer: MdnsAnnouncer? = null
+    /** Both links' announcers: announced again as their tags change (announce()). */
+    private val announcers = java.util.concurrent.CopyOnWriteArrayList<MdnsAnnouncer>()
+    private var announced: Pair<Long, Boolean>? = null  // the tags' epoch, pairing open: as last announced
     private var bluetooth: BtListener? = null
     private val pairedChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         link?.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
+        announce(force = true)
+    }
+
+    /** The announcements again when what they say changed: a quarter of an
+     * hour turned (the tags), pairing opened or shut, a PC paired or
+     * forgotten (force). Every ANNOUNCE_CHECK, and when told. */
+    fun announce(force: Boolean = false) {
+        val now = io.github.gabrielesantangelo.plusone.link.Tags.epoch() to Pairing.windowOpen()
+        if (!force && now == announced) return
+        announced = now
+        for (announcer in announcers) announcer.refresh()
+    }
+
+    private fun announceCheck() {
+        announce()
+        handler.postDelayed(::announceCheck, ANNOUNCE_CHECK)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -69,9 +88,11 @@ class CompanionService : Service(), LinkServer.Host {
             host = this,
             // How the PCs reach the app, and learn where: another way is one more here.
             listeners = listOf(TcpListener()),
-            announcers = listOf(MdnsAnnouncer(this))).also { it.start() }
+            announcers = listOf(MdnsAnnouncer(this, pairing = Pairing::windowOpen).also { announcers += it }))
+            .also { it.start() }
         startLink(sign, update)
         handler.postDelayed(::idleCheck, IDLE_CHECK)
+        handler.postDelayed(::announceCheck, ANNOUNCE_CHECK)
     }
 
     /** The link's core: listening, announced, the paired PCs trusted; "echo"
@@ -114,8 +135,9 @@ class CompanionService : Service(), LinkServer.Host {
                 val port = try { core.listen(LINK_PORT) } catch (e: java.io.IOException) { core.listen() }
                 val id = io.github.gabrielesantangelo.plusone.link.Identity.fingerprint(
                     io.github.gabrielesantangelo.plusone.link.Identity.certificate.encoded)
-                linkAnnouncer = MdnsAnnouncer(this, io.github.gabrielesantangelo.plusone.link.LinkCore.SERVICE_TYPE)
-                    .also { it.announce("tcp", port, id, deviceName(this), appVersion()) }
+                linkAnnouncer = MdnsAnnouncer(this, io.github.gabrielesantangelo.plusone.link.LinkCore.SERVICE_TYPE,
+                    pairing = Pairing::windowOpen)
+                    .also { announcers += it; it.announce("tcp", port, id, deviceName(this), appVersion()) }
                 Log.i(TAG, "link: listening on $port")
             } catch (e: Exception) {
                 Log.w(TAG, "link: cannot listen: $e")
@@ -170,6 +192,8 @@ class CompanionService : Service(), LinkServer.Host {
     override fun askPairing(pc: String, code: String, from: String, fingerprint: String): Boolean? =
         Pairing.ask(this, pc, code, from, fingerprint)
 
+    override fun pairingWindowUntil(): Long = Pairing.windowUntil
+
     override fun pairingWithdrawn(code: String) = Pairing.answer(code, false)
 
     override fun connected(delta: Int) {
@@ -208,7 +232,7 @@ class CompanionService : Service(), LinkServer.Host {
 
     // -- what the PCs use now ------------------------------------------------------
     /** A session a PC holds: what (camera, microphone, speakers), on which link. */
-    class Session(val kind: String, val link: Link)
+    class Session(val kind: String, val link: Link, val use: String = "")
 
     private val sessions = mutableMapOf<Any, Session>()  // by its owner (a capture, a playback)
 
@@ -234,8 +258,11 @@ class CompanionService : Service(), LinkServer.Host {
     /** The user took the device back from the PC (MainActivity): its
      * sessions end, and the service lets go of it. */
     fun stopCaptures(kind: String) {
-        val links = synchronized(sessions) { sessions.values.filter { it.kind == kind }.map { it.link } }
-        links.forEach { it.close() }
+        val stopping = synchronized(sessions) { sessions.values.filter { it.kind == kind } }
+        for (session in stopping) {
+            CaptureHandler.stop(kind, session.link.fingerprint, session.use)  // not again for this use
+            session.link.close()
+        }
         if (kind != "speakers" && allowedTypes(kind)) {
             types = types and typeOf(kind).inv()
             showForeground()
@@ -342,6 +369,7 @@ class CompanionService : Service(), LinkServer.Host {
         const val TAG = io.github.gabrielesantangelo.plusone.link.TAG
         const val ELEVATE_WAIT = 5_000L        // ms for CaptureActivity to bring the app in front
         const val IDLE_CHECK = 60_000L         // ms
+        const val ANNOUNCE_CHECK = 15_000L     // ms: a pairing window shut by its time is said this soon
         const val IDLE_STOP = 10 * 60_000L     // ms without a PC when not always ready
 
         fun deviceName(context: Context): String =

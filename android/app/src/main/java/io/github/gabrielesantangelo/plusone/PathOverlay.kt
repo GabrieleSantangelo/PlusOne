@@ -104,7 +104,10 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     private fun setPill(path: String?, bright: Boolean) {
         shown = path
         pillIcon.setImageResource(LinkStatus.icon(path))
-        pillText.text = LinkStatus.name(context, path)
+        // Whose screen this is, always (SEC-30): a picture from the PC could
+        // look like Android's own, its lock screen say; this pill is the
+        // app's, above it, and the stream cannot cover it.
+        pillText.text = context.getString(R.string.display_marker, LinkStatus.name(context, path))
         pill.animate().cancel()
         if (bright) {
             pill.alpha = 1f

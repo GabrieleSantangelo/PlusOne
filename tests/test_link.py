@@ -93,9 +93,10 @@ class FakeApp:
     """The tablet's app as far as the protocol goes (LinkServer.kt):
     each connection runs one of the scripts given, in order."""
 
-    def __init__(self, tmp_path, scripts, version=link.PROTOCOL, paired=True, at=None):
+    def __init__(self, tmp_path, scripts, version=link.PROTOCOL, paired=True, at=None, window=True):
         self.cert, self.key, self.der = link.identity(str(tmp_path / "app"))
         self.scripts, self.version, self.paired, self.at = list(scripts), version, paired, at
+        self.window = window  # the user holds its pairing window open (PairingPolicy.kt)
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(4)
@@ -114,6 +115,10 @@ class FakeApp:
                 with context.wrap_socket(raw, server_side=True) as sock:
                     wire = link.Wire(sock)
                     hello, _ = receive(wire)
+                    if not self.paired and not (hello.get("pair") and self.window):
+                        # A PC it does not know, the window shut: only that, nothing of itself.
+                        wire.send({"type": "hello", "version": self.version, "paired": False, "pairing": "closed"})
+                        continue
                     wire.send({"type": "hello", "name": "Tab", "version": self.version, "paired": self.paired,
                                "at": self.at or sock.getsockname()[0]})
                     if not (self.paired and hello["paired"]) and self.version == link.PROTOCOL:
@@ -304,6 +309,15 @@ def test_an_impostor_at_a_paired_tablets_address(tmp_path, pc):
     expect = link.fingerprint(real.der)[:16]
     result = sign_jobs.sign([impostor.target, real.target], path, paired=paired, expect=expect)
     assert result == {"pages": []}
+
+
+def test_a_tablet_pairs_only_while_its_window_is_open(tmp_path, pc):
+    _path, paired = pc
+    app = FakeApp(tmp_path, [lambda wire: None], paired=False, window=False)
+    asked = []
+    with pytest.raises(link.PairingClosed):
+        link.pair([app.target], lambda name, code: asked.append(code) or True, paired=paired)
+    assert asked == [] and app.codes == [] and not paired.all()  # no question on either screen
 
 
 def test_signing_never_pairs(tmp_path, pc):

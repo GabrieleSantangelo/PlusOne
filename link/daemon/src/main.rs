@@ -65,6 +65,8 @@ const IDLE: Duration = Duration::from_secs(60);
 struct Daemon {
     node: Node,
     config: PathBuf,
+    /// This PC's fingerprint: the tags the apps announce are for it (mdns::tag).
+    ours: String,
     /// Where each tablet was last reached: {id: "IP:PORT"}.
     state: PathBuf,
     finding: Mutex<()>,
@@ -180,9 +182,10 @@ impl Daemon {
         if let Some(session) = self.node.session(device).filter(|s| !s.is_closed() && s.path().is_some()) {
             return Ok(session);  // reached while this waited
         }
-        let id = device.to_owned();
+        let (id, ours) = (device.to_owned(), self.ours.clone());
         let looking = std::thread::spawn(move || {
-            let mine = |f: &plusone_link::mdns::Found| f.txt.get("id").is_some_and(|i| i.len() >= 8 && id.starts_with(i.as_str()));
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let mine = |f: &plusone_link::mdns::Found| plusone_link::mdns::announces(f, &id, &ours, now);
             plusone_link::mdns::browse(SERVICE, Duration::from_secs(3), mine).map_err(|e| e.to_string())
                 .and_then(|all| all.into_iter().find(|f| mine(f)).map(|f| f.address).ok_or_else(|| "not found nearby".to_owned()))
         });
@@ -466,7 +469,8 @@ fn main() {
         let base = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{home}/.local/state"));
         format!("{base}/plus-one/link.json")
     }));
-    let daemon = Arc::new(Daemon { node: node.clone(), config, state, finding: Mutex::default(), usb: usb::Watcher::new(),
+    let daemon = Arc::new(Daemon { node: node.clone(), config, ours: identity.fingerprint(), state, finding: Mutex::default(),
+                                   usb: usb::Watcher::new(),
                                    switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(),
                                    serial: AtomicU64::new(0) });
     let cable = daemon.clone();

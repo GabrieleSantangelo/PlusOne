@@ -569,6 +569,9 @@ class AppStreamer:
         self.on_error = on_error or (lambda message: None)
         self.input = input
         self.shown = True
+        # seat.py: closed, the app's input reaches nothing (and what touches
+        # is let go); inactive, nothing is captured either.
+        self.gated, self.active, self._let_go = False, True, False
         if source == "test":
             video = (f"videotestsrc is-live=true pattern=ball ! "
                      f"video/x-raw,format={media.CAPTURE_FORMAT},width={width},height={height},"
@@ -686,12 +689,17 @@ class AppStreamer:
             # first finger waits 80 ms at most for a second); else seldom.
             busy = self.input is not None and self.input.busy()
             body = self.channel.receive(0.02 if busy else IDLE_WAIT)
+            if self.gated and self.input and not self._let_go:
+                self.input.close()  # whatever touches, let go (within 20 ms while it touched)
+            self._let_go = self.gated
             if self.input:
                 self.input.check()
             if not body:
                 continue
             kind = body[0]
             if kind == INPUT:
+                if self.gated:
+                    continue  # dropped, not queued
                 if self.input and not self.input.packet(body):
                     log("app display: a malformed input packet")
             elif kind == KEYFRAME:
@@ -727,10 +735,22 @@ class AppStreamer:
         self.shown = shown
         if not shown and self.input:
             self.input.close()  # nothing left touching
-        self.pipeline.set_state(Gst.State.PLAYING if shown else Gst.State.PAUSED)
+        self.pipeline.set_state(Gst.State.PLAYING if shown and self.active else Gst.State.PAUSED)
         if shown:
             self.force_keyframe()
         self.on_visible(shown)
+
+    def gate(self, closed, active=True):
+        """The desktop may not be touched now (seat.py): the app's input is
+        dropped, not queued, and the listening thread lets go of whatever
+        touches; inactive (another user's session in front), nothing is
+        captured either."""
+        self.gated = closed
+        if active != self.active:
+            self.active = active
+            self.pipeline.set_state(Gst.State.PLAYING if self.shown and active else Gst.State.PAUSED)
+            if active and self.shown:
+                self.force_keyframe()
 
     def force_keyframe(self):
         # Not again before the last one can have come: a round trip, and its
@@ -777,11 +797,19 @@ class AppDisplay:
         self.channel = self.monitor = self.streamer = self.link = None
         self.tablet_size = None  # what the app said its screen is
         self.started = False
+        self.gated, self.seat_active = False, True  # seat.py's, for the streamer
         self._reports = 0
         self._stopped = threading.Event()
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
+
+    def gate(self, closed, active=True):
+        """On the main loop: seat.py's say (AppStreamer.gate), now and for
+        a streamer made later."""
+        self.gated, self.seat_active = closed, active
+        if self.streamer is not None:
+            self.streamer.gate(closed, active)
 
     def stop(self):
         """On the main loop: everything ends now; the app is told by the
@@ -919,6 +947,7 @@ class AppDisplay:
                                         on_visible=lambda shown: GLib.idle_add(once(self.on_paused, not shown)),
                                         preview=self.preview,
                                         on_error=lambda message: self._ended(RuntimeError(message)))
+            self.streamer.gate(self.gated, self.seat_active)
             self.streamer.start()
         except Exception as e:  # noqa: BLE001 - said, not left half-started
             self._ended(e)

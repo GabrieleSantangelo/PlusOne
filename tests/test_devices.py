@@ -104,6 +104,9 @@ class FakeApp:
     def devices_changed(self):
         self.changes += 1
 
+    def notify(self, key, title, body, button=None, **args):
+        self.notes = getattr(self, "notes", []) + [title]
+
 
 class Probe(devices.Device):
     def __init__(self, app):
@@ -211,7 +214,9 @@ def test_the_feed_offers_and_hangs_up(monkeypatch):
                         lambda reason: None)
     feed.start()
     assert spin(lambda: ready)
-    assert wire.sent == [{"type": "microphone", "sdp": "v=0 offer"}] and receivers[0].answered == "v=0 answer"
+    use = wire.sent[0]["use"]  # one use: what the tablet's Stop holds until the next
+    assert len(use) == 8 and use != devices.Feed({"type": "microphone"}, None, None, None, None).request["use"]
+    assert wire.sent == [{"type": "microphone", "use": use, "sdp": "v=0 offer"}] and receivers[0].answered == "v=0 answer"
     assert opened == [([("10.0.0.2", 47236)], "a1b2")]
     feed.stop()
     feed._thread.join(5)

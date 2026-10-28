@@ -93,9 +93,10 @@ object Notifications {
 
     /** A PC wants the camera or the microphone, which the user did not let
      * PCs have (or Android did not): Allow, from where the user is. */
-    fun askDevice(context: Context, kind: String, pc: String) {
+    fun askDevice(context: Context, kind: String, pc: String, fingerprint: String) {
         val allow = PendingIntent.getActivity(context, deviceId(kind),
             Intent(context, AllowActivity::class.java).putExtra(AllowActivity.EXTRA_KIND, kind)
+                .putExtra(AllowActivity.EXTRA_PC, fingerprint)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val camera = kind == MainActivity.CAMERA
@@ -118,6 +119,29 @@ object Notifications {
 
     fun cancelDevice(context: Context, kind: String) =
         context.getSystemService(NotificationManager::class.java).cancel(deviceId(kind))
+
+    /** Each time a PC turns the camera or the microphone on: said at the
+     * top of the screen, with Stop (CC-04; the service's own notification
+     * stays quiet). */
+    fun inUse(context: Context, kind: String, pc: String) {
+        val stop = PendingIntent.getBroadcast(context, inUseId(kind),
+            Intent(context, CaptureStopReceiver::class.java).putExtra(CaptureStopReceiver.EXTRA_KIND, kind),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val camera = kind == MainActivity.CAMERA
+        val notification = Notification.Builder(context, ASK)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(context.getString(if (camera) R.string.in_use_camera else R.string.in_use_microphone, pc))
+            .addAction(Notification.Action.Builder(null, context.getString(R.string.display_stop), stop).build())
+            .setGroup("in-use-$kind")
+            .setOngoing(true)
+            .build()
+        context.getSystemService(NotificationManager::class.java).notify(inUseId(kind), notification)
+    }
+
+    fun cancelInUse(context: Context, kind: String) =
+        context.getSystemService(NotificationManager::class.java).cancel(inUseId(kind))
+
+    private fun inUseId(kind: String) = if (kind == MainActivity.CAMERA) 2011 else 2012
 
     private fun deviceId(kind: String) = if (kind == MainActivity.CAMERA) 2001 else 2002
 

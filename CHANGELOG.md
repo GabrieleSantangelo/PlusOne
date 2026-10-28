@@ -2,6 +2,40 @@
 
 ## Unreleased (1.0)
 
+- **The PC locked, the tablet touches nothing**: while this PC's session
+  is locked (or another user's is in front), the tablet's fingers and pen
+  reach nothing, whatever touched is let go at once, and the tablet's
+  camera and microphone pause ("Paused while this PC is locked"); all
+  goes on when it opens again. A tablet left about could tap at the lock
+  screen before.
+- **A new PC pairs only when you let it**: on the tablet, Plus One → Pair
+  a new PC opens pairing for two minutes (one PC); otherwise a PC the
+  tablet does not know learns nothing of it, and no pairing question
+  comes up. The question hides other apps' windows over it, takes no tap
+  through them, and says the PC's address under its name.
+- **The camera and the microphone, PC by PC**: a yes on the tablet lets
+  only the PC that asked; each PC's options on the tablet take it back. A
+  yes given before for all PCs is asked again, PC by PC. Each time a PC
+  turns one on, the tablet says so at the top of its screen, with Stop,
+  and the PC says which program did.
+- **The PC's screen, a signature and a pairing code stay out of
+  screenshots**, screen recordings, casting and Recents on the tablet; a
+  small pill on the desktop says it is the PC's screen.
+- **The tablet is no longer known on the network**: its app announced its
+  name, version and id to everyone; now a name of no one and a tag per
+  paired PC, which only that PC recognises and which changes every
+  quarter of an hour (its name only while you open pairing on it). An
+  older Plus One on a PC finds the tablet where it last reached it, not
+  by its announcement: update both.
+- **One host on the network can no longer keep the PC out**: at most two
+  handshakes at once from one address, and new ones at a rate, on the
+  link and on the app's listener.
+- **The desktop keeps its quality on a phone's hotspot**: a lost packet or
+  a still screen no longer takes the picture down to a few Mbit/s; on the
+  link's QUIC paths the picture follows the link's congestion controller.
+- **Post-quantum key exchange**: the link's TLS uses the hybrid
+  X25519MLKEM768 between this PC and the app (X25519 with a version from
+  before).
 - **Signing by cable**: a PDF to sign goes over the link too (plus-one-link),
   so the cable alone is enough; so does the tablet's app update.
 - **A signed answer is bound to its PDF**: the tablet says the SHA-256 of

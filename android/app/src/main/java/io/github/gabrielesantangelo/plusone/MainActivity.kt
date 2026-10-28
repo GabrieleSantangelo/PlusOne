@@ -171,14 +171,14 @@ class MainActivity : AppCompatActivity() {
         ))
 
         val paired = Paired.all(this)
-        section(R.string.heading_paired, if (paired.isEmpty()) {
+        section(R.string.heading_paired, (if (paired.isEmpty()) {
             listOf(Row(row(R.drawable.ic_computer, getString(R.string.paired_none_title), getString(R.string.paired_none))))
         } else paired.map { (fingerprint, name) ->
             Row(row(R.drawable.ic_computer, name, pcAllows(fingerprint),
                 iconButton(R.drawable.ic_forget, R.string.forget) { askForget(fingerprint, name) })) {
                 pcOptions(fingerprint, name)
             }
-        })
+        }) + pairNew())
 
         val version = packageManager.getPackageInfo(packageName, 0).versionName
         content.addView(label(getString(R.string.version, version), M.attr.textAppearanceBodySmall,
@@ -186,6 +186,22 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
             setPadding(0, dp(32), 0, 0)
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    }
+
+    /** A new PC pairs only while the user holds this open, two minutes at
+     * most (Pairing.windowUntil): no one else on the network can put the
+     * question on the screen. */
+    private fun pairNew(): Row {
+        val open = Pairing.windowOpen()
+        return Row(row(R.drawable.ic_computer, getString(R.string.pair_new),
+            if (open) getString(R.string.pair_new_open, CompanionService.deviceName(this)) else getString(R.string.pair_new_hint),
+            button(getString(if (open) R.string.pair_new_stop else R.string.pair_new_start), Look.TONAL) {
+                if (Pairing.windowOpen()) Pairing.closeWindow() else {
+                    Pairing.openWindow()
+                    content.postDelayed({ if (!isFinishing) refresh() }, Pairing.windowUntil - android.os.SystemClock.elapsedRealtime() + 100)
+                }
+                refresh()
+            }))
     }
 
     /** Ready, and how the PC finds this tablet: the app's whole job in a card. */
@@ -354,19 +370,25 @@ class MainActivity : AppCompatActivity() {
     /** What this PC may do, in a line: what is on, or a hint that there is a choice. */
     private fun pcAllows(fingerprint: String): String =
         listOfNotNull(getString(R.string.pc_updates_app).takeIf { PcOptions.updates(this, fingerprint) },
-            getString(R.string.pc_shares_signatures).takeIf { PcOptions.shareSignatures(this, fingerprint) })
+            getString(R.string.pc_shares_signatures).takeIf { PcOptions.shareSignatures(this, fingerprint) },
+            getString(R.string.pc_uses_camera).takeIf { PcOptions.device(this, fingerprint, CAMERA) },
+            getString(R.string.pc_uses_microphone).takeIf { PcOptions.device(this, fingerprint, MICROPHONE) })
             .joinToString(" · ").ifEmpty { getString(R.string.pc_options_hint) }
 
     /** The choices for one PC alone. */
     private fun pcOptions(fingerprint: String, name: String) {
-        val items = arrayOf(getString(R.string.pc_update_app), getString(R.string.pc_share_signatures))
-        val checked = booleanArrayOf(PcOptions.updates(this, fingerprint), PcOptions.shareSignatures(this, fingerprint))
+        val items = arrayOf(getString(R.string.pc_update_app), getString(R.string.pc_share_signatures),
+            getString(R.string.pc_use_camera), getString(R.string.pc_use_microphone))
+        val checked = booleanArrayOf(PcOptions.updates(this, fingerprint), PcOptions.shareSignatures(this, fingerprint),
+            PcOptions.device(this, fingerprint, CAMERA), PcOptions.device(this, fingerprint, MICROPHONE))
         MaterialAlertDialogBuilder(this)
             .setTitle(name)
             .setMultiChoiceItems(items, checked) { _, which, on ->
                 when (which) {
                     0 -> PcOptions.setUpdates(this, fingerprint, on)
                     1 -> PcOptions.setShareSignatures(this, fingerprint, on)
+                    2 -> PcOptions.setDevice(this, fingerprint, CAMERA, on)
+                    3 -> PcOptions.setDevice(this, fingerprint, MICROPHONE, on)
                 }
             }
             .setPositiveButton(R.string.done) { _, _ -> }

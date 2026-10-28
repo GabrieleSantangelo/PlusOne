@@ -91,6 +91,7 @@ class SignActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        protect(this)
         val first = Jobs.get(savedInstanceState?.getString(STATE_JOB))
             ?: Jobs.get(intent.getStringExtra(EXTRA_JOB))
             ?: Jobs.waiting().firstOrNull()

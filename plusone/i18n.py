@@ -221,6 +221,13 @@ _IT = {
     "A program uses the microphone, but the tablet is not reachable":
         "Un programma usa il microfono, ma il tablet non è raggiungibile",
     "Not allowed on the tablet: Plus One → For the PC": "Non consentito sul tablet: Plus One → Per il PC",
+    "Paused while this PC is locked": "In pausa mentre questo PC è bloccato",
+    "Stopped on the tablet: on again when a program takes it anew":
+        "Interrotto sul tablet: riparte quando un programma lo riprende",
+    "A program uses the tablet's camera": "Un programma usa la fotocamera del tablet",
+    "A program uses the tablet's microphone": "Un programma usa il microfono del tablet",
+    "On the tablet, open Plus One and tap “Pair a new PC”, then try again":
+        "Sul tablet apri Plus One e tocca «Abbina un nuovo PC», poi riprova",
     "On the tablet, allow Plus One to use the camera": "Sul tablet, consenti a Plus One di usare la fotocamera",
     "On the tablet, allow Plus One to use the microphone": "Sul tablet, consenti a Plus One di usare il microfono",
     "On the tablet, let Plus One display over other apps":

@@ -39,6 +39,11 @@ class PairingRefused(Exception):
     pass
 
 
+class PairingClosed(PairingRefused):
+    """The tablet takes a new PC only while its user holds its pairing
+    window open (Plus One → Pair a new PC); it was shut."""
+
+
 class Impostor(PairingRefused):
     """At an address announced for a paired tablet, an app with another
     certificate: someone answering mDNS for it. Never paired with."""
@@ -161,6 +166,8 @@ def _handshake(target, paired, ask_pairing, expect=None, timeout=CONNECT_TIMEOUT
         wire.send({"type": "hello", "name": socket.gethostname(), "version": PROTOCOL, "paired": known,
                    "pair": ask_pairing is not None})
         hello = small()
+        if hello.get("pairing") == "closed" and ask_pairing is not None:
+            raise PairingClosed("the tablet's pairing window is shut")
         name = str(hello.get("name") or "tablet")[:MAX_NAME]
         if hello.get("version") != PROTOCOL:
             if not any_version:

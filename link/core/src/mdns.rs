@@ -16,6 +16,44 @@ const TXT: u16 = 16;
 const SRV: u16 = 33;
 const A: u16 = 1;
 
+/// What the app announces instead of its id (SEC-15; plusone/link/tags.py,
+/// Tags.kt): a tag per paired PC ("t"), only that PC recognises, a quarter
+/// of an hour at a time:
+///     tag = SHA-256(app's fingerprint ‖ PC's fingerprint ‖ epoch, 8 bytes BE)[:8]
+///     epoch = Unix time / TAG_EPOCH
+pub const TAG_EPOCH: u64 = 900;
+
+/// The tag (16 hex digits) of the app and the PC (fingerprints in hex) for epoch.
+pub fn tag(app: &str, pc: &str, epoch: u64) -> Option<String> {
+    let bytes = |hex: &str| (0..hex.len() / 2).map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>();
+    let mut data = bytes(app)?;
+    data.extend(bytes(pc)?);
+    data.extend(epoch.to_be_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &data);
+    Some(digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether an announcement is the app's, for this PC, now (a quarter of an
+/// hour either way: the two clocks need not agree); an app from before
+/// tags says its id.
+pub fn announces(found: &Found, app: &str, pc: &str, now: u64) -> bool {
+    match found.txt.get("t") {
+        Some(tags) => {
+            let epoch = now / TAG_EPOCH;
+            let tags: Vec<&str> = tags.split(',').collect();
+            [epoch.saturating_sub(1), epoch, epoch + 1].iter()
+                .any(|e| tag(app, pc, *e).is_some_and(|t| tags.contains(&t.as_str())))
+                || found.txt.get("pair").is_some_and(|p| p == "1") && id_matches(found, app)
+        }
+        None => id_matches(found, app),
+    }
+}
+
+fn id_matches(found: &Found, app: &str) -> bool {
+    found.txt.get("id").is_some_and(|i| i.len() >= 8 && app.starts_with(i.as_str()))
+}
+
 /// A service found: its instance's name, where it listens, its TXT record.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Found {
@@ -280,6 +318,22 @@ mod tests {
         assert_eq!(found[0].address, "10.0.0.7:43331".parse().unwrap());
         assert_eq!(found[0].txt["id"], "6a2665bcebe1984c");
         assert_eq!(found[0].txt["v"], "910");
+    }
+
+    #[test]
+    fn the_shared_tag_vector() {  // as plusone/link/tags.py's and Tags.kt's tests
+        let (app, pc) = ("aa".repeat(32), "bb".repeat(32));
+        assert_eq!(tag(&app, &pc, 2_000_000).as_deref(), Some("19ab5569a757519b"));
+        assert_eq!(tag(&app, &pc, 2_000_001).as_deref(), Some("c2cc4faea63bb065"));
+        let found = |txt: &[(&str, &str)]| Found {
+            instance: "Plus One 1a2b".into(), address: "10.0.0.2:47101".parse().unwrap(),
+            txt: txt.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        };
+        let now = 2_000_000 * TAG_EPOCH + 5;
+        assert!(announces(&found(&[("t", "0123456789abcdef,c2cc4faea63bb065")]), &app, &pc, now));
+        assert!(!announces(&found(&[("t", "0123456789abcdef")]), &app, &pc, now));
+        assert!(!announces(&found(&[("t", ""), ("id", "aaaaaaaaaaaaaaaa")]), &app, &pc, now));  // an id alone, no pairing
+        assert!(announces(&found(&[("id", "aaaaaaaaaaaaaaaa")]), &app, &pc, now));  // an app from before tags
     }
 
     #[test]

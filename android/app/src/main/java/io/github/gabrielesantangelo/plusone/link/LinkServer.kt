@@ -53,6 +53,9 @@ class LinkServer(
          * the address from, its fingerprint fingerprint): null when no
          * question may be asked now. */
         fun askPairing(pc: String, code: String, from: String, fingerprint: String): Boolean?
+        /** Until when (elapsedRealtime ms) a PC not paired may ask to pair:
+         * the window the user opens here (PairingPolicy). */
+        fun pairingWindowUntil(): Long
         /** The PC withdrew the question (said no there, or went). */
         fun pairingWithdrawn(code: String)
         /** A PC connected (+1) or went (-1): for when the app may rest. */
@@ -65,6 +68,7 @@ class LinkServer(
     private val connections = ThreadPoolExecutor(0, MAX_CONNECTIONS, 60, TimeUnit.SECONDS, SynchronousQueue())
     private val unpaired = AtomicInteger()     // connections not yet known to be a paired PC
     private val handshaking = AtomicInteger()  // connections still in their TLS handshake
+    private val gate = HandshakeGate()  // and how many from each address, how often
     private val links = ConcurrentHashMap<String, MutableSet<Link>>()  // each paired PC's open links
 
     fun start() {
@@ -96,24 +100,37 @@ class LinkServer(
     }
 
     private fun accepted(client: SSLSocket) {
-        // Connections not through TLS yet, few at a time: strangers that
-        // never finish their handshake cannot take every thread from a paired PC.
+        // Connections not through TLS yet, few at a time, and few from one
+        // address: strangers that never finish their handshake cannot take
+        // every thread from a paired PC.
+        val from = client.inetAddress?.hostAddress ?: ""
+        if (!gate.start(from)) {
+            runCatching { client.close() }
+            return
+        }
         if (handshaking.incrementAndGet() > MAX_HANDSHAKING) {
-            handshaking.decrementAndGet()
+            shaken(from)
             runCatching { client.close() }
             return
         }
         try {
             connections.execute { handle(client) }
         } catch (e: RejectedExecutionException) {
-            handshaking.decrementAndGet()
+            shaken(from)
             runCatching { client.close() }
         }
+    }
+
+    /** A handshake over (through, failed or turned away): its slot back. */
+    private fun shaken(from: String) {
+        handshaking.decrementAndGet()
+        gate.done(from)
     }
 
     /** One PC: hello, pairing if either side does not know the other and the
      * PC asks to pair (its user chose this tablet), then its requests. */
     private fun handle(socket: SSLSocket) {
+        val from = socket.inetAddress?.hostAddress ?: ""
         host.connected(1)
         var link: Link? = null
         var stranger = false  // counted in unpaired: not (yet) a paired PC
@@ -127,7 +144,7 @@ class LinkServer(
                 val guard = Wire.WATCHDOG.schedule({ socket.close() }, HANDSHAKE_DEADLINE, TimeUnit.MILLISECONDS)
                 socket.soTimeout = HANDSHAKE_TIMEOUT
                 socket.startHandshake()
-                handshaking.decrementAndGet()
+                shaken(from)
                 shaking = false
                 val pc = socket.session.peerCertificates[0].encoded
                 val fingerprint = Identity.fingerprint(pc)
@@ -140,6 +157,14 @@ class LinkServer(
                 val hello = wire.receive(Wire.UNPAIRED_HEADER)
                 require(hello.optString("type") == "hello") { "expected hello" }
                 val pcName = readable(hello.optString("name"))
+                if (!PairingPolicy.allowed(android.os.SystemClock.elapsedRealtime(), host.pairingWindowUntil(), known,
+                        hello.optBoolean("pair"))) {
+                    // Not known here, and the pairing window shut: told only
+                    // that, nothing of this tablet (no name, app or address).
+                    wire.send(JSONObject().put("type", "hello").put("version", PROTOCOL).put("paired", false)
+                        .put("pairing", "closed"))
+                    return
+                }
                 // "at": the address the PC reached, so it can tell this
                 // tablet answered itself, not through someone passing the
                 // connection on.
@@ -176,7 +201,7 @@ class LinkServer(
             // stack, and an uncaught Error on a pool thread ends the process.
             Log.i(TAG, "connection ended: $e")
         } finally {
-            if (shaking) handshaking.decrementAndGet()
+            if (shaking) shaken(from)
             if (stranger) unpaired.decrementAndGet()
             link?.let { links[it.fingerprint]?.remove(it) }
             host.connected(-1)

@@ -23,12 +23,13 @@ The primitives:
 from .datagrams import Datagrams
 from .discovery import Discovery
 from .link import (APP_PORT, IO_TIMEOUT, KEEPALIVE, LINK_TIMEOUT, PAIRING_TIMEOUT, PROTOCOL, Impostor,
-                   Incompatible, Link, PairingRefused, Refused, connect, pair)
+                   Incompatible, Link, PairingClosed, PairingRefused, Refused, connect, pair)
 from .nearby import Nearby
 from .tablets import Tablet, Tablets
 from .trust import MAX_NAME, Paired, fingerprint, identity
 from .wire import MAX_HEADER, UNPAIRED_HEADER, Wire
 
 __all__ = ["APP_PORT", "Datagrams", "Discovery", "IO_TIMEOUT", "Impostor", "Incompatible", "KEEPALIVE", "LINK_TIMEOUT",
-           "Link", "MAX_HEADER", "MAX_NAME", "Nearby", "PAIRING_TIMEOUT", "PROTOCOL", "Paired", "PairingRefused",
+           "Link", "MAX_HEADER", "MAX_NAME", "Nearby", "PAIRING_TIMEOUT", "PROTOCOL", "Paired", "PairingClosed",
+           "PairingRefused",
            "Refused", "Tablet", "Tablets", "UNPAIRED_HEADER", "Wire", "connect", "fingerprint", "identity", "pair"]

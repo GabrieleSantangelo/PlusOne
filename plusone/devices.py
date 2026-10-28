@@ -14,6 +14,7 @@ import glob
 import itertools
 import json
 import os
+import secrets
 import shutil
 import struct
 import subprocess
@@ -130,7 +131,9 @@ class Feed:
     "off", "permission", "background", "unavailable", "away")."""
 
     def __init__(self, request, where, receiver, on_ready, on_problem):
-        self.request = request
+        # One use (a program took the device): what the tablet's Stop holds
+        # until the next (CaptureHandler.kt), whatever the requests again.
+        self.request = dict(request, use=secrets.token_hex(4))
         self.where = where  # () -> (addresses, app id) of the tablet in use, or None
         self.receiver, self.on_ready, self.on_problem = receiver, on_ready, on_problem
         self._wanted = threading.Event()
@@ -195,7 +198,7 @@ class Feed:
             log(f"{kind}: the tablet said no ({e})")
             self.on_problem(str(e))
             # Turned off or not allowed there: the user has to act; else soon.
-            return REFUSED_RETRY if str(e) in ("off", "permission") else RETRY
+            return REFUSED_RETRY if str(e) in ("off", "permission", "stopped") else RETRY
         except link.PairingRefused as e:
             # The tablet forgot this PC (or is another): pairing again is the user's.
             log(f"{kind}: the tablet does not know this PC ({e})")
@@ -358,6 +361,7 @@ class Device:
         self.users = []  # the programs using it, by name, for the window
         self._in_use = False
         self._timer = None
+        self.gated = False  # seat.py: the desktop locked, or another user's in front
 
     def _set_state(self, state):
         if state != self.state:
@@ -393,12 +397,45 @@ class Device:
         self._in_use = in_use
         if in_use:
             log(f"{self.kind}: a program uses it")
+            if self.gated:
+                self._set_state("locked")
+                return
             self._set_state("in use")
+            self._told()
             self.begin()
         else:
             log(f"{self.kind}: no program uses it")
             self.end()
             self._set_state("ready")
+
+    def _told(self):
+        """Which program turned the tablet's camera or microphone on, said
+        each time (SEC-25): any program on this PC may, while the switch is on."""
+        if self.kind not in ("camera", "microphone"):
+            return
+        title = ("A program uses the tablet's camera" if self.kind == "camera"
+                 else "A program uses the tablet's microphone")
+        self.app.notify(self.kind, title, "{programs}", programs=", ".join(self.users) or "?")
+
+    def gate(self, closed):
+        """seat.py: the desktop locked or another user's session in front,
+        the tablet's feed pauses (no program gets its picture or sound
+        meanwhile, SEC-22); open again, it goes on if a program still uses
+        the device."""
+        if closed == self.gated:
+            return
+        self.gated = closed
+        if not self._in_use or self.state in ("off", "setup", "reload", "webrtc", "decoder"):
+            return
+        if closed:
+            log(f"{self.kind}: paused, the desktop is locked")
+            self.end()
+            self._set_state("locked")
+        else:
+            log(f"{self.kind}: on again")
+            self._set_state("in use")
+            self._told()
+            self.begin()
 
     def begin(self):
         raise NotImplementedError
@@ -985,6 +1022,12 @@ class Devices:
                     device.renew()
             else:
                 device.disable()
+
+    def gate(self, closed):
+        """seat.py's say for the camera and the microphone (the speakers play
+        on: they take nothing in)."""
+        self.camera.gate(closed)
+        self.microphone.gate(closed)
 
     def restart_camera(self):
         """Its quality changed: the device's format with it, which means a

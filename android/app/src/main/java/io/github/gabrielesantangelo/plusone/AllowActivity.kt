@@ -16,10 +16,12 @@ import android.provider.Settings
  */
 class AllowActivity : Activity() {
     private var kind = ""
+    private var pc = ""  // the PC that asked: the only one allowed by this yes
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         kind = intent.getStringExtra(EXTRA_KIND)?.takeIf { it in PERMISSIONS } ?: return finish()
+        pc = intent.getStringExtra(EXTRA_PC) ?: return finish()
         Notifications.cancelDevice(this, kind)
         val permission = PERMISSIONS.getValue(kind)
         when {
@@ -43,6 +45,7 @@ class AllowActivity : Activity() {
     private fun allowed(granted: Boolean) {
         if (granted) {
             if (kind == MainActivity.CAMERA) Options.setCamera(this, true) else Options.setMicrophone(this, true)
+            PcOptions.setDevice(this, pc, kind, true)
             // In front now: the service takes the camera or microphone at once,
             // and the PC (which asks again every few seconds) gets it.
             CompanionService.instance?.elevate()
@@ -52,6 +55,7 @@ class AllowActivity : Activity() {
 
     companion object {
         const val EXTRA_KIND = "kind"
+        const val EXTRA_PC = "pc"
         private val PERMISSIONS = mapOf(MainActivity.CAMERA to Manifest.permission.CAMERA,
             MainActivity.MICROPHONE to Manifest.permission.RECORD_AUDIO)
     }

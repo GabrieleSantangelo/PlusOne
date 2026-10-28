@@ -38,10 +38,12 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         instance = this
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        protect(this)
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
         val view = SurfaceView(this)
+        view.setSecure(true)
         view.holder.addCallback(this)
         // The PC's monitor has the screen's proportions, held in landscape;
         // Android 16 lets a large screen's app turn to portrait all the same

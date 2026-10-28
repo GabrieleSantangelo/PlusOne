@@ -30,7 +30,11 @@ class FakeAppDisplay:
 
     def __init__(self, targets, app_id, mode, bitrate, encoder, **callbacks):
         self.targets, self.mode, self.callbacks, self.stopped = targets, mode, callbacks, False
+        self.gated = None
         FakeAppDisplay.made.append(self)
+
+    def gate(self, closed, active=True):
+        self.gated = (closed, active)
 
     def start(self):
         pass
@@ -135,3 +139,13 @@ def test_sizes_are_read_with_care():
     assert engine.parse_size("2880x1800") == (2880, 1800)
     for nonsense in ("auto", None, "", "12x9", "axb", "99999x2"):
         assert engine.parse_size(nonsense) is None
+
+
+def test_the_desktop_locked_is_told_to_the_display_now_and_to_one_started_later(monkeypatch):
+    controller = app_controller(monkeypatch)
+    controller.gate(True, True)
+    controller.start()
+    display = FakeAppDisplay.made[-1]
+    assert display.gated == (True, True)  # started while locked: gated from the first frame
+    controller.gate(False, True)
+    assert display.gated == (False, True)

@@ -1,6 +1,7 @@
 """Discovery over mDNS: the tablets on the local network, from what their
-apps announce, Plus One's own (where to connect, its id and version) and
-others' (that a tablet is there at all).
+apps announce, Plus One's own (where to connect; which tablet, told by a
+tag only its paired PCs recognise: tags.py) and others' (that a tablet is
+there at all).
 
 Android's Quick Share and KDE Connect both say what kind of device they run
 on, and Avahi listens to the network anyway, so watching costs next to
@@ -15,6 +16,8 @@ import binascii
 from gi.repository import Gio, GLib
 
 from .. import log, once
+from . import tags
+from .trust import Paired, fingerprint, identity
 
 AVAHI = "org.freedesktop.Avahi"
 SERVER = AVAHI + ".Server"
@@ -57,12 +60,26 @@ def tablet_name(service, txt):
     return ""
 
 
+_ours = []
+
+
+def _our_fingerprint():
+    if not _ours:
+        _ours.append(fingerprint(identity()[2]))
+    return _ours[0]
+
+
 class Nearby:
     """Watches Avahi for tablets; on_change() fires when present() or
     names() may have changed."""
 
-    def __init__(self, on_change=None):
+    def __init__(self, on_change=None, paired=None, ours=None):
+        """paired() -> {fingerprint: name} (this PC's tablets: paired.json);
+        ours(): this PC's own fingerprint. The app's announcements name only
+        those."""
         self.on_change = on_change or (lambda: None)
+        self.paired = paired or (lambda: Paired().all())
+        self.ours = ours or _our_fingerprint
         self.bus = None
         self.known = False   # Avahi is there to ask
         self.services = set()  # (interface, protocol, name, type, domain) announced
@@ -209,13 +226,11 @@ class Nearby:
     def _companion(self, key, reply, txt):
         before = self.companions.get(key), self.versions.get(key)
         companions = {k: v for k, v in self.companions.items() if k != key}
-        if reply is not None:
-            fields = dict(entry.partition(b"=")[::2] for entry in txt)
-            name = fields.get(b"name", b"").decode(errors="replace")[:64] or key[2]
-            app_id = fields.get(b"id", b"").decode(errors="replace").lower()[:64]
-            companions[key] = (reply[7], reply[8], name, app_id)
-            version = fields.get(b"v", b"")
-            self.versions[key] = int(version) if version.isdigit() and len(version) <= 9 else 0
+        found = self._which(txt) if reply is not None else None
+        if found is not None:
+            app_id, name, version = found
+            companions[key] = (reply[7], reply[8], name or key[2], app_id)
+            self.versions[key] = version
         else:
             self.versions.pop(key, None)
         self.companions = companions
@@ -223,6 +238,25 @@ class Nearby:
             log("nearby:", f"the Plus One app on {self.companions[key][2]} at {reply[7]}:{reply[8]}"
                 if key in self.companions else "the Plus One app is gone")
             self.on_change()
+
+    def _which(self, txt):
+        """Which app an announcement is: (app id, name, version), or None if
+        it is no tablet of this PC's (nor one whose pairing is open)."""
+        fields = dict(entry.partition(b"=")[::2] for entry in txt)
+        app_id = fields.get(b"id", b"").decode(errors="replace").lower()[:64]
+        name = fields.get(b"name", b"").decode(errors="replace")[:64]
+        version = fields.get(b"v", b"")
+        version = int(version) if version.isdigit() and len(version) <= 9 else 0
+        if b"t" not in fields:
+            return app_id, name, version  # an app from before tags: says who it is
+        if fields.get(b"pair") == b"1" and app_id:
+            return app_id, name, 0  # its user opened pairing on it: it says who, for a while
+        announced = set(fields[b"t"].decode(errors="replace").split(","))
+        ours = self.ours()
+        for fingerprint, paired_name in self.paired().items():
+            if tags.recognised(announced, fingerprint, ours):
+                return fingerprint[:16], paired_name, 0  # its version: over the link
+        return None
 
     def _update(self, key, name):
         # Each tablet shows up once per app and IP version: report changes only.

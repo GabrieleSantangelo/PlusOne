@@ -64,6 +64,8 @@ def device_status(kind, state, users=()):
         else _("On the tablet, another app is using the microphone"),
         "tablet-unpaired": _("The tablet no longer knows this PC: pair it again"),
         "tablet-version": _("Plus One on the tablet and on this PC are different versions: update them"),
+        "tablet-stopped": _("Stopped on the tablet: on again when a program takes it anew"),
+        "locked": _("Paused while this PC is locked"),
     }.get(state, "")
 CSS = b".pair-code { font-size: 300%; font-weight: 800; letter-spacing: 0.1em; }"
 _resources_added = False
@@ -684,6 +686,9 @@ class PairDialog(Adw.Dialog):
         def work():
             try:
                 fingerprint, paired_name = link.pair(targets, lambda n, code: self._ask(attempt, n, code))
+            except link.PairingClosed:
+                GLib.idle_add(once(self._failed, attempt, _("On the tablet, open Plus One and tap “Pair a new PC”, "
+                                                            "then try again")))
             except link.PairingRefused:
                 GLib.idle_add(once(self._failed, attempt, _("Not paired: the code was not confirmed on both screens")))
             except Exception as e:  # noqa: BLE001 - shown to the user

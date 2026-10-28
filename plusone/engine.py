@@ -92,6 +92,7 @@ class Controller:
         self.detail = ("", {})
         self.encoder = None
         self.app_display = None  # appdisplay.AppDisplay, while the app shows the desktop
+        self.gated = (False, True)  # seat.py's (closed, active), for the desktop's streamer
         self.mode = None  # (width, height, fps) of the current session
         self._running = False
         # Each start() a new one: an older session's callbacks change nothing.
@@ -194,7 +195,15 @@ class Controller:
 
         self.app_display = AppDisplay(targets, tablet.app_id, mode, s.bitrate, self.encoder, touch=s.touch,
                                       test=s.test_pattern, on_started=started, on_ended=ended, on_paused=paused)
+        self.app_display.gate(*self.gated)
         self.app_display.start()
+
+    def gate(self, closed, active=True):
+        """On the main loop: the desktop may not be touched now, or may
+        again (seat.py)."""
+        self.gated = (closed, active)
+        if self.app_display is not None:
+            self.app_display.gate(closed, active)
 
     def _end_app(self):
         if self.app_display is not None:

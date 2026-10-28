@@ -85,6 +85,14 @@ object PcOptions {
 
     private const val ADOPTED = "updates-adopted"
 
+    /** That PC may use the camera or the microphone (kind), the switch for
+     * them on too: each PC its own yes, asked the first time it wants it
+     * (CC-04; a yes for all PCs before is asked again, PC by PC). */
+    fun device(context: Context, pc: String, kind: String) = prefs(context).getBoolean("$pc/$kind", false)
+
+    fun setDevice(context: Context, pc: String, kind: String, on: Boolean) =
+        prefs(context).edit().putBoolean("$pc/$kind", on).apply()
+
     fun forget(context: Context, pc: String) {
         val prefs = prefs(context)
         prefs.edit().apply { prefs.all.keys.filter { it.startsWith("$pc/") }.forEach(::remove) }.apply()

@@ -25,12 +25,19 @@ class CaptureHandler(private val service: CompanionService) : Handler {
             val now = System.currentTimeMillis()
             if (now - (asked[kind] ?: 0L) > ASK_AGAIN) {
                 asked[kind] = now
-                Notifications.askDevice(service, kind, link.pc)
+                Notifications.askDevice(service, kind, link.pc, link.fingerprint)
             }
             link.refuse(reason)
             return false
         }
         if (!(if (camera) Options.camera(service) else Options.microphone(service))) return ask("off")
+        if (!PcOptions.device(service, link.fingerprint, kind)) return ask("off")  // not this PC (yet)
+        // Stopped here (Interrompi): not again for this use; the PC's next one, yes.
+        val use = request.optString("use")
+        if (isStopped(kind, link.fingerprint, use)) {
+            link.refuse("stopped")
+            return false
+        }
         val permission = if (camera) Manifest.permission.CAMERA else Manifest.permission.RECORD_AUDIO
         if (service.checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) return ask("permission")
         Notifications.cancelDevice(service, kind)  // allowed now
@@ -44,7 +51,7 @@ class CaptureHandler(private val service: CompanionService) : Handler {
         // camera or microphone that fails ends the session (the PC tries
         // again), not an empty stream.
         val capture = RtcCapture(service, request, request.optBoolean("noise_reduction", true)) { link.close() }
-        service.began(capture, CompanionService.Session(kind, link))
+        service.began(capture, CompanionService.Session(kind, link, use))
         try {
             if (!service.allowedTypes(kind) && !service.foreground(kind)) {
                 link.refuse("background")
@@ -59,17 +66,35 @@ class CaptureHandler(private val service: CompanionService) : Handler {
             }
             link.send(JSONObject().put("type", "answer").put("sdp", answer))
             service.showSessions()
+            Notifications.inUse(service, kind, link.pc)  // seen, with Stop
             service.lowLatency(true)
             // The PC holds it as long as its program uses the device, and pings.
             link.hold()
         } finally {
             capture.stop()
             service.ended(capture)
+            Notifications.cancelInUse(service, kind)
         }
         return false
     }
 
     companion object {
         const val ASK_AGAIN = 60_000L  // ms between notifications asking for the camera or microphone
+        const val STOP_HOLD = 60_000L  // ms a stop holds for a PC that does not say its use
+
+        /** What the user stopped (the notification's Interrompi, the switch):
+         * that PC's use of the device, refused until a new one comes (a use:
+         * one program taking it on the PC, its requests again and again
+         * until it lets go). Before, the PC asked again in seconds and had it. */
+        private val stopped = ConcurrentHashMap<String, Triple<String, String, Long>>()  // kind -> (PC, use, when)
+
+        fun stop(kind: String, pc: String, use: String) {
+            stopped[kind] = Triple(pc, use, System.currentTimeMillis())
+        }
+
+        fun isStopped(kind: String, pc: String, use: String): Boolean {
+            val (who, which, at) = stopped[kind] ?: return false
+            return who == pc && if (use.isEmpty()) System.currentTimeMillis() - at < STOP_HOLD else which == use
+        }
     }
 }

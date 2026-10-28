@@ -26,6 +26,13 @@ import com.google.android.material.R as M
  * them, surfaces; each in the theme's colours (the wallpaper's).
  */
 
+/** The PC's screen, a signature, a pairing code: kept out of screenshots,
+ * screen recordings, casting and the Recents thumbnail (SEC-30). */
+fun protect(activity: android.app.Activity) {
+    activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+    activity.setRecentsScreenshotEnabled(false)
+}
+
 fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
 fun Context.dp(v: Float): Float = v * resources.displayMetrics.density
 

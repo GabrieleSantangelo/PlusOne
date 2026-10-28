@@ -55,7 +55,15 @@ next. Each path's round trip is measured all along (its pings).
 
 Every source feeds one list of candidates per paired device:
 - **the cable**: the PC sees a USB device it can switch to accessory mode;
-- **mDNS**, as now, where the network lets multicast through;
+- **mDNS**, where the network lets multicast through. The app's name on
+  the network is no one's ("Plus One" and a few letters new each start),
+  and its TXT record holds a tag for each paired PC instead of its id:
+  SHA-256(the app's fingerprint ‖ the PC's ‖ the quarter of an hour)[:8]
+  (`tags.py`, `Tags.kt`, `mdns.rs`, one test vector for the three). Only
+  that PC recognises it, nobody can follow the tablet from one quarter to
+  the next, nor learn which PCs it is paired with; its version comes over
+  the link, authenticated. While the user holds pairing open on the
+  tablet, its id and name are there too, for a new PC to list it;
 - **Bluetooth LE**: the app advertises a service with an id that changes
   every 15 minutes, HMAC(the pairing's key, the time slot), its IPv4
   address and port and which paths it has. Only a PC paired with it can
