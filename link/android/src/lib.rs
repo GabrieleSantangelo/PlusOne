@@ -217,7 +217,16 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
         "listen" => {
             let port = request["port"].as_u64().unwrap_or(0) as u16;
             let bound = core.node.listen(([0, 0, 0, 0], port).into()).map_err(|e| e.to_string())?;
-            Ok(json!({"ok": true, "port": bound.port()}))
+            // QUIC on the same port (UDP): the PC's TCP session moves to it
+            // (our hello says it). Without it, TCP alone, as before.
+            let quic = match core.node.listen_quic(([0, 0, 0, 0], bound.port()).into()) {
+                Ok(quic) => Some(quic.port()),
+                Err(e) => {
+                    plusone_link::log!("no QUIC at {}: {e}", bound.port());
+                    None
+                }
+            };
+            Ok(json!({"ok": true, "port": bound.port(), "quic": quic}))
         }
         "connect" => {
             let address = text("address")?.parse().map_err(|e| format!("the address: {e}"))?;

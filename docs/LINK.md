@@ -98,8 +98,8 @@ refuses it (not served, not allowed). Four classes:
 | Class | Delivery | On an IP path | On a stream (USB, Bluetooth) |
 |---|---|---|---|
 | control | reliable, ordered messages | the session's TLS stream | frames, first |
-| input | unreliable; the newest state counts, never queued; up to 1422 bytes | UDP | frames, before any media; one waiting at most |
-| realtime (sound, video) | unreliable; late is lost; up to 1422 bytes | UDP | frames; dropped while the stream's queue is past its budget |
+| input | unreliable; the newest state counts, never queued; up to 1380 bytes | UDP or QUIC datagrams | frames, before any media; one waiting at most |
+| realtime (sound, video) | unreliable; late is lost; up to 1380 bytes | UDP or QUIC datagrams | frames; dropped while the stream's queue is past its budget |
 | bulk (a PDF, a file, an update) | a reliable byte stream, last in line | a TCP connection of its own, joined to the session | frames, in what the others leave |
 
 - Datagrams: AES-256-GCM, the nonce the direction and a counter, the

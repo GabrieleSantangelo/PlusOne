@@ -27,9 +27,10 @@ import threading
 CONTROL, INPUT, REALTIME = "control", "input", "realtime"
 REQUEST = 64 << 10
 # A channel's largest message: control's (the system caps a message
-# socket's), and input's or realtime's (a datagram on any network).
+# socket's), and input's or realtime's (a datagram on any network, QUIC's
+# too: plus-one-link's session.rs MAX_DATAGRAM).
 MAX_CONTROL = 200 << 10
-MAX_DATAGRAM = 1422
+MAX_DATAGRAM = 1380
 
 
 class LinkError(Exception):

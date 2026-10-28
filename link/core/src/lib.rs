@@ -6,11 +6,13 @@
 //! its end as a file descriptor: a message socket (one write, one
 //! message). It never sees the path, the keys or the other channels.
 
+mod cc;
 pub mod frame;
 pub mod identity;
 pub mod mdns;
 pub mod node;
 pub mod pace;
+pub mod quic;
 pub mod relay;
 pub mod seal;
 pub mod session;

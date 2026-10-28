@@ -53,9 +53,10 @@ const UDP_PROBE: Duration = Duration::from_millis(200);
 const UDP_STALL: Duration = Duration::from_millis(20);
 const HANDSHAKE: Duration = Duration::from_secs(5);
 const OPEN_WAIT: Duration = Duration::from_secs(5);
-/// An input or realtime message's largest size: with the seal (30 bytes),
-/// UDP and IPv6 (48), a datagram of 1500 bytes, which any network carries.
-pub const MAX_DATAGRAM: usize = 1422;
+/// An input or realtime message's largest size: sealed (30 bytes more), it
+/// fits a QUIC datagram on a 1500-byte network (QUIC's header, tag and
+/// frame take about 40 of the 1452 bytes IP and UDP leave), and a UDP one.
+pub const MAX_DATAGRAM: usize = 1380;
 /// Realtime over the stream: dropped while this much urgent waits to be
 /// sent, at most; on a slow stream, while more than REALTIME_WAIT of it
 /// does at the rate the stream takes it (Bluetooth: 256 KiB were seconds).
@@ -262,6 +263,8 @@ struct Path {
     stream: Box<dyn Stream>,  // a clone of the session thread's, to shut it down
     udp: Option<UdpSocket>,
     udp_peer: Mutex<Option<SocketAddr>>,
+    /// A QUIC path's connection: its datagrams instead of UDP's.
+    quic: Option<crate::quic::Quic>,
     started: Instant,
     heard_us: AtomicU64,   // since started: the stream's last frame, or an authenticated datagram
     proven_us: AtomicU64,  // a pong's (0: none yet)
@@ -287,7 +290,8 @@ impl Path {
 
     fn udp_works(&self) -> bool {
         let proven = self.proven_us.load(Ordering::Relaxed);
-        self.udp.is_some() && proven != 0 && self.us().saturating_sub(proven) < UDP_PROOF.as_micros() as u64
+        (self.udp.is_some() || self.quic.is_some()) && proven != 0
+            && self.us().saturating_sub(proven) < UDP_PROOF.as_micros() as u64
     }
 }
 
@@ -341,6 +345,8 @@ pub(crate) struct Established {
     /// The other side has no path for it now: this one is taken, whatever
     /// we believe of ours (it is gone for them).
     forced: bool,
+    /// A QUIC path's connection (quic.rs).
+    quic: Option<crate::quic::Quic>,
 }
 
 impl Established {
@@ -348,8 +354,26 @@ impl Established {
         &self.kind
     }
 
+    /// The connection under the stream is QUIC's: its datagrams carry ours.
+    pub(crate) fn set_quic(&mut self, quic: crate::quic::Quic) {
+        self.quic = Some(quic);
+    }
+
+    /// Where to make a QUIC path to the other side, if this is a TCP one we
+    /// made and its hello says it takes QUIC.
+    pub(crate) fn quic_offer(&self) -> Option<SocketAddr> {
+        let port = self.hello["quic"].as_u64().filter(|p| (1..=65535).contains(p))?;
+        match (self.dialer, &self.quic, self.stream.addresses()) {
+            (true, None, Some((peer, _))) if peer.is_ipv4() => Some(SocketAddr::new(peer, port as u16)),
+            _ => None,
+        }
+    }
+
     fn close(&self) {
         self.stream.shutdown();
+        if let Some(quic) = &self.quic {
+            quic.close();
+        }
     }
 }
 
@@ -442,7 +466,7 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
         _ => kind.to_owned(),
     };
     Ok(Established { conn, stream, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer,
-                     kind, id, resumes, forced })
+                     kind, id, resumes, forced, quic: None })
 }
 
 /// A connection made ready to be a path: non-blocking from now on, its
@@ -455,7 +479,8 @@ fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
         udp.set_read_timeout(Some(Duration::from_millis(500)))?;
     }
     Ok(Arc::new(Path { kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
-                       udp_peer: Mutex::new(established.udp_peer), started: Instant::now(), heard_us: AtomicU64::new(1),
+                       udp_peer: Mutex::new(established.udp_peer), quic: established.quic.take(),
+                       started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
                        gone: AtomicBool::new(false) }))
 }
@@ -528,8 +553,9 @@ impl Session {
             return false;
         }
         let now = self.path.lock().unwrap().clone();
-        if !established.forced
-            && now.is_some_and(|path| !path.gone.load(Ordering::SeqCst) && rank(&path.kind) >= rank(&established.kind)) {
+        // Taken if better: a higher rank, or QUIC over TCP at the same one.
+        let better = |path: &Path| (rank(&established.kind), established.quic.is_some()) > (rank(&path.kind), path.quic.is_some());
+        if !established.forced && now.is_some_and(|path| !path.gone.load(Ordering::SeqCst) && !better(&path)) {
             established.close();
             return false;
         }
@@ -561,6 +587,16 @@ impl Session {
     /// What it runs on now: "lan", "usb"; None while it waits for a path.
     pub fn path(&self) -> Option<String> {
         self.current().map(|path| path.kind.clone())
+    }
+
+    /// The path is a QUIC connection (quic.rs), not a TCP one or a stream.
+    pub fn by_quic(&self) -> bool {
+        self.current().is_some_and(|path| path.quic.is_some())
+    }
+
+    /// What a QUIC path's congestion controller allows now (bytes a second).
+    pub fn rate(&self) -> Option<u64> {
+        self.current().and_then(|path| path.quic.as_ref().map(|quic| quic.rate()))
     }
 
     /// The last round trip over UDP, if it works.
@@ -936,10 +972,20 @@ impl Session {
             let (me, path) = (self.clone(), path.clone());
             let _ = std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(path));
         }
+        if let Some(quic) = &path.quic {
+            let (me, path) = (self.clone(), path.clone());
+            quic.read_datagrams(move |datagram| {
+                let mut buf = datagram.to_vec();
+                me.datagram_in(&path, &mut buf, None, &mut Vec::new());
+            });
+        }
         conn.set_buffer_limit(None);
         let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err().unwrap_or_else(|| "a better path".into());
         path.gone.store(true, Ordering::SeqCst);
         path.stream.shutdown();
+        if let Some(quic) = &path.quic {
+            quic.close();
+        }
         reason
     }
 
@@ -1029,7 +1075,7 @@ impl Session {
                 self.queue(frame::PING, 0, &heard.to_be_bytes());
                 continue;
             }
-            if path.udp.is_some() && now >= next_udp_ping {
+            if (path.udp.is_some() || path.quic.is_some()) && now >= next_udp_ping {
                 let early = path.started.elapsed() < UDP_PROOF;
                 let busy = path.realtime_going() && self.outbox.lock().unwrap().reliable_bytes > 0;
                 next_udp_ping = now + if busy && path.udp_works() { PROBE_BUSY }
@@ -1038,7 +1084,8 @@ impl Session {
                 ping.extend_from_slice(&path.us().to_be_bytes());
                 self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
             }
-            let mut wait = if path.udp.is_some() { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
+            let datagrams = path.udp.is_some() || path.quic.is_some();
+            let mut wait = if datagrams { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
             if let Some(paced) = paced.filter(|_| self.outbox.lock().unwrap().reliable_bytes > 0) {
                 wait = wait.min(paced);  // the reliable frames' next turn
             }
@@ -1162,6 +1209,13 @@ impl Session {
     }
 
     fn send_datagram_now(&self, path: &Path, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
+        if let Some(quic) = &path.quic {
+            self.sealer.seal(channel, body, sealed);
+            if !quic.send(sealed) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);  // late, or too big
+            }
+            return;
+        }
         let (Some(udp), Some(to)) = (&path.udp, *path.udp_peer.lock().unwrap()) else { return };
         self.sealer.seal(channel, body, sealed);
         let mut result = sys::send_to(udp.as_raw_fd(), sealed, &to);
@@ -1184,28 +1238,38 @@ impl Session {
                 Ok(got) => got,
                 Err(_) => continue,  // the timeout: look at closed again
             };
-            let Some((count, channel, body)) = self.opener.lock().unwrap().open(&mut buf[..length])
-                .map(|(count, channel, body)| (count, channel, body.to_vec())) else { continue };
-            path.heard();
-            // Where it came from is where the other side is now (its
-            // address may change; only a sealed packet can say so).
-            {
-                let mut peer = path.udp_peer.lock().unwrap();
-                if *peer != Some(from) {
-                    *peer = Some(from);
-                }
+            self.datagram_in(&path, &mut buf[..length], Some(from), &mut sealed);
+        }
+    }
+
+    /// A datagram that came on path (from: where, for UDP): its channel's,
+    /// or a ping answered, or a pong's round trip taken.
+    fn datagram_in(&self, path: &Path, buf: &mut [u8], from: Option<SocketAddr>, sealed: &mut Vec<u8>) {
+        let Some((count, channel, body)) = self.opener.lock().unwrap().open(buf)
+            .map(|(count, channel, body)| (count, channel, body.to_vec())) else { return };
+        path.heard();
+        // Where it came from is where the other side is now (its address
+        // may change; only a sealed packet can say so).
+        if let Some(from) = from {
+            let mut peer = path.udp_peer.lock().unwrap();
+            if *peer != Some(from) {
+                *peer = Some(from);
             }
-            if channel != DATAGRAM_PATH {
-                self.deliver(channel, &body, Some(count));
-            } else if body.len() == 9 && body[0] == PING {
-                let mut pong = body.clone();
-                pong[0] = PONG;
-                self.send_datagram_now(&path, DATAGRAM_PATH, &pong, &mut sealed);
-            } else if body.len() == 9 && body[0] == PONG {
-                let sent = u64::from_be_bytes(body[1..9].try_into().unwrap());
-                let now = path.us();
-                path.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
-                path.proven_us.store(now.max(1), Ordering::Relaxed);
+        }
+        if channel != DATAGRAM_PATH {
+            self.deliver(channel, &body, Some(count));
+        } else if body.len() == 9 && body[0] == PING {
+            let mut pong = body.clone();
+            pong[0] = PONG;
+            self.send_datagram_now(path, DATAGRAM_PATH, &pong, sealed);
+        } else if body.len() == 9 && body[0] == PONG {
+            let sent = u64::from_be_bytes(body[1..9].try_into().unwrap());
+            let now = path.us();
+            path.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
+            path.proven_us.store(now.max(1), Ordering::Relaxed);
+            // A QUIC path is paced by its own controller (cc.rs); pace.rs
+            // paces a TCP one.
+            if path.quic.is_none() {
                 self.pace.lock().unwrap().sample(now.saturating_sub(sent), path.realtime_going(), Instant::now());
             }
         }

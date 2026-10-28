@@ -10,7 +10,9 @@
 //!
 //! Requests, each answered {"ok": true, ...} or {"ok": false, "error"}:
 //!   {"op": "devices"}            the paired tablets: id, name, connected,
-//!                                features, rtt_ms, dropped
+//!                                features, rtt_ms, path, quic (its path a
+//!                                QUIC one), rate_kbps (its controller's),
+//!                                dropped
 //!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]
 //!    [, "kind": "p2p"|"ap"]}     a session with the tablet there (or with
 //!                                that one, wherever it is): its id; "p2p",
@@ -100,6 +102,8 @@ impl Daemon {
                 "features": session.map(|s| s.features()).unwrap_or(json!({})),
                 "rtt_ms": session.and_then(|s| s.rtt()).map(|r| r.as_secs_f64() * 1000.0),
                 "path": session.and_then(|s| s.path()),
+                "quic": session.is_some_and(|s| s.by_quic()),
+                "rate_kbps": session.and_then(|s| s.rate()).map(|r| r * 8 / 1000),
                 "dropped": session.map(|s| s.dropped()).unwrap_or(0),
             }));
         }
@@ -469,9 +473,21 @@ fn main() {
     std::thread::Builder::new().name("link-idle".into()).spawn(move || reaper.reap()).unwrap();
     let events = daemon.clone();
     node.on_event(move |event| events.event(event));
+    // PLUSONE_LINK_QUIC=1: a TCP session moves to QUIC where the tablet
+    // takes it (its hello says so); off until it beats TCP everywhere.
+    if std::env::var("PLUSONE_LINK_QUIC").as_deref() == Ok("1") {
+        node.upgrade_to_quic(true);
+        log!("QUIC: TCP paths move to it where the tablet takes it");
+    }
     if let Some(address) = value("--listen") {
         match address.parse().map_err(|e| format!("{e}")).and_then(|a| node.listen(a).map_err(|e| e.to_string())) {
-            Ok(bound) => log!("listening at {bound}"),
+            Ok(bound) => {
+                log!("listening at {bound}");
+                match node.listen_quic(bound) {
+                    Ok(quic) => log!("QUIC at {quic}"),
+                    Err(e) => log!("no QUIC at {bound}: {e}"),
+                }
+            }
             Err(e) => log!("cannot listen at {address}: {e}"),
         }
     }

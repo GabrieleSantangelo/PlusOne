@@ -23,6 +23,9 @@ const HANDSHAKES: usize = 8;
 /// A connection that is not a session this long after it came: closed
 /// (each read has its own timeout too; this is the whole of it).
 const HANDSHAKE_WHOLE: Duration = Duration::from_secs(8);
+/// The other side says it takes QUIC (its hello): a QUIC path to it is
+/// tried this long, beside the TCP one the session has already.
+const QUIC_TRY: Duration = Duration::from_secs(3);
 
 pub enum Event {
     /// A session with a paired device, up.
@@ -47,6 +50,13 @@ pub(crate) struct NodeInner {
     events: Mutex<Option<Arc<dyn Fn(Event) + Send + Sync>>>,
     listeners: Mutex<Vec<TcpListener>>,
     handshakes: AtomicUsize,
+    /// QUIC's endpoint: the listening one, or one to dial from.
+    quic: Mutex<Option<quinn::Endpoint>>,
+    quic_handshakes: Arc<AtomicUsize>,
+    /// Where we take QUIC (0: we do not), said in our hello.
+    quic_port: std::sync::atomic::AtomicU16,
+    /// Our TCP paths to a device that takes QUIC move to it (upgrade_to_quic).
+    quic_upgrade: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -62,8 +72,14 @@ impl NodeInner {
     }
 
     fn hello(&self) -> Value {
-        // flow: control channels flow-controlled (session.rs, WINDOW).
-        json!({"t": "hello", "name": self.name, "features": self.features(), "flow": 1})
+        // flow: control channels flow-controlled (session.rs, WINDOW);
+        // quic: the UDP port we take QUIC on, if we do (quic.rs).
+        let mut hello = json!({"t": "hello", "name": self.name, "features": self.features(), "flow": 1});
+        let port = self.quic_port.load(Ordering::SeqCst);
+        if port != 0 {
+            hello["quic"] = json!(port);
+        }
+        hello
     }
 
     /// The session we have with peer, its id (a new path goes on with it),
@@ -110,10 +126,62 @@ impl NodeInner {
         self.add(established)
     }
 
+    /// As accept(), on a QUIC connection's stream (its datagrams the path's).
+    fn accept_quic(self: &Arc<Self>, stream: Box<dyn Stream>, quic: crate::quic::Quic) -> std::io::Result<Arc<Session>> {
+        let conn = rustls::ServerConnection::new(self.server.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut established = match session::establish(conn.into(), stream, false, self.hello(), "lan", &|peer| self.ours(peer)) {
+            Ok(established) => established,
+            Err(e) => {
+                quic.close();
+                return Err(e);
+            }
+        };
+        established.set_quic(quic);
+        self.add(established)
+    }
+
+    fn connect_quic(self: &Arc<Self>, address: SocketAddr, timeout: Duration, kind: &str) -> Result<Arc<Session>, String> {
+        let endpoint = self.quic_endpoint().map_err(|e| e.to_string())?;
+        let (stream, quic) = crate::quic::dial(&endpoint, &self.client, address, timeout)?;
+        let name = rustls::pki_types::ServerName::try_from("plus-one.invalid").unwrap();
+        let conn = rustls::ClientConnection::new(self.client.clone(), name).map_err(|e| e.to_string())?;
+        let mut established = match session::establish(conn.into(), Box::new(stream), true, self.hello(), kind,
+                                                       &|peer| self.ours(peer)) {
+            Ok(established) => established,
+            Err(e) => {
+                quic.close();
+                return Err(e.to_string());
+            }
+        };
+        established.set_quic(quic);
+        self.add(established).map_err(|e| e.to_string())
+    }
+
+    /// The endpoint QUIC dials from: the listening one, else one of its own.
+    fn quic_endpoint(&self) -> std::io::Result<quinn::Endpoint> {
+        let mut quic = self.quic.lock().unwrap();
+        if let Some(endpoint) = quic.as_ref() {
+            return Ok(endpoint.clone());
+        }
+        let endpoint = crate::quic::endpoint(([0, 0, 0, 0], 0).into(), None)?;
+        *quic = Some(endpoint.clone());
+        Ok(endpoint)
+    }
+
     /// A connection made a session: a path for the one we have with the
     /// device (both hellos named it), or a new session, and the one
     /// before, if any, ends (the device forgot it: restarted, say).
     fn add(self: &Arc<Self>, established: session::Established) -> std::io::Result<Arc<Session>> {
+        // A TCP path we made to a device that takes QUIC: a QUIC path to
+        // it after, which takes over (QUIC over TCP, the same kind).
+        if let Some(address) = established.quic_offer().filter(|_| self.quic_upgrade.load(Ordering::SeqCst)) {
+            let (node, kind) = (self.clone(), established.kind().to_owned());
+            let _ = std::thread::Builder::new().name("link-quic-upgrade".into()).spawn(move || {
+                if let Err(e) = node.connect_quic(address, QUIC_TRY, &kind) {
+                    log!("{address}: no QUIC path ({e}): TCP stays");
+                }
+            });
+        }
         if let Some(id) = established.resumes.clone() {
             let existing = self.sessions.lock().unwrap().get(&established.peer).cloned();
             if let Some(existing) = existing.filter(|s| s.id == id) {
@@ -164,6 +232,10 @@ impl Node {
             events: Mutex::default(),
             listeners: Mutex::default(),
             handshakes: AtomicUsize::new(0),
+            quic: Mutex::default(),
+            quic_handshakes: Arc::default(),
+            quic_port: std::sync::atomic::AtomicU16::new(0),
+            quic_upgrade: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         })))
     }
@@ -250,6 +322,35 @@ impl Node {
         Ok(bound)
     }
 
+    /// Our TCP paths to a device whose hello says it takes QUIC are followed
+    /// by a QUIC path to it, which takes over (off at first: QUIC is still
+    /// measured against TCP on each network).
+    pub fn upgrade_to_quic(&self, on: bool) {
+        self.0.quic_upgrade.store(on, Ordering::SeqCst);
+    }
+
+    /// Paired devices connect here by QUIC too (UDP: the same port as
+    /// listen()'s TCP, say): the address it took.
+    pub fn listen_quic(&self, address: SocketAddr) -> std::io::Result<SocketAddr> {
+        let endpoint = crate::quic::endpoint(address, Some(&self.0.server))?;
+        let bound = endpoint.local_addr()?;
+        *self.0.quic.lock().unwrap() = Some(endpoint.clone());
+        self.0.quic_port.store(bound.port(), Ordering::SeqCst);
+        let node = self.0.clone();
+        crate::quic::listen(endpoint, self.0.server.clone(), self.0.quic_handshakes.clone(), HANDSHAKES, HANDSHAKE_WHOLE,
+                            move |stream, quic| {
+            let from = quic.conn.remote_address();
+            if node.closed.load(Ordering::SeqCst) {
+                quic.close();
+                return;
+            }
+            if let Err(e) = node.accept_quic(Box::new(stream), quic) {
+                log!("{from}: no session by QUIC ({e})");
+            }
+        });
+        Ok(bound)
+    }
+
     /// A session (or a path for the one we have) with the device at the
     /// other end of stream, which connected to us (its TLS server: we).
     pub fn accept_stream(&self, stream: Box<dyn Stream>, kind: &str) -> Result<Arc<Session>, String> {
@@ -275,6 +376,9 @@ impl Node {
         for listener in self.0.listeners.lock().unwrap().drain(..) {
             // A listening socket shut down: its accept() returns at once.
             crate::sys::shutdown(listener.as_raw_fd());
+        }
+        if let Some(endpoint) = self.0.quic.lock().unwrap().take() {
+            endpoint.close(0u32.into(), b"closed");
         }
         let sessions: Vec<Arc<Session>> = self.0.sessions.lock().unwrap().values().cloned().collect();
         for session in sessions {
@@ -309,5 +413,10 @@ impl Node {
         let tcp = TcpStream::connect_timeout(&address, timeout).map_err(|e| format!("{address}: {e}"))?;
         crate::stream::tune_tcp(&tcp);
         self.connect_stream(Box::new(tcp), kind).map_err(|e| format!("{address}: {e}"))
+    }
+
+    /// As connect_as(), by QUIC alone.
+    pub fn connect_quic(&self, address: SocketAddr, timeout: Duration, kind: &str) -> Result<Arc<Session>, String> {
+        self.0.connect_quic(address, timeout, kind)
     }
 }

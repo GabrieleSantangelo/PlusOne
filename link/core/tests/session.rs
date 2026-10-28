@@ -598,10 +598,10 @@ fn a_session_on_a_stream_with_no_ip_carries_everything() {
     assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(7));
     let mut got = 0;
     for i in 0..300u32 {
-        let mut packet = vec![0u8; 1422];
+        let mut packet = vec![0u8; plusone_link::session::MAX_DATAGRAM];
         packet[..4].copy_from_slice(&i.to_be_bytes());
         video.send(&packet).unwrap();
-        if video.recv(&mut buf, Some(Duration::from_millis(200))).unwrap() == Some(1422) {
+        if video.recv(&mut buf, Some(Duration::from_millis(200))).unwrap() == Some(plusone_link::session::MAX_DATAGRAM) {
             got += 1;
         }
     }
@@ -653,4 +653,82 @@ fn a_path_the_other_side_lost_is_replaced_even_by_a_worse_one() {
     control.send(b"still").unwrap();
     assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
     drop(relay_tablet);
+}
+
+/// The tablet takes QUIC too (its hello says where), so a TCP session moves
+/// to a QUIC path to it; control, realtime and bulk go on there.
+fn quic_pair() -> (Node, Node, SocketAddr) {
+    let (pc, tablet, address) = pair();
+    tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    pc.upgrade_to_quic(true);
+    (pc, tablet, address)
+}
+
+#[test]
+fn a_tcp_session_moves_to_quic() {
+    let (pc, _tablet, address) = quic_pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let started = Instant::now();
+    while !session.by_quic() {
+        assert!(started.elapsed() < Duration::from_secs(5), "never on QUIC");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(session.path().as_deref(), Some("lan"));
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let mut buf = vec![0u8; 1 << 17];
+    control.send(b"by QUIC").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(7));
+    // Realtime as QUIC datagrams, once a pong proved them.
+    let realtime = session.open("echo", "video", Class::Realtime).unwrap();
+    while session.rtt().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(5), "datagrams never proven");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut got = 0;
+    for i in 0..500u32 {
+        let mut packet = vec![0u8; plusone_link::session::MAX_DATAGRAM];
+        packet[..4].copy_from_slice(&i.to_be_bytes());
+        realtime.send(&packet).unwrap();
+        if let Some(n) = realtime.recv(&mut buf, Some(Duration::from_millis(200))).unwrap() {
+            assert_eq!(n, plusone_link::session::MAX_DATAGRAM);
+            got += 1;
+        }
+    }
+    assert!(got >= 495, "{got} of 500 came back");
+    // Bulk both ways: 32 MiB there and back.
+    let bulk = session.open("echo", "bulk", Class::Control).unwrap();
+    let reader = {
+        let bulk = bulk.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 17];
+            let mut got = 0usize;
+            while got < 512 * (64 << 10) {
+                match bulk.recv(&mut buf, WAIT) {
+                    Ok(Some(n)) if n > 0 => got += n,
+                    _ => break,
+                }
+            }
+            got
+        })
+    };
+    let begun = Instant::now();
+    let chunk = vec![7u8; 64 << 10];
+    for _ in 0..512 {
+        bulk.send(&chunk).unwrap();
+    }
+    assert_eq!(reader.join().unwrap(), 512 * (64 << 10));
+    eprintln!("32 MiB there and back by QUIC in {:.2} s", begun.elapsed().as_secs_f64());
+    assert!(session.by_quic());
+}
+
+#[test]
+fn a_session_by_quic_alone() {
+    let (pc, tablet, _address) = pair();
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let session = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
+    assert!(session.by_quic());
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let mut buf = vec![0u8; 1 << 10];
+    control.send(b"hello").unwrap();
+    assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
 }
