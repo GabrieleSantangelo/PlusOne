@@ -1,0 +1,45 @@
+# The link's parsers under libFuzzer (cargo-fuzz): tools/fuzz-docker.sh.
+[package]
+name = "plus-one-link-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+plus-one-link = { path = "../core" }
+
+# Not the link's workspace: its own (cargo-fuzz's flags, a nightly).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "datagram"
+path = "fuzz_targets/datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mdns"
+path = "fuzz_targets/mdns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "controller"
+path = "fuzz_targets/controller.rs"
+test = false
+doc = false
+bench = false

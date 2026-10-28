@@ -16,3 +16,7 @@ android/local.properties
 link/target/
 link/quic-spike/target/
 android/app/src/main/jniLibs/
+link/fuzz/target/
+link/fuzz/corpus/
+link/fuzz/artifacts/
+link/fuzz/coverage/
