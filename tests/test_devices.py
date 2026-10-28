@@ -528,3 +528,19 @@ def test_the_tablets_own_bluetooth_audio_is_off_while_it_is_the_speakers_and_bac
     devices.BluetoothAudio.restore()
     assert calls[-1] == (tablet, "ConnectProfile", devices.BluetoothAudio.A2DP_SOURCE)
     assert not (tmp_path / "bluetooth-audio.json").exists()
+
+
+def test_a_stream_played_again_is_looked_at_again_a_moment_later():
+    # pactl tells the change before PipeWire runs the node (still "idle"):
+    # looked at at once, and again AGAIN_AFTER_EVENT later.
+    looked = []
+    pauses = object()
+    lines = ["Event 'change' on sink-input #3483"]
+    stream = types.SimpleNamespace(read_line_finish_utf8=lambda result: (lines.pop(0) if lines else None, 0),
+                                   read_line_async=lambda *args: None)
+    device = types.SimpleNamespace(pauses=pauses, links={("Chrome:output_FL", "plusone_speakers:playback_FL")},
+                                   _who_records=lambda: looked.append(time.monotonic()), _event=None)
+    devices.AudioDevice._event(device, stream, None, pauses)
+    assert len(looked) == 1
+    assert spin(lambda: len(looked) == 2)
+    assert looked[1] - looked[0] >= devices.AGAIN_AFTER_EVENT / 1000 - 0.05

@@ -35,6 +35,7 @@ MIC_NAME = "plusone_mic"
 SPEAKERS_NAME = "plusone_speakers"
 QUALITIES = {"720p": (1280, 720, 2_500_000), "1080p": (1920, 1080, 5_000_000)}
 FPS = 30
+AGAIN_AFTER_EVENT = 500  # ms: a stream's pause or play, looked at again (AudioDevice._event)
 RETRY = 3          # seconds between attempts to reach the tablet while wanted
 REFUSED_RETRY = 10  # seconds, after the app said no (the user may change their mind there)
 IN_USE_AFTER = 0.2  # seconds a program holds the device before the tablet is asked
@@ -725,6 +726,10 @@ class AudioDevice(Device):
             return  # switched off, or PipeWire went (the links' watch handles that)
         if "sink-input" in line and self.links:
             self._who_records()
+            # A stream played again is told before PipeWire runs its node
+            # (still "idle" then): looked at once more a moment later, or a
+            # video played again after a pause went unheard.
+            GLib.timeout_add(AGAIN_AFTER_EVENT, once(lambda: self.links and self._who_records()))
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._event, pauses)
 
     def _line(self, stream, result, watch):
