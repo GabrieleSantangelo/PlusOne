@@ -1,0 +1,29 @@
+#!/bin/sh
+# Plus One: the Wi-Fi's power saving off (on), for good and now. Saving, the
+# radio sleeps between the access point's beacons, the Wi-Fi Direct groups'
+# too, and the tablet's packets wait 15-30 ms more (docs/LINK.md). Run by
+# pkexec, as root, when the user says so (plusone/wifi.py).
+#   plus-one-wifi-latency on|off    on: low latency (power saving off)
+set -eu
+conf=/etc/NetworkManager/conf.d/plus-one-wifi-latency.conf
+case "${1:-}" in
+    on)
+        # After Ubuntu's default-wifi-powersave-on.conf: this one wins.
+        mkdir -p "${conf%/*}"
+        printf '%s\n' '# Plus One (Preferences: Low latency Wi-Fi): the Wi-Fi without power saving.' \
+            '[connection]' 'wifi.powersave = 2' > "$conf"
+        save=off ;;
+    off)
+        rm -f "$conf"
+        save=on ;;
+    *)
+        echo "usage: plus-one-wifi-latency on|off" >&2
+        exit 2 ;;
+esac
+# Now, without reconnecting: every Wi-Fi interface up (a Wi-Fi Direct
+# group's too); the ones to come follow NetworkManager's setting.
+for dev in /sys/class/net/*; do
+    [ -e "$dev/phy80211" ] || continue
+    iw dev "${dev##*/}" set power_save "$save" 2>/dev/null || true
+done
+nmcli general reload conf 2>/dev/null || true

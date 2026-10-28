@@ -2,6 +2,16 @@
 
 ## Unreleased (1.0)
 
+- **Low latency Wi-Fi**: Ubuntu keeps the Wi-Fi's power saving on, and
+  the radio sleeping between beacons delayed every packet to and from the
+  tablet by 15-30 ms. At the first start Plus One says so and offers to
+  turn it off (your password, GNOME's dialog); Preferences → Low latency
+  Wi-Fi turns it on again.
+- **No sound round and round over Bluetooth**: with the PC and the tablet
+  connected by Bluetooth, Android sent the tablet's sound to the PC, which
+  played it back on the tablet's speakers. While the tablet is this PC's
+  speakers, its own Bluetooth audio is off on the PC, and back as it was
+  when they go (after a crash too).
 - **The PC locked, the tablet touches nothing**: while this PC's session
   is locked (or another user's is in front), the tablet's fingers and pen
   reach nothing, whatever touched is let go at once, and the tablet's

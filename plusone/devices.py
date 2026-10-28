@@ -20,6 +20,7 @@ import struct
 import subprocess
 import threading
 import time
+import types
 
 import gi
 
@@ -880,6 +881,90 @@ def make_default_sink(name):
         log("speakers: not made the output:", repr(e))
 
 
+class BluetoothAudio:
+    """The tablet's own Bluetooth audio, off while the tablet is this PC's
+    speakers (l15): else Android sends the tablet's sound to the PC over
+    A2DP (PipeWire takes it, the PC's default output plays it), the PC
+    plays it back on the tablet, and round. Every CHECK while the speakers
+    are on, its card's profile is "off" (kept in STATE as it was); it goes
+    back when they go, and at the next start after a crash."""
+
+    CHECK = 5  # seconds
+    STATE = os.path.join(GLib.get_user_state_dir(), "plus-one", "bluetooth-audio.json")
+
+    def __init__(self, tablet_name):
+        self.tablet_name = tablet_name  # () -> the tablet in use's name (its Bluetooth one), or None
+        self._timer = None
+
+    def hold(self):
+        if self._timer is None:
+            self._check()
+            self._timer = GLib.timeout_add_seconds(self.CHECK, self._check)
+
+    def release(self):
+        if self._timer is not None:
+            GLib.source_remove(self._timer)
+            self._timer = None
+        self.restore()
+
+    def _check(self):
+        name = self.tablet_name()
+        for card in self._cards():
+            props = card.get("properties", {})
+            if not card.get("name", "").startswith("bluez_card.") or props.get("device.description") != name:
+                continue
+            profile = card.get("active_profile")
+            if profile and profile != "off":
+                self._save(card["name"], profile)
+                log(f"speakers: {name}'s own Bluetooth audio off ({profile}): no sound round and round")
+                _pactl("set-card-profile", card["name"], "off")
+        return True
+
+    @classmethod
+    def restore(cls):
+        """Each profile turned off back as it was (also after a crash)."""
+        try:
+            with open(cls.STATE) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return
+        for card, profile in saved.items():
+            if isinstance(card, str) and isinstance(profile, str):
+                _pactl("set-card-profile", card, profile)
+                log(f"speakers: the tablet's Bluetooth audio back ({profile})")
+        try:
+            os.remove(cls.STATE)
+        except OSError:
+            pass
+
+    def _save(self, card, profile):
+        try:
+            with open(self.STATE) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = {}
+        saved.setdefault(card, profile)  # as it was first, not "off"
+        os.makedirs(os.path.dirname(self.STATE), exist_ok=True)
+        with open(self.STATE, "w") as f:
+            json.dump(saved, f)
+
+    @staticmethod
+    def _cards():
+        try:
+            out = subprocess.run(["pactl", "-f", "json", "list", "cards"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            return json.loads(out or "[]")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return []
+
+
+def _pactl(*args):
+    try:
+        subprocess.run(["pactl", *args], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 class Speakers(AudioDevice):
     """The tablet's speakers: a virtual PipeWire sink ("Tablet speakers"),
     which Plus One captures and sends to the tablet as it is (pcm.PcmSender)
@@ -892,6 +977,16 @@ class Speakers(AudioDevice):
 
     def __init__(self, app):
         super().__init__(app, "speakers")
+        self.bluetooth = BluetoothAudio(lambda: (self.app.tablets.active() or types.SimpleNamespace(name=None)).name)
+
+    def enable(self):
+        super().enable()
+        if self.module:
+            self.bluetooth.hold()
+
+    def disable(self):
+        super().disable()
+        self.bluetooth.release()
 
     def ours(self, link):
         return link[1].startswith(SPEAKERS_NAME + ":playback_")  # a program playing: a link into it
@@ -1001,6 +1096,7 @@ class Devices:
         self.camera = Camera(app)
         self.microphone = Microphone(app)
         self.speakers = Speakers(app)
+        BluetoothAudio.restore()  # turned off by a Plus One that did not live to turn it back
         self.tablet = None  # the fingerprint of the tablet in use, as last applied
 
     def apply(self):

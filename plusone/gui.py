@@ -9,7 +9,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
-from . import __version__, link, log, once, pen  # noqa: E402
+from . import __version__, link, log, once, pen, wifi  # noqa: E402
 from .app import APP_ID, IN_FLATPAK, set_shell_extension, shell_extension_state  # noqa: E402
 from .devices import neural_available  # noqa: E402
 from .engine import State, parse_size  # noqa: E402
@@ -365,8 +365,29 @@ class Window(Adw.ApplicationWindow):
         updates.connect("notify::active", lambda row, _p: self._set_update_tablet(row.get_active()))
         group.add(updates)
         page.add(group)
+        group = Adw.PreferencesGroup()
+        # The Wi-Fi's power saving, off: the tablet's packets no longer wait
+        # for the radio to wake (15-30 ms); it takes the user's password.
+        self.wifi_row = Adw.SwitchRow(title=_("Low latency Wi-Fi"), active=wifi.low_latency(),
+                                      subtitle=_("The Wi-Fi without power saving: 15-30 ms less delay with the "
+                                                 "tablet, a little more battery. Asks for your password"))
+        self._wifi_handler = self.wifi_row.connect("notify::active", lambda row, _p: self._set_low_latency(row))
+        group.add(self.wifi_row)
+        page.add(group)
         self.tablet_rows = []
         return page
+
+    def _set_low_latency(self, row):
+        on = row.get_active()
+        if on == wifi.low_latency():
+            return
+
+        def done(ok):
+            if not ok:  # no password given: the switch as things are
+                row.handler_block(self._wifi_handler)
+                row.set_active(wifi.low_latency())
+                row.handler_unblock(self._wifi_handler)
+        wifi.set_low_latency(on, done)
 
     def _set_update_tablet(self, on):
         self.settings.update_tablet = on

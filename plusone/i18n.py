@@ -222,6 +222,15 @@ _IT = {
         "Un programma usa il microfono, ma il tablet non è raggiungibile",
     "Not allowed on the tablet: Plus One → For the PC": "Non consentito sul tablet: Plus One → Per il PC",
     "Paused while this PC is locked": "In pausa mentre questo PC è bloccato",
+    "The Wi-Fi's power saving delays the tablet": "Il risparmio energetico del Wi-Fi rallenta il tablet",
+    "15-30 ms more on each packet. Turning it off takes your password; Preferences turn it on again.":
+        "15-30 ms in più su ogni pacchetto. Spegnerlo chiede la tua password; dalle preferenze lo riattivi.",
+    "Turn it off": "Spegnilo",
+    "Low latency Wi-Fi": "Wi-Fi a bassa latenza",
+    "The Wi-Fi without power saving: 15-30 ms less delay with the tablet, a little more battery. "
+    "Asks for your password":
+        "Il Wi-Fi senza risparmio energetico: 15-30 ms di ritardo in meno con il tablet, un po' più di "
+        "batteria. Chiede la tua password",
     "Stopped on the tablet: on again when a program takes it anew":
         "Interrotto sul tablet: riparte quando un programma lo riprende",
     "A program uses the tablet's camera": "Un programma usa la fotocamera del tablet",

@@ -506,3 +506,24 @@ def test_a_paused_stream_is_no_program_playing():
     objects[3]["info"]["output-node-id"] = 41  # only Firefox, paused
     objects[4]["info"]["output-node-id"] = 41
     assert devices.players(objects) == []
+
+
+def test_the_tablets_own_bluetooth_audio_is_off_while_it_is_the_speakers_and_back_after(tmp_path, monkeypatch):
+    cards = [{"name": "bluez_card.54_DD_4F_07_78_77", "active_profile": "a2dp-source",
+              "properties": {"device.description": "Tab"}},
+             {"name": "bluez_card.88_8E", "active_profile": "a2dp-sink",
+              "properties": {"device.description": "Earbuds"}}]
+    calls = []
+    monkeypatch.setattr(devices.BluetoothAudio, "STATE", str(tmp_path / "bluetooth-audio.json"))
+    monkeypatch.setattr(devices.BluetoothAudio, "_cards", staticmethod(lambda: cards))
+    monkeypatch.setattr(devices, "_pactl", lambda *args: calls.append(args))
+    audio = devices.BluetoothAudio(lambda: "Tab")
+    audio._check()
+    assert calls == [("set-card-profile", "bluez_card.54_DD_4F_07_78_77", "off")]  # the tablet's only
+    cards[0]["active_profile"] = "off"
+    audio._check()
+    assert len(calls) == 1
+    # Plus One gone without a word: the next one puts it back.
+    devices.BluetoothAudio.restore()
+    assert calls[-1] == ("set-card-profile", "bluez_card.54_DD_4F_07_78_77", "a2dp-source")
+    assert not (tmp_path / "bluetooth-audio.json").exists()

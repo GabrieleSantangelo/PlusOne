@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Plus One</vendor>
+  <vendor_url>https://github.com/GabrieleSantangelo/PlusOne</vendor_url>
+  <action id="io.github.gabrielesantangelo.plusone.wifi-latency">
+    <description>Turn the Wi-Fi's power saving off or on</description>
+    <message>Plus One wants to change the Wi-Fi's power saving, for the tablet's low latency</message>
+    <!-- A setting of the whole PC: the administrator's password each time. -->
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/plus-one/wifi-latency</annotate>
+  </action>
+</policyconfig>

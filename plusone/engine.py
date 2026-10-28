@@ -46,6 +46,7 @@ class Settings:
     share_signatures: bool = False
     # The Quick Settings toggle offered once, after the first pairing (gui.py).
     toggle_offered: bool = False
+    wifi_latency_asked: bool = False  # told once that the Wi-Fi's power saving delays the tablet (wifi.py)
     # The desktop's size: "auto" (about 1920x1200) or "WxH" at the tablet's
     # proportions; and the tablet's screen, as its app last said.
     app_size: str = "auto"

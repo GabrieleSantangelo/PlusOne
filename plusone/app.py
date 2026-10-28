@@ -24,7 +24,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 from gi.repository import Adw, Gio, GLib, Gst  # noqa: E402
 
-from . import __version__, add_log_handler, i18n, log, once  # noqa: E402
+from . import __version__, add_log_handler, i18n, log, once, wifi  # noqa: E402
 from .engine import Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .signing import Signing  # noqa: E402
@@ -260,6 +260,7 @@ class PlusOneApp(Adw.Application):
                                ("show", lambda *a: self.activate()),
                                ("pair", lambda *a: self._show_and_pair()),
                                ("quit", lambda *a: self._quit()),
+                               ("wifi-latency", lambda *a: wifi.set_low_latency(True, lambda ok: None)),
                                ("restart", lambda *a: self.self_update.pending and self.self_update.restart()),
                                ("whats-new", lambda *a: Gio.AppInfo.launch_default_for_uri(
                                    f"https://github.com/GabrieleSantangelo/PlusOne/releases/tag/v{__version__}", None))):
@@ -291,6 +292,7 @@ class PlusOneApp(Adw.Application):
         # The desktop locked or another user's in front: the tablet's input
         # reaches nothing, its camera and microphone pause (SEC-22).
         self.seat = Seat(self._seat)
+        self._offer_low_latency()
         self._update_hold()
         self.self_update.start()
         updated_from = os.environ.pop(UPDATED_FROM, None)
@@ -298,6 +300,22 @@ class PlusOneApp(Adw.Application):
             self.notify("updates", "Plus One updated to {version}", "From {before}",
                         version=__version__, before=updated_from,
                         button=("What's new", "app.whats-new"))
+
+    def _offer_low_latency(self):
+        """Once, at the first start: the Wi-Fi's power saving delays the
+        tablet; turning it off takes the user's password (Preferences turn it
+        on again)."""
+        if self.settings.wifi_latency_asked or wifi.low_latency():
+            return
+        self.settings.wifi_latency_asked = True
+        self.save_settings()
+
+        def check():
+            if wifi.saving():
+                GLib.idle_add(once(self.notify, "wifi", "The Wi-Fi's power saving delays the tablet",
+                                   "15-30 ms more on each packet. Turning it off takes your password; "
+                                   "Preferences turn it on again.", button=("Turn it off", "app.wifi-latency")))
+        threading.Thread(target=check, name="plusone-wifi-check", daemon=True).start()
 
     def _seat(self, open, active):
         """seat.py: the desktop's session locked, inactive, or open again."""

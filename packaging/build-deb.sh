@@ -56,6 +56,11 @@ install -m 644 "$top/data/pen-helper/io.github.gabrielesantangelo.PlusOne.Pen.se
     "$root/usr/share/dbus-1/system-services/"
 install -m 644 "$top/data/pen-helper/io.github.gabrielesantangelo.PlusOne.Pen.conf" "$root/usr/share/dbus-1/system.d/"
 install -m 644 "$top/data/pen-helper/io.github.gabrielesantangelo.plusone.policy" "$root/usr/share/polkit-1/actions/"
+# Low latency Wi-Fi: the user's yes (their password, polkit) turns the
+# Wi-Fi's power saving off for good, and back on (plusone/wifi.py).
+install -m 755 "$top/data/wifi-latency/plus-one-wifi-latency" "$root/usr/lib/$pkg/wifi-latency"
+install -m 644 "$top/data/wifi-latency/io.github.gabrielesantangelo.plusone.wifi-latency.policy" \
+    "$root/usr/share/polkit-1/actions/"
 install -m 644 "$top/data/$pkg-uhid.conf" "$root/usr/lib/modules-load.d/"
 # The tablet's camera as a webcam: a v4l2loopback device, loaded at boot.
 install -m 644 "$top/data/$pkg-camera.conf" "$root/usr/lib/modules-load.d/"
@@ -104,7 +109,7 @@ Priority: optional
 Architecture: $arch
 Maintainer: $maintainer
 Installed-Size: $size
-Depends: ${shlibs:+$shlibs, }python3 (>= 3.11), python3-gi, python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1 (>= 1.5), gir1.2-gstreamer-1.0, gir1.2-poppler-0.18, python3-pypdf, python3-cryptography, openssl, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-nice, gir1.2-gst-plugins-bad-1.0, swh-plugins, pulseaudio-utils, pipewire-bin, avahi-daemon, kmod, udev, acl, dbus, polkitd | policykit-1
+Depends: ${shlibs:+$shlibs, }python3 (>= 3.11), python3-gi, python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1 (>= 1.5), gir1.2-gstreamer-1.0, gir1.2-poppler-0.18, python3-pypdf, python3-cryptography, openssl, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-nice, gir1.2-gst-plugins-bad-1.0, swh-plugins, pulseaudio-utils, pipewire-bin, avahi-daemon, kmod, udev, acl, dbus, iw, polkitd | policykit-1
 Recommends: gstreamer1.0-vaapi, gstreamer1.0-plugins-ugly, gstreamer1.0-x, gnome-shell (>= 45), python3-nautilus
 Homepage: https://github.com/GabrieleSantangelo/PlusOne
 Description: Samsung Galaxy Tab as a second screen, signing tablet and more
