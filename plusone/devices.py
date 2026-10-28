@@ -35,7 +35,7 @@ MIC_NAME = "plusone_mic"
 SPEAKERS_NAME = "plusone_speakers"
 QUALITIES = {"720p": (1280, 720, 2_500_000), "1080p": (1920, 1080, 5_000_000)}
 FPS = 30
-AGAIN_AFTER_EVENT = 500  # ms: a stream's pause or play, looked at again (AudioDevice._event)
+AGAIN_AFTER_EVENT = 500  # ms: a stream's pause, play or link, looked at again (AudioDevice._look_again)
 RETRY = 3          # seconds between attempts to reach the tablet while wanted
 REFUSED_RETRY = 10  # seconds, after the app said no (the user may change their mind there)
 IN_USE_AFTER = 0.2  # seconds a program holds the device before the tablet is asked
@@ -725,12 +725,17 @@ class AudioDevice(Device):
         if line is None or pauses is not self.pauses:
             return  # switched off, or PipeWire went (the links' watch handles that)
         if "sink-input" in line and self.links:
-            self._who_records()
-            # A stream played again is told before PipeWire runs its node
-            # (still "idle" then): looked at once more a moment later, or a
-            # video played again after a pause went unheard.
-            GLib.timeout_add(AGAIN_AFTER_EVENT, once(lambda: self.links and self._who_records()))
+            self._look_again()
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._event, pauses)
+
+    def _look_again(self):
+        """Who uses it, now and once more a moment later: a stream played
+        again (or made anew, as Chrome does after a pause) is told, and
+        linked, before PipeWire runs its node, still "idle" then; looked at
+        only once, a video played again after a pause went unheard."""
+        self._who_records()
+        for later in (AGAIN_AFTER_EVENT, 3 * AGAIN_AFTER_EVENT):
+            GLib.timeout_add(later, once(lambda: self.links and self._who_records()))
 
     def _line(self, stream, result, watch):
         try:
@@ -752,7 +757,7 @@ class AudioDevice(Device):
             sign, link = changed
             if self.ours(link):
                 (self.links.add if sign in "=+" else self.links.discard)(link)
-                self._who_records()
+                self._look_again()
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line, watch)
 
     def _who_records(self):
@@ -876,6 +881,14 @@ def recorders(objects):
             if props.get("stream.monitor") not in (True, "true", "1"):
                 found.append(str(props.get("application.name") or props.get("node.name") or "?"))
     return found
+
+
+def default_sink():
+    """The output programs play to now, or None."""
+    try:
+        return subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def make_default_sink(name):
@@ -1003,12 +1016,23 @@ class Speakers(AudioDevice):
         super().__init__(app, "speakers")
         self.bluetooth = BluetoothAudio(lambda: (self.app.tablets.active() or types.SimpleNamespace(name=None)).name)
 
+    # The output the user picked, across Plus One's restarts (an update's):
+    # with the sink gone for a moment, the PC's sound went to the next one
+    # (earbuds, say) and stayed there.
+    WAS_OUTPUT = os.path.join(GLib.get_user_state_dir(), "plus-one", "speakers-were-the-output")
+
     def enable(self):
         super().enable()
         if self.module:
             self.bluetooth.hold()
+            if os.path.exists(self.WAS_OUTPUT):
+                make_default_sink(SPEAKERS_NAME)
+                os.remove(self.WAS_OUTPUT)
 
     def disable(self):
+        if self.module and default_sink() == SPEAKERS_NAME:
+            os.makedirs(os.path.dirname(self.WAS_OUTPUT), exist_ok=True)
+            open(self.WAS_OUTPUT, "w").close()
         super().disable()
         self.bluetooth.release()
 

@@ -540,7 +540,29 @@ def test_a_stream_played_again_is_looked_at_again_a_moment_later():
                                    read_line_async=lambda *args: None)
     device = types.SimpleNamespace(pauses=pauses, links={("Chrome:output_FL", "plusone_speakers:playback_FL")},
                                    _who_records=lambda: looked.append(time.monotonic()), _event=None)
+    device._look_again = lambda: devices.AudioDevice._look_again(device)
     devices.AudioDevice._event(device, stream, None, pauses)
     assert len(looked) == 1
-    assert spin(lambda: len(looked) == 2)
+    assert spin(lambda: len(looked) == 3)
     assert looked[1] - looked[0] >= devices.AGAIN_AFTER_EVENT / 1000 - 0.05
+
+
+def test_the_tablets_speakers_stay_the_output_across_a_restart(tmp_path, monkeypatch):
+    made, default = [], ["plusone_speakers"]
+    monkeypatch.setattr(devices.Speakers, "WAS_OUTPUT", str(tmp_path / "speakers-were-the-output"))
+    monkeypatch.setattr(devices, "default_sink", lambda: default[0])
+    monkeypatch.setattr(devices, "make_default_sink", made.append)
+    monkeypatch.setattr(devices.AudioDevice, "enable", lambda self: setattr(self, "module", "42"))
+    monkeypatch.setattr(devices.AudioDevice, "disable", lambda self: setattr(self, "module", None))
+    monkeypatch.setattr(devices.BluetoothAudio, "hold", lambda self: None)
+    monkeypatch.setattr(devices.BluetoothAudio, "release", lambda self: None)
+    speakers = devices.Speakers(FakeApp())
+    speakers.enable()
+    assert made == []  # nothing remembered: the user's choice stands
+    speakers.disable()  # Plus One goes (an update), its output the tablet's
+    default[0] = "bluez_output.earbuds"  # the PC's sound moved meanwhile
+    speakers.enable()
+    assert made == ["plusone_speakers"]
+    speakers.disable()
+    speakers.enable()
+    assert made == ["plusone_speakers"]  # not the output when it went: left alone
