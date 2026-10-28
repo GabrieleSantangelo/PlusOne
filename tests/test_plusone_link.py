@@ -64,7 +64,7 @@ def test_devices_and_connect(world):
     assert link.connect(address) == tablet_id
     (device,) = link.devices()
     assert device["connected"] and device["name"] == "Test tablet"
-    assert set(device["features"]) == {"echo", "sink", "callback"}
+    assert set(device["features"]) == {"echo", "sink", "callback", "frames"}
 
 
 def test_control_and_realtime_channels(world):

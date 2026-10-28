@@ -8,8 +8,7 @@
 //! aggregation's own wait, but whether it grows: the slope of the delay over
 //! the last packet groups against a threshold that follows the path's own
 //! jitter. Growing: the rate is cut to 0.85 of what was acknowledged (at
-//! most 30 %, a round trip apart, never while the application sends less
-//! than allowed: realtime would only starve); steady: up 8 % a second, by a
+//! most 30 %, a round trip apart); steady: up 8 % a second, by a
 //! packet a round trip near the last cut, doubling a round trip after 2 s
 //! clean with the window full; never past 1.5 times what was acknowledged
 //! (no probing while idle). Loss cuts it only past 10 % (Wi-Fi loses
@@ -39,6 +38,18 @@ const PROBE_AFTER: Duration = Duration::from_secs(2);
 const MIN_RATE: f64 = 30_000.0;     // bytes a second
 const START_RATE: f64 = 1_250_000.0; // 10 Mbit/s
 const MIN_PACKETS: u64 = 4;
+/// A queue standing this long is cut, whatever its slope (architecture
+/// §3.11: an emergency cut past 20 ms of queuing delay). The gradient alone
+/// missed a router's deep queue filled slowly by a video just over the
+/// path's rate (356 ms on an emulated home Wi-Fi). Standing: the least
+/// round trip of the last STANDING, over the least of BASE (Wi-Fi's own
+/// jitter is no queue: it does not stand half a second).
+const QUEUE_LIMIT: Duration = Duration::from_millis(20);
+const STANDING: Duration = Duration::from_millis(500);
+const BASE: Duration = Duration::from_secs(10);
+/// The round trips kept as the least of each BUCKET (200 over BASE, not a
+/// sample a packet: a million at a fast path's rate).
+const BUCKET: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct GccConfig {
@@ -105,6 +116,9 @@ struct Gcc {
     loss_window: Instant,
     srtt: Duration,
     last_over: Instant,
+    /// The least round trip of each BUCKET over BASE (its start, the
+    /// least): the base and the standing round trips.
+    samples: VecDeque<(Instant, Duration)>,
 }
 
 impl Gcc {
@@ -114,7 +128,7 @@ impl Gcc {
               previous: None, accumulated: 0.0, smoothed: 0.0, history: VecDeque::new(), deltas: 0, threshold: 12.5,
               last_update: None, over_time: -1.0, over_count: 0, previous_trend: 0.0, signal: Signal::Normal,
               acked: VecDeque::new(), max_mean: None, max_var: 0.4, last_change: now, lost: 0, acked_since: 0,
-              loss_window: now, srtt: Duration::from_millis(50), last_over: now }
+              loss_window: now, srtt: Duration::from_millis(50), last_over: now, samples: VecDeque::new() }
     }
 
     fn ms(&self, t: Instant) -> f64 {
@@ -186,15 +200,25 @@ impl Gcc {
         }
     }
 
+    /// The queue standing now: the least round trip of the last STANDING
+    /// over the least of BASE.
+    fn standing_queue(&self, now: Instant) -> Duration {
+        let least = |since: Instant| self.samples.iter().filter(|(at, _)| *at >= since).map(|(_, rtt)| *rtt).min();
+        match (least(now.checked_sub(STANDING).unwrap_or(now)), least(now.checked_sub(BASE).unwrap_or(now))) {
+            (Some(standing), Some(base)) => standing.saturating_sub(base),
+            _ => Duration::ZERO,
+        }
+    }
+
     fn control(&mut self, now: Instant, app_limited: bool) {
         let Some(acked) = self.acked_rate(now) else { return };
-        let since = now.duration_since(self.last_change).as_secs_f64();
-        // Sending less than allowed (realtime alone): no cut, which would
-        // only starve it (it sends what it must), and what is acknowledged
-        // says the demand, not the path.
-        if app_limited && self.signal == Signal::Over {
-            self.signal = Signal::Normal;
+        if self.standing_queue(now) > QUEUE_LIMIT {
+            self.signal = Signal::Over;
         }
+        let since = now.duration_since(self.last_change).as_secs_f64();
+        // (A cut even while the application sends less than allowed: a
+        // video following the rate always does, and with no cut its queue
+        // filled the router's, 438 ms, on an emulated home Wi-Fi.)
         if !app_limited && !self.slow_start && now.duration_since(self.last_over) > PROBE_AFTER {
             self.slow_start = true;
         }
@@ -257,6 +281,14 @@ impl Gcc {
 impl Controller for Gcc {
     fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, _app_limited: bool, rtt: &RttEstimator) {
         self.srtt = rtt.get();
+        let sample = now.saturating_duration_since(sent);
+        match self.samples.back_mut() {
+            Some((start, least)) if now.duration_since(*start) < BUCKET => *least = (*least).min(sample),
+            _ => self.samples.push_back((now, sample)),
+        }
+        while self.samples.front().is_some_and(|(at, _)| now.duration_since(*at) > BASE) {
+            self.samples.pop_front();
+        }
         self.acked.push_back((now, bytes));
         while self.acked.front().is_some_and(|(t, _)| now.duration_since(*t) > ACKED_WINDOW) {
             self.acked.pop_front();

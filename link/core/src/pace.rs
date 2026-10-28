@@ -19,8 +19,10 @@ pub const TARGET: Duration = Duration::from_millis(8);
 const RECENT: usize = 2;
 /// The least round trip is the least of this long (and the one before).
 const BASE_WINDOW: Duration = Duration::from_secs(10);
-/// Bulk never slower than this (control messages go on).
-const MIN_RATE: f64 = 256.0 * 1024.0;
+/// Bulk never slower than this (control messages go on). (256 KiB/s was
+/// most of a 3 Mbit/s home Wi-Fi: the realtime waited in the router's
+/// queue behind the bulk, 260 ms, on an emulated one.)
+const MIN_RATE: f64 = 32.0 * 1024.0;
 /// Paced faster than this: not paced.
 const UNPACED: f64 = 200e6;
 /// At most one slowing down this often (a sample's queue drains in it).

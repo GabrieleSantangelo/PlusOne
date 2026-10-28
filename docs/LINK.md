@@ -174,6 +174,44 @@ signing with the keystore's key.
   microphone, which leave WebRTC for their own realtime channels (WebRTC
   needs an IP path, the cable and Bluetooth are not one).
 
+## Flow control, and where its numbers come from
+
+Every flow is congestion controlled. On a QUIC path (`quic.rs`) one
+controller (`cc.rs`) holds the rate for everything on it; realtime goes
+first in each packet, and the bulk gets what the realtime leaves. On a TCP
+path the kernel's controller holds the stream, and `pace.rs` slows the
+bulk down while realtime goes (its datagrams' own control: to come).
+
+The aim: from about 15 Mbit/s up (a home ADSL or Wi-Fi, a phone's hotspot,
+Wi-Fi Direct) everything goes perfectly; under 5 Mbit/s it degrades
+gracefully (less quality, no stall). Each number below is one of three
+kinds: from a published algorithm, measured while running, or chosen here
+(and checked on `tools/netbench-grid.sh`'s networks, kept only if it holds
+on all of them).
+
+| Number | Value | Kind |
+|---|---|---|
+| Packet groups (`cc.rs` `GROUP`) | 5 ms | published: GCC (draft-ietf-rmcat-gcc-02) |
+| Trendline window, smoothing, gain | 20 groups, 0.9, 4 | published: WebRTC's `TrendlineEstimator` |
+| Overuse threshold | 12.5 ms at first, 6-600 ms, k_up 0.0087, k_down 0.039 | published: GCC (adapts to the path's jitter while running) |
+| Overuse lasting | 20 ms | chosen (WebRTC's 10 ms cut on Wi-Fi's bursts) |
+| Cut | 0.85 of the rate acknowledged | published: GCC |
+| Increase | 8 % a second; near the last cut a packet a round trip (and 100 ms), at least 5 % a second | published: GCC; the 5 % floor chosen |
+| Never above | 1.5 × acknowledged + 10 KB/s (no probing while idle) | published: WebRTC |
+| Cuts apart | a round trip, 100-200 ms | published: WebRTC's `TimeToReduceFurther` (10-200 ms); the 100 ms floor chosen (what is acknowledged is measured over 200 ms) |
+| A cut on a stale measurement | at most 30 % | chosen |
+| Rate acknowledged, over | 200 ms | chosen |
+| Loss | past 10 %: cut by half the loss | published: GCC's loss-based controller |
+| Queue standing | past 20 ms (least round trip of 500 ms over the least of 10 s): cut | the design's emergency cut (architecture §3.11); the windows chosen |
+| Window | rate × (round trip + 5 ms), 4 packets at least | chosen; QUIC's least is 2 (RFC 9002) |
+| Start | 10 Mbit/s, doubling a round trip until the first overuse | chosen |
+| MTU on a local network | 1452 bytes | derived: 1500 less IP and UDP |
+| Realtime late (`quic.rs` `LATE`) | 100 ms | chosen; to be each channel's own deadline |
+| Bulk handed ahead of the rate | 30 ms (32 KiB at least) | chosen; as `TCP_NOTSENT_LOWAT` on TCP |
+| Bulk's share | 1.25 × rate − 1.2 × realtime's | chosen |
+| Acknowledgements asked | every 2 packets, within 2 ms | chosen (QUIC's default is 25 ms) |
+| TCP bulk pace (`pace.rs`) | 8 ms of queue, 32 KiB/s at least | measured on a hotspot; the floor lowered on an emulated 3 Mbit/s Wi-Fi |
+
 ## Measured
 
 On loopback, the flows of the tablet in use at once from Python (video,

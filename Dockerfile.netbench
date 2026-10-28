@@ -1,0 +1,5 @@
+# The link on an emulated network (tools/netbench.sh): two of these on a
+# Docker network of their own, each shaping its way out with tc.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
