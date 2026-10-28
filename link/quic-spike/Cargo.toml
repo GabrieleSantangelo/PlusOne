@@ -1,0 +1,29 @@
+# Stage 1's QUIC spike (architecture §3.14): quinn measured against today's
+# link on the same networks. A workspace of its own: nothing of the link's
+# builds or locks changes with it.
+[workspace]
+resolver = "3"
+
+[package]
+name = "quic-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "qbench"
+path = "src/main.rs"
+
+[dependencies]
+quinn-udp = { version = "0.5", default-features = false }
+quinn-proto = { version = "0.11", default-features = false }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+bytes = "1"
+
+[profile.release]
+debug = false
+strip = true
