@@ -50,6 +50,20 @@ const BASE: Duration = Duration::from_secs(10);
 /// The round trips kept as the least of each BUCKET (200 over BASE, not a
 /// sample a packet: a million at a fast path's rate).
 const BUCKET: Duration = Duration::from_millis(50);
+/// A queue stands only if packets went through most of STANDING: these
+/// buckets of it at least. Idle, a keepalive's round trip every few
+/// seconds is all there is, and a Wi-Fi in power saving lengthens it (28
+/// to 58 ms on a phone's hotspot): that cut a session doing nothing to the
+/// least rate, 17 times, and the screen started again from there.
+const STANDING_BUCKETS: usize = 6;
+/// The trend says overuse; it is ours only if the least round trip of the
+/// last RISING is over the path's least by RISING_QUEUE too: a queue we
+/// fill raises it within tens of milliseconds, a Wi-Fi's jitter does not
+/// (a few packets late, 9 to 30 ms, the least unchanged). On a phone's
+/// hotspot the trend alone cut 12 times in 90 s with 1 ms queued, a video
+/// of 4 Mbit/s on a path that takes 20.
+const RISING: Duration = Duration::from_millis(150);
+const RISING_QUEUE: Duration = Duration::from_millis(4);
 
 #[derive(Debug, Clone)]
 pub struct GccConfig {
@@ -108,6 +122,7 @@ struct Gcc {
     signal: Signal,
     // Rate control.
     acked: VecDeque<(Instant, u64)>,
+    acked_bytes: u64,  // the sum of acked's
     max_mean: Option<f64>,
     max_var: f64,
     last_change: Instant,
@@ -119,6 +134,39 @@ struct Gcc {
     /// The least round trip of each BUCKET over BASE (its start, the
     /// least): the base and the standing round trips.
     samples: VecDeque<(Instant, Duration)>,
+    /// PLUSONE_LINK_CC_TRACE=1: what it does, every TRACE_EVERY in the log;
+    /// the cuts so far, by why (the trend, a standing queue, loss).
+    traced: Instant,
+    cuts: [u32; 3],
+    why: usize,
+    /// Which controller this is, in a record (each connection has one).
+    id: u32,
+}
+
+const TRACE_EVERY: Duration = Duration::from_millis(250);
+
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLUSONE_LINK_CC_TRACE").as_deref() == Ok("1"))
+}
+
+/// PLUSONE_LINK_CC_RECORD=FILE: every event the controllers get, a line
+/// each, to replay a real network's in a test (the controller's number,
+/// then "a" acknowledged: µs since
+/// the controller began, the packet's age in µs, bytes, smoothed round
+/// trip in µs; "e" the acknowledgements read: µs, app-limited; "l" lost:
+/// µs, bytes, persistent).
+fn record(line: std::fmt::Arguments) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
+        std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("PLUSONE_LINK_CC_RECORD")?;
+        std::fs::File::create(path).ok().map(|f| std::sync::Mutex::new(std::io::BufWriter::new(f)))
+    });
+    if let Some(file) = file {
+        let _ = writeln!(file.lock().unwrap(), "{line}");
+    }
 }
 
 impl Gcc {
@@ -127,8 +175,11 @@ impl Gcc {
         Gcc { start: now, mtu: mtu as u64, rate: START_RATE, out, slow_start: true, state: State::Hold, group: None,
               previous: None, accumulated: 0.0, smoothed: 0.0, history: VecDeque::new(), deltas: 0, threshold: 12.5,
               last_update: None, over_time: -1.0, over_count: 0, previous_trend: 0.0, signal: Signal::Normal,
-              acked: VecDeque::new(), max_mean: None, max_var: 0.4, last_change: now, lost: 0, acked_since: 0,
-              loss_window: now, srtt: Duration::from_millis(50), last_over: now, samples: VecDeque::new() }
+              acked: VecDeque::new(), acked_bytes: 0, max_mean: None, max_var: 0.4, last_change: now, lost: 0,
+              acked_since: 0, loss_window: now, srtt: Duration::from_millis(50), last_over: now, samples: VecDeque::new(),
+              traced: now, cuts: [0; 3], why: 0,
+              id: { static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    NEXT.fetch_add(1, Ordering::Relaxed) } }
     }
 
     fn ms(&self, t: Instant) -> f64 {
@@ -138,7 +189,7 @@ impl Gcc {
     fn acked_rate(&self, now: Instant) -> Option<f64> {
         let first = self.acked.front()?.0;
         let span = now.duration_since(first).as_secs_f64().max(0.05);
-        Some(self.acked.iter().map(|(_, b)| *b).sum::<u64>() as f64 / span)
+        Some(self.acked_bytes as f64 / span)
     }
 
     /// A group complete: its delay variation into the trendline, the trend
@@ -180,6 +231,7 @@ impl Gcc {
                 self.over_time = 0.0;
                 self.over_count = 0;
                 self.signal = Signal::Over;
+                self.why = 0;
             }
         } else if trend < -self.threshold {
             self.over_time = -1.0;
@@ -203,8 +255,18 @@ impl Gcc {
     /// The queue standing now: the least round trip of the last STANDING
     /// over the least of BASE.
     fn standing_queue(&self, now: Instant) -> Duration {
+        self.queued(now, STANDING, STANDING_BUCKETS)
+    }
+
+    /// The least round trip of the last window over the least of BASE, if
+    /// packets went through in so many of its buckets at least (else 0).
+    fn queued(&self, now: Instant, window: Duration, buckets: usize) -> Duration {
+        let since = now.checked_sub(window).unwrap_or(now);
+        if self.samples.iter().rev().take_while(|(at, _)| *at >= since).count() < buckets {
+            return Duration::ZERO;
+        }
         let least = |since: Instant| self.samples.iter().filter(|(at, _)| *at >= since).map(|(_, rtt)| *rtt).min();
-        match (least(now.checked_sub(STANDING).unwrap_or(now)), least(now.checked_sub(BASE).unwrap_or(now))) {
+        match (least(since), least(now.checked_sub(BASE).unwrap_or(now))) {
             (Some(standing), Some(base)) => standing.saturating_sub(base),
             _ => Duration::ZERO,
         }
@@ -212,8 +274,12 @@ impl Gcc {
 
     fn control(&mut self, now: Instant, app_limited: bool) {
         let Some(acked) = self.acked_rate(now) else { return };
+        if self.signal == Signal::Over && self.why == 0 && self.queued(now, RISING, 2) < RISING_QUEUE {
+            self.signal = Signal::Normal;  // jitter: no queue of ours
+        }
         if self.standing_queue(now) > QUEUE_LIMIT {
             self.signal = Signal::Over;
+            self.why = 1;
         }
         let since = now.duration_since(self.last_change).as_secs_f64();
         // (A cut even while the application sends less than allowed: a
@@ -243,6 +309,7 @@ impl Gcc {
         }
         match self.state {
             State::Decrease => {
+                self.cuts[self.why] += 1;
                 self.slow_start = false;
                 // At most 30 % a cut.
                 self.rate = (BETA * acked).max(0.7 * self.rate).max(MIN_RATE).min(self.rate);
@@ -256,7 +323,13 @@ impl Gcc {
                 self.last_change = now;
                 self.last_over = now;
             }
-            State::Increase if !app_limited => {
+            // Up, but never past what goes through by more than half (and
+            // 10 KB/s): the application may send less than allowed. Never
+            // down for it, though (WebRTC's AIMD): the screen follows the
+            // rate, so a still image sent little, the rate followed it down,
+            // the screen down again, to the least in seconds on a 30 Mbit/s
+            // hotspot, with no queue at all.
+            State::Increase if !app_limited && self.rate < 1.5 * acked + 10_000.0 => {
                 if self.slow_start {
                     // Double a round trip until the first overuse.
                     self.rate *= 2f64.powf(since / self.srtt.as_secs_f64().max(0.001)).min(2.0);
@@ -276,11 +349,13 @@ impl Gcc {
         }
         self.rate = self.rate.max(MIN_RATE);
     }
-}
 
-impl Controller for Gcc {
-    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, _app_limited: bool, rtt: &RttEstimator) {
-        self.srtt = rtt.get();
+    /// An acknowledgement: the packet sent at sent, of bytes, the
+    /// smoothed round trip now (quinn's on_ack).
+    fn ack(&mut self, now: Instant, sent: Instant, bytes: u64, srtt: Duration) {
+        record(format_args!("{} a {} {} {bytes} {}", self.id, now.duration_since(self.start).as_micros(),
+                            now.saturating_duration_since(sent).as_micros(), srtt.as_micros()));
+        self.srtt = srtt;
         let sample = now.saturating_duration_since(sent);
         match self.samples.back_mut() {
             Some((start, least)) if now.duration_since(*start) < BUCKET => *least = (*least).min(sample),
@@ -290,8 +365,11 @@ impl Controller for Gcc {
             self.samples.pop_front();
         }
         self.acked.push_back((now, bytes));
+        self.acked_bytes += bytes;
         while self.acked.front().is_some_and(|(t, _)| now.duration_since(*t) > ACKED_WINDOW) {
-            self.acked.pop_front();
+            if let Some((_, gone)) = self.acked.pop_front() {
+                self.acked_bytes -= gone;
+            }
         }
         self.acked_since += bytes;
         match &mut self.group {
@@ -317,7 +395,9 @@ impl Controller for Gcc {
         }
     }
 
-    fn on_end_acks(&mut self, now: Instant, _in_flight: u64, app_limited: bool, _largest: Option<u64>) {
+    /// An acknowledgement frame read through (quinn's on_end_acks).
+    fn end_acks(&mut self, now: Instant, app_limited: bool) {
+        record(format_args!("{} e {} {}", self.id, now.duration_since(self.start).as_micros(), app_limited as u8));
         // Loss past 10 % over the last second: cut by half of it.
         if now.duration_since(self.loss_window) > Duration::from_secs(1) {
             let total = (self.lost + self.acked_since).max(1);
@@ -325,6 +405,7 @@ impl Controller for Gcc {
             if loss > 0.1 {
                 self.rate = (self.rate * (1.0 - 0.5 * loss)).max(MIN_RATE);
                 self.slow_start = false;
+                self.cuts[2] += 1;
             }
             self.lost = 0;
             self.acked_since = 0;
@@ -332,9 +413,30 @@ impl Controller for Gcc {
         }
         self.control(now, app_limited);
         self.out.store(self.rate as u64, Ordering::Relaxed);
+        if tracing() && now.duration_since(self.traced) >= TRACE_EVERY {
+            self.traced = now;
+            crate::log!("cc {:.0} ms: rate {:.0} KB/s, acked {:.0} KB/s, trend {:.2} / {:.2}, {:?} {:?}{}{}, queue {} ms, \
+                         srtt {:.1} ms, cuts: {} by trend, {} by queue, {} by loss, lost {} B",
+                        self.ms(now), self.rate / 1e3, self.acked_rate(now).unwrap_or(0.0) / 1e3, self.previous_trend,
+                        self.threshold, self.signal, self.state, if self.slow_start { " (slow start)" } else { "" },
+                        if app_limited { " app-limited" } else { "" }, self.standing_queue(now).as_millis(),
+                        self.srtt.as_secs_f64() * 1e3, self.cuts[0], self.cuts[1], self.cuts[2], self.lost);
+        }
+    }
+}
+
+impl Controller for Gcc {
+    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, _app_limited: bool, rtt: &RttEstimator) {
+        self.ack(now, sent, bytes, rtt.get());
     }
 
-    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, persistent: bool, lost_bytes: u64) {
+    fn on_end_acks(&mut self, now: Instant, _in_flight: u64, app_limited: bool, _largest: Option<u64>) {
+        self.end_acks(now, app_limited);
+    }
+
+    fn on_congestion_event(&mut self, now: Instant, _sent: Instant, persistent: bool, lost_bytes: u64) {
+        record(format_args!("{} l {} {lost_bytes} {}", self.id, now.duration_since(self.start).as_micros(),
+                            persistent as u8));
         self.lost += lost_bytes;
         if persistent {
             self.rate = MIN_RATE;
@@ -361,5 +463,128 @@ impl Controller for Gcc {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+/// The controller fed timings no network should give (link/fuzz): each
+/// 6 bytes an event (time on, a packet's age, bytes); it must never panic,
+/// and its rate and threshold stay numbers in their bounds.
+#[cfg(fuzzing)]
+pub fn fuzz(data: &[u8]) {
+    let start = Instant::now();
+    let mut gcc = Gcc::new(start, 1200, Arc::default());
+    let mut now = start;
+    for event in data.chunks_exact(6) {
+        now += Duration::from_micros(u16::from_be_bytes([event[0], event[1]]) as u64 * 16);
+        let age = Duration::from_micros(u16::from_be_bytes([event[2], event[3]]) as u64 * 8);
+        let sent = now.checked_sub(age).unwrap_or(start).max(start);
+        let bytes = u16::from_be_bytes([event[4], event[5]]) as u64;
+        match event[5] % 8 {
+            0 => Controller::on_congestion_event(&mut gcc, now, sent, event[4] & 1 == 1, bytes),
+            1 => gcc.end_acks(now, event[4] & 1 == 1),
+            _ => gcc.ack(now, sent, bytes, age.max(Duration::from_micros(100))),
+        }
+        assert!(gcc.rate.is_finite() && gcc.rate >= MIN_RATE, "rate {}", gcc.rate);
+        assert!(gcc.threshold.is_finite() && (6.0..=600.0).contains(&gcc.threshold), "threshold {}", gcc.threshold);
+        assert!(gcc.window() >= MIN_PACKETS * gcc.mtu);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path of rtt, nothing queued: the controller's rate after it
+    /// carried bytes_a_second for seconds (acknowledged a packet at a time).
+    fn carry(gcc: &mut Gcc, now: &mut Instant, bytes_a_second: f64, seconds: f64, rtt: Duration) {
+        carry_with(gcc, now, bytes_a_second, seconds, |_| rtt);
+    }
+
+    /// As carry(), each packet's round trip rtt(seconds into it).
+    fn carry_with(gcc: &mut Gcc, now: &mut Instant, bytes_a_second: f64, seconds: f64, rtt: impl Fn(f64) -> Duration) {
+        let packet = 1200.0;
+        let gap = Duration::from_secs_f64(packet / bytes_a_second);
+        let (start, end) = (*now, *now + Duration::from_secs_f64(seconds));
+        while *now < end {
+            *now += gap;
+            let rtt = rtt(now.duration_since(start).as_secs_f64());
+            gcc.ack(*now, *now - rtt, packet as u64, rtt);
+            gcc.end_acks(*now, false);
+        }
+    }
+
+    #[test]
+    fn sending_less_does_not_take_the_rate_down() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let rtt = Duration::from_millis(10);
+        carry(&mut gcc, &mut now, 3e6, 3.0, rtt);
+        let before = gcc.rate;
+        assert!(before >= 3e6, "{before}");
+        // A still image: a tenth of it, for seconds.
+        carry(&mut gcc, &mut now, 3e5, 3.0, rtt);
+        assert!(gcc.rate >= before, "{} after {before}", gcc.rate);
+        assert_eq!(gcc.cuts, [0; 3]);
+    }
+
+    #[test]
+    fn an_idle_path_in_power_saving_is_no_queue() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        carry(&mut gcc, &mut now, 1e6, 2.0, Duration::from_millis(8));
+        let before = gcc.rate;
+        // Then a keepalive every 2 s, its round trip 30-60 ms (the radio asleep).
+        for i in 0..20u64 {
+            now += Duration::from_secs(2);
+            let rtt = Duration::from_millis(30 + (i * 7) % 30);
+            gcc.ack(now, now - rtt, 60, rtt);
+            gcc.end_acks(now, true);
+        }
+        assert_eq!(gcc.cuts[1], 0, "cut by a queue that is none");
+        assert!(gcc.rate >= before * 0.99, "{} after {before}", gcc.rate);
+    }
+
+    #[test]
+    fn a_wifis_jitter_is_no_overuse() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let rtt = Duration::from_millis(9);
+        carry(&mut gcc, &mut now, 1e6, 2.0, rtt);
+        // Every 300 ms the round trip climbs to 30 ms in 40 ms and comes
+        // back in 40 (a hotspot's radio busy elsewhere); its least stays.
+        let spike = |t: f64| {
+            let into = t % 0.3;
+            let up = if into < 0.04 { into / 0.04 } else if into < 0.08 { (0.08 - into) / 0.04 } else { 0.0 };
+            Duration::from_secs_f64(0.009 + 0.021 * up)
+        };
+        carry_with(&mut gcc, &mut now, 1e6, 6.0, spike);
+        assert_eq!(gcc.cuts, [0; 3]);
+    }
+
+    #[test]
+    fn a_queue_growing_is_cut_early() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
+        // The path's rate falls under ours: the round trip grows 10 ms each 100 ms.
+        for step in 1..=8u64 {
+            carry(&mut gcc, &mut now, 2e6, 0.1, Duration::from_millis(10 + 10 * step));
+        }
+        assert!(gcc.cuts[0] + gcc.cuts[1] > 0, "{:?}", gcc.cuts);
+    }
+
+    #[test]
+    fn a_queue_that_stands_is_cut() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
+        // The same rate, the round trip 40 ms more and staying (a router's queue).
+        carry(&mut gcc, &mut now, 2e6, 1.0, Duration::from_millis(50));
+        assert!(gcc.cuts[1] > 0);
     }
 }

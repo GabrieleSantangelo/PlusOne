@@ -83,13 +83,18 @@ goes over the cable, Wi-Fi Direct or Bluetooth instead.
 - **Every handshake whole**: no session resumed, no tickets, no early
   data, so a device forgotten is refused at its next handshake and a
   stolen resumption secret stands for no one. Only ECDSA P-256 with
-  SHA-256 signs, against the whole pinned certificate.
+  SHA-256 signs, against the whole pinned certificate. The key exchange
+  is the hybrid post-quantum X25519MLKEM768 (rustls on aws-lc-rs), X25519
+  alone with an app or a PC from before it (TLS 1.3 signs the choice).
+- **Who may start a handshake** (`gate.rs`, TCP and QUIC together): 8 at
+  once, 2 from one address; new ones 4 at once then 1 a second from an
+  address, 16 then 8 a second from all. Anyone on the network can try,
+  and each try costs the tablet a keystore signature.
 - **A QUIC path** (`quic.rs`) is dialled with the same certificates.
   Its connection IDs carry a 4-byte HMAC under the endpoint's key: a
   packet for no connection we know whose ID fails it is dropped, and
-  nothing goes back (no stateless reset to strangers). Handshakes: 8 at
-  once at most, 2 from one address; over 2 at once, an address answers
-  a Retry first. One stream, the session's. Keys change within the first
+  nothing goes back (no stateless reset to strangers). Over 2 handshakes
+  at once, an address answers a Retry first. One stream, the session's. Keys change within the first
   1,000 packets, then before the AEAD's limit (2²³ packets for AES-GCM),
   and the connection ends at its integrity limit (quinn).
 - **More paths join** with a token (an HMAC of the session's secret and a
@@ -215,14 +220,15 @@ on all of them).
 | Trendline window, smoothing, gain | 20 groups, 0.9, 4 | published: WebRTC's `TrendlineEstimator` |
 | Overuse threshold | 12.5 ms at first, 6-600 ms, k_up 0.0087, k_down 0.039 | published: GCC (adapts to the path's jitter while running) |
 | Overuse lasting | 20 ms | chosen (WebRTC's 10 ms cut on Wi-Fi's bursts) |
+| Overuse is ours only if | the least round trip of 150 ms is 4 ms over the path's least | chosen: on a phone's hotspot the trend alone cut 12 times in 90 s on the radio's jitter, 1 ms queued |
 | Cut | 0.85 of the rate acknowledged | published: GCC |
 | Increase | 8 % a second; near the last cut a packet a round trip (and 100 ms), at least 5 % a second | published: GCC; the 5 % floor chosen |
-| Never above | 1.5 × acknowledged + 10 KB/s (no probing while idle) | published: WebRTC |
+| Never above | 1.5 × acknowledged + 10 KB/s, going up; never down for it | published: WebRTC (`AimdRateControl`); applied going down too, a still screen took the rate, and the screen with it, to the least in seconds |
 | Cuts apart | a round trip, 100-200 ms | published: WebRTC's `TimeToReduceFurther` (10-200 ms); the 100 ms floor chosen (what is acknowledged is measured over 200 ms) |
 | A cut on a stale measurement | at most 30 % | chosen |
 | Rate acknowledged, over | 200 ms | chosen |
 | Loss | past 10 %: cut by half the loss | published: GCC's loss-based controller |
-| Queue standing | past 20 ms (least round trip of 500 ms over the least of 10 s): cut | the design's emergency cut (architecture §3.11); the windows chosen |
+| Queue standing | past 20 ms (least round trip of 500 ms over the least of 10 s): cut; only with packets in 6 of its 10 buckets of 50 ms | the design's emergency cut (architecture §3.11); the windows chosen; idle, a Wi-Fi asleep lengthened the keepalives' round trips: 17 cuts to the least |
 | Window | rate × (round trip + 5 ms), 4 packets at least | chosen; QUIC's least is 2 (RFC 9002) |
 | Start | 10 Mbit/s, doubling a round trip until the first overuse | chosen |
 | MTU on a local network | 1452 bytes | derived: 1500 less IP and UDP |
@@ -231,6 +237,13 @@ on all of them).
 | Bulk's share | 1.25 × rate − 1.2 × realtime's | chosen |
 | Acknowledgements asked | every 2 packets, within 2 ms | chosen (QUIC's default is 25 ms) |
 | TCP bulk pace (`pace.rs`) | 8 ms of queue, 32 KiB/s at least | measured on a hotspot; the floor lowered on an emulated 3 Mbit/s Wi-Fi |
+| Screen's bitrate on QUIC (`appdisplay.py`) | 0.85 of the controller's rate, changed past 5 % | chosen; a frame lost asks for a keyframe, it no longer cuts the bitrate (a third each, 20 to 4 Mbit/s in 4 s on a hotspot taking 36) |
+
+`PLUSONE_LINK_CC_TRACE=1` puts what the controller does in the log four
+times a second (rate, what is acknowledged, trend and threshold, state,
+queue, its cuts by why); `PLUSONE_LINK_CC_RECORD=FILE` writes every event
+it gets (each acknowledgement's times, losses), a real network's to replay
+in a test.
 
 ## Measured
 
