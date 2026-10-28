@@ -319,6 +319,17 @@ def test_the_bitrate_follows_the_network():
     assert rate.report(60, 9, 30, 20) is None  # nor below the least
 
 
+def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
+    rate = appdisplay.RateControl(20000)
+    assert rate.report(60, 0, 30, 20, budget=10000) == 8500  # a share of it
+    assert rate.report(55, 3, 30, 20, budget=10000) is None  # a frame lost: no cut
+    assert rate.report(60, 0, 30, 20, budget=10300) is None  # a few percent: no change
+    assert rate.report(60, 0, 30, 20, budget=40000) == 20000  # never past the one set
+    assert rate.report(60, 0, 30, 20, budget=500) == appdisplay.MIN_KBPS  # nor below the least
+    rate.kbps = 9000
+    assert rate.report(55, 3, 30, 20) == 6000  # no budget (a TCP path): a frame lost cuts, as before
+
+
 def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():
     rate = appdisplay.RateControl(20000)
     rate.kbps = 10000

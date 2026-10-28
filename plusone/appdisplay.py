@@ -410,6 +410,8 @@ class RateControl:
     with enough frames: a still desktop's one or two say little (Wi-Fi's
     own jitter), and it went down for nothing."""
 
+    SHARE = 0.85    # of a path's budget (its congestion controller's), the video's
+    STEADY = 0.05   # a change of the budget under this much: none for the encoder
     GROWN_MS = 25   # over the least: a queue
     CLEAN = 3       # reports in a row without loss nor queue before going up
     HISTORY = 10    # reports the least is taken over
@@ -428,9 +430,20 @@ class RateControl:
         self.ceiling_age = 0  # reports since
         self.delays = collections.deque(maxlen=self.HISTORY)
 
-    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0):
+    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None):
         """A report, and the frames not encoded since the last; the new
-        bitrate if it changed, else None."""
+        bitrate if it changed, else None. budget: what the path's congestion
+        controller allows (kbit/s), if it has one (QUIC's GCC): the bitrate
+        is SHARE of it, and a frame lost is a keyframe's business, not the
+        bitrate's (a Wi-Fi loses one now and then; cut by a third each time,
+        the picture went from 20 to 4 Mbit/s in 4 s on a hotspot taking 36,
+        and took 50 s to come back)."""
+        if budget:
+            self.clean, self.ceiling = 0, None
+            target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE)))
+            if abs(target - self.kbps) < self.kbps * self.STEADY:
+                return None
+            return self._set(target)
         delay = capture_to_decoded - first_to_decoded if shown >= self.FRAMES else None
         if delay is not None:
             self.delays.append(delay)
@@ -503,12 +516,19 @@ class LinkPackets:
 
     def rtt(self):
         """The session's round trip (seconds), or None if not known."""
-        try:
-            device = next((d for d in self.connection.devices() if d["id"] == self.device), None)
-        except (OSError, ValueError, plusone_link.LinkError):
-            return None
-        ms = device.get("rtt_ms") if device else None
+        ms = self._device().get("rtt_ms")
         return ms / 1000 if ms else None
+
+    def budget_kbps(self):
+        """What the path's congestion controller allows now (kbit/s): a
+        QUIC path's (GCC), else None (the stream of before has none)."""
+        return self._device().get("rate_kbps") or None
+
+    def _device(self):
+        try:
+            return next((d for d in self.connection.devices() if d["id"] == self.device), None) or {}
+        except (OSError, ValueError, plusone_link.LinkError):
+            return {}
 
     def receive(self, timeout):
         """A body from the app, or None (nothing in time, or the channels over)."""
@@ -687,7 +707,8 @@ class AppStreamer:
                 encoded, self._encoded = sorted(self._encoded), []
                 skipped, self.skipped = self.skipped, 0
                 before = self.rate.kbps
-                kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped)
+                budget = self.channel.budget_kbps() if hasattr(self.channel, "budget_kbps") else None
+                kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget)
                 if kbps is not None:
                     self.enc.set_property("bitrate", kbps)
                     media.cap_keyframes(self.enc, kbps, self.fps)
