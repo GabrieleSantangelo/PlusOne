@@ -312,9 +312,10 @@ class PlusOneApp(Adw.Application):
 
         def check():
             if wifi.saving():
-                GLib.idle_add(once(self.notify, "wifi", "The Wi-Fi's power saving delays the tablet",
-                                   "15-30 ms more on each packet. Turning it off takes your password; "
-                                   "Preferences turn it on again.", button=("Turn it off", "app.wifi-latency")))
+                GLib.idle_add(once(lambda: self.notify(
+                    "wifi", "The Wi-Fi's power saving delays the tablet",
+                    "15-30 ms more on each packet. Turning it off takes your password; Preferences turn it on "
+                    "again.", button=("Turn it off", "app.wifi-latency"))))
         threading.Thread(target=check, name="plusone-wifi-check", daemon=True).start()
 
     def _seat(self, open, active):
