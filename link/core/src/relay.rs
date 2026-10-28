@@ -16,7 +16,7 @@ use std::time::Duration;
 const HELLO: &str = "PLUSONE-RELAY-1 ";
 const PAIRED: &[u8] = b"PAIRED\n";
 /// A side waits this long for the other.
-pub const WAIT: Duration = Duration::from_secs(30);
+const WAIT: Duration = Duration::from_secs(30);
 
 /// The rendezvous of two devices (their fingerprints, in either order).
 pub fn rendezvous(one: &str, other: &str) -> String {

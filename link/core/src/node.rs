@@ -11,15 +11,13 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 /// A feature's code for the channels the other side opens for it.
 pub type Handler = Arc<dyn Fn(Incoming) + Send + Sync>;
 
-/// Connections not yet a session, at once; more wait for none (closed).
-const HANDSHAKES: usize = 8;
 /// A connection that is not a session this long after it came: closed
 /// (each read has its own timeout too; this is the whole of it).
 const HANDSHAKE_WHOLE: Duration = Duration::from_secs(8);
@@ -49,10 +47,10 @@ pub(crate) struct NodeInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     events: Mutex<Option<Arc<dyn Fn(Event) + Send + Sync>>>,
     listeners: Mutex<Vec<TcpListener>>,
-    handshakes: AtomicUsize,
+    /// Who may start a handshake, by TCP or QUIC (gate.rs).
+    gate: Arc<crate::gate::Gate>,
     /// QUIC's endpoint: the listening one, or one to dial from.
     quic: Mutex<Option<quinn::Endpoint>>,
-    quic_handshakes: Arc<AtomicUsize>,
     /// Where we take QUIC (0: we do not), said in our hello.
     quic_port: std::sync::atomic::AtomicU16,
     /// Our TCP paths to a device that takes QUIC move to it (upgrade_to_quic).
@@ -173,20 +171,17 @@ impl NodeInner {
     /// before, if any, ends (the device forgot it: restarted, say).
     fn add(self: &Arc<Self>, established: session::Established) -> std::io::Result<Arc<Session>> {
         // A TCP path we made to a device that takes QUIC: a QUIC path to
-        // it after, which takes over (QUIC over TCP, the same kind).
-        if let Some(address) = established.quic_offer().filter(|_| self.quic_upgrade.load(Ordering::SeqCst)) {
-            let (node, kind) = (self.clone(), established.kind().to_owned());
-            let _ = std::thread::Builder::new().name("link-quic-upgrade".into()).spawn(move || {
-                if let Err(e) = node.connect_quic(address, QUIC_TRY, &kind) {
-                    log!("{address}: no QUIC path ({e}): TCP stays");
-                }
-            });
-        }
+        // it after, which takes over (QUIC over TCP, the same kind); only
+        // from a path taken, not from one dropped for a better.
+        let upgrade = established.quic_offer().filter(|_| self.quic_upgrade.load(Ordering::SeqCst))
+            .map(|address| (address, established.kind().to_owned()));
         if let Some(id) = established.resumes.clone() {
             let existing = self.sessions.lock().unwrap().get(&established.peer).cloned();
             if let Some(existing) = existing.filter(|s| s.id == id) {
                 let kind = established.kind().to_owned();
-                if !existing.adopt(established) {
+                if existing.adopt(established) {
+                    self.upgrade(&existing, upgrade);
+                } else {
                     log!("{}: a {kind} path not taken (a better one is up)", existing.name);
                 }
                 return Ok(existing);
@@ -211,7 +206,23 @@ impl NodeInner {
         log!("{}: a session ({})", if session.name.is_empty() { &session.peer[..8] } else { &session.name },
              session.peer.get(..16).unwrap_or(""));
         self.event(Event::Up(session.clone()));
+        self.upgrade(&session, upgrade);
         Ok(session)
+    }
+
+    /// The QUIC path add() asks for, on a thread: unless the session is on
+    /// QUIC already by then (one dial, one QUIC path), or over.
+    fn upgrade(self: &Arc<Self>, session: &Arc<Session>, upgrade: Option<(SocketAddr, String)>) {
+        let Some((address, kind)) = upgrade else { return };
+        let (node, session) = (self.clone(), session.clone());
+        let _ = std::thread::Builder::new().name("link-quic-upgrade".into()).spawn(move || {
+            if session.is_closed() || session.by_quic() {
+                return;
+            }
+            if let Err(e) = node.connect_quic(address, QUIC_TRY, &kind) {
+                log!("{address}: no QUIC path ({e}): TCP stays");
+            }
+        });
     }
 }
 
@@ -231,9 +242,8 @@ impl Node {
             sessions: Mutex::default(),
             events: Mutex::default(),
             listeners: Mutex::default(),
-            handshakes: AtomicUsize::new(0),
+            gate: crate::gate::Gate::new(),
             quic: Mutex::default(),
-            quic_handshakes: Arc::default(),
             quic_port: std::sync::atomic::AtomicU16::new(0),
             quic_upgrade: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -290,29 +300,29 @@ impl Node {
                     break;
                 }
                 let Ok(tcp) = tcp else { continue };
-                // So many at once, no more: anyone on the network can connect.
-                if node.handshakes.fetch_add(1, Ordering::SeqCst) >= HANDSHAKES {
-                    node.handshakes.fetch_sub(1, Ordering::SeqCst);
-                    continue;
-                }
+                // Anyone on the network can connect: the gate says who may
+                // now (dropped unanswered).
+                let Some(handshake) = tcp.peer_addr().ok().and_then(|from| node.gate.start(from.ip())) else { continue };
                 let node = node.clone();
                 // Each on its own: a slow or hostile one holds up no other.
+                // (The handshake goes back when the thread ends, or if it
+                // never starts.)
                 let _ = std::thread::Builder::new().name("link-accept".into()).spawn(move || {
                     let from = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
                     crate::stream::tune_tcp(&tcp);
-                    let done = Arc::new(AtomicBool::new(false));
+                    // Closed if it is no session within HANDSHAKE_WHOLE; the
+                    // watch ends as soon as it is one (or not).
+                    let (done, ended) = mpsc::channel::<()>();
                     if let Ok(watched) = tcp.try_clone() {
-                        let done = done.clone();
                         let _ = std::thread::Builder::new().name("link-accept-watch".into()).spawn(move || {
-                            std::thread::sleep(HANDSHAKE_WHOLE);
-                            if !done.load(Ordering::SeqCst) {
+                            if ended.recv_timeout(HANDSHAKE_WHOLE) == Err(mpsc::RecvTimeoutError::Timeout) {
                                 let _ = watched.shutdown(std::net::Shutdown::Both);
                             }
                         });
                     }
                     let result = node.accept(Box::new(tcp), "lan");
-                    done.store(true, Ordering::SeqCst);
-                    node.handshakes.fetch_sub(1, Ordering::SeqCst);
+                    drop(done);
+                    drop(handshake);
                     if let Err(e) = result {
                         log!("{from}: no session ({e})");
                     }
@@ -337,7 +347,7 @@ impl Node {
         *self.0.quic.lock().unwrap() = Some(endpoint.clone());
         self.0.quic_port.store(bound.port(), Ordering::SeqCst);
         let node = self.0.clone();
-        crate::quic::listen(endpoint, self.0.server.clone(), self.0.quic_handshakes.clone(), HANDSHAKES, HANDSHAKE_WHOLE,
+        crate::quic::listen(endpoint, self.0.server.clone(), self.0.gate.clone(), HANDSHAKE_WHOLE,
                             move |stream, quic| {
             let from = quic.conn.remote_address();
             if node.closed.load(Ordering::SeqCst) {

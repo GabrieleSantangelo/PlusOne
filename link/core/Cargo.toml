@@ -10,16 +10,22 @@ license.workspace = true
 name = "plusone_link"
 
 [dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# aws-lc-rs: the post-quantum hybrid key exchange (X25519MLKEM768,
+# architecture §3.14); ring still seals the datagrams.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 ring = "0.17"
 serde_json = "1"
 libc = "0.2"
 # QUIC for the IP paths (architecture §3.14, decided after the spike):
 # quinn on a small tokio runtime of the core's own.
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 bytes = "1"
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+
+[lints.rust]
+# link/fuzz builds the core with --cfg fuzzing (cargo-fuzz): its ways in.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

@@ -4,7 +4,8 @@
 //!   never leaves Android's keystore: the TLS handshake asks signer.sign;
 //! - nativeSetPaired(handle, fingerprints): the PCs it trusts, as they change;
 //! - nativeRequest(handle, json): listen, connect, accept_fd (a session the
-//!   PC starts on a USB accessory's fd, bridged), open (the channel's
+//!   PC starts on a USB accessory's fd, bridged), accept_stream (on a
+//!   Bluetooth socket's, bridged by the app), open (the channel's
 //!   descriptor in the answer's "fd", the caller's to own), serve, unserve,
 //!   devices, close;
 //! - nativeNext(handle, ms): the next event (a channel the PC opened, with
@@ -230,7 +231,8 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
         }
         "connect" => {
             let address = text("address")?.parse().map_err(|e| format!("the address: {e}"))?;
-            let session = core.node.connect(address, Duration::from_secs_f64(request["timeout"].as_f64().unwrap_or(5.0)))?;
+            let timeout = request["timeout"].as_f64().filter(|t| t.is_finite()).unwrap_or(5.0).clamp(0.1, 60.0);
+            let session = core.node.connect(address, Duration::from_secs_f64(timeout))?;
             Ok(json!({"ok": true, "device": session.peer}))
         }
         "accept_fd" => {

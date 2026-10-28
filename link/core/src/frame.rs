@@ -1,5 +1,5 @@
-//! Frames on a stream (the session's TLS stream; later a USB or a
-//! Bluetooth one): a kind, a channel, a length, the bytes.
+//! Frames on the session's TLS stream (on TCP, a QUIC stream, the cable,
+//! Bluetooth): a kind, a channel, a length, the bytes.
 
 use std::io;
 

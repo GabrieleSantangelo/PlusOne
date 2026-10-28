@@ -111,7 +111,8 @@ impl Daemon {
     }
 
     fn connect(&self, request: &Value) -> Result<Value, String> {
-        let timeout = Duration::from_secs_f64(request["timeout"].as_f64().unwrap_or(5.0).clamp(0.1, 60.0));
+        let timeout = request["timeout"].as_f64().filter(|t| t.is_finite()).unwrap_or(5.0).clamp(0.1, 60.0);
+        let timeout = Duration::from_secs_f64(timeout);
         let session = match (request["address"].as_str(), request["device"].as_str()) {
             (Some(address), _) => {
                 let address = address.parse().map_err(|e| format!("the address: {e}"))?;
@@ -219,7 +220,8 @@ impl Daemon {
     }
 
     fn browse(&self, request: &Value) -> Result<Value, String> {
-        let wait = Duration::from_secs_f64(request["wait"].as_f64().unwrap_or(1.5).clamp(0.1, 10.0));
+        let wait = request["wait"].as_f64().filter(|w| w.is_finite()).unwrap_or(1.5).clamp(0.1, 10.0);
+        let wait = Duration::from_secs_f64(wait);
         let found = plusone_link::mdns::browse(SERVICE, wait, |_| false).map_err(|e| e.to_string())?;
         let tablets: Vec<Value> = found.iter().map(|f| json!({
             "id": f.txt.get("id"), "name": f.txt.get("name"), "version": f.txt.get("v"),

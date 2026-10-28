@@ -207,6 +207,14 @@ impl Records {
     }
 }
 
+/// What one response tells of service (link/fuzz: a stranger's packet).
+#[cfg(fuzzing)]
+pub fn read_response(service: &str, message: &[u8]) -> Vec<Found> {
+    let mut records = Records::default();
+    let _ = records.read(message);
+    records.found(service, SocketAddr::from(([192, 0, 2, 1], 5353)))
+}
+
 /// A name at at (compression followed): it, and where the record goes on.
 fn name(message: &[u8], mut at: usize) -> Option<(String, usize)> {
     let mut labels: Vec<String> = Vec::new();

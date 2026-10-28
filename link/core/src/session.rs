@@ -3,9 +3,10 @@
 //! session lasts (the cable plugged in or pulled, the Wi-Fi lost and back).
 //!
 //! A path: a TLS 1.3 stream (the session's messages, the control
-//! channels; input and realtime too while there is no UDP), and a UDP
-//! socket when there is IP under it (input and realtime, sealed with the
-//! session's keys from the first TLS exporter). A path lost, the session
+//! channels; input and realtime too while there is no UDP), and, when
+//! there is IP under it, a UDP socket or the QUIC connection's datagrams
+//! (input and realtime, sealed with the session's keys from the first TLS
+//! exporter). A path lost, the session
 //! waits RESUME_WAIT for another (the dialer makes one: plus-one-link);
 //! a better one coming (the cable) takes over. Each side numbers its
 //! reliable frames (the session's messages, the control channels'); a ping
@@ -16,7 +17,8 @@
 //! - the session's: it alone touches the path's TLS connection; reads,
 //!   writes what the others queued (woken by an eventfd), pings each
 //!   second, takes a path handed over, waits for one when it is lost;
-//! - the path's datagrams': opens what arrives and hands it to its channel;
+//! - the path's datagrams': opens what arrives and hands it to its channel
+//!   (a QUIC path's, on quinn's runtime: quic.rs);
 //! - one per channel: what the feature writes, to the other side.
 
 use crate::frame::{self, Decoder};
@@ -105,6 +107,11 @@ const PROBE_BUSY: Duration = Duration::from_millis(40);
 const ROOM_POLL: Duration = Duration::from_millis(2);
 /// Reliable frames taken since the last ping that make one go at once.
 const ACK_AFTER: u64 = 32;
+/// Reliable bytes sent and not yet acknowledged, at most: past it no more
+/// go until the other side says it has them (it acknowledges each
+/// ACK_AFTER frames, 32 MiB at the very most; one that never does holds no
+/// more of ours than this).
+const UNACKED_MOST: usize = 64 << 20;
 const KEYS_LABEL: &[u8] = b"EXPORTER-plus-one-link datagrams";
 const ID_LABEL: &[u8] = b"EXPORTER-plus-one-link session";
 const DATAGRAM_PATH: u16 = 0;  // the datagrams' own channel: pings and pongs
@@ -195,14 +202,18 @@ struct End {
     sent: AtomicU64,
     granted: AtomicU64,
     /// Flow: what comes for it, to its feature in order on a thread of its
-    /// own (None: the channel's end, after what came before it).
+    /// own (None: the channel's end, after what came before it); bytes
+    /// come, and taken by the feature.
     inbox: Mutex<Option<mpsc::Sender<Option<Vec<u8>>>>>,
+    received: AtomicU64,
+    taken: AtomicU64,
 }
 
 impl End {
     fn new(id: u16, class: Class, fd: OwnedFd) -> End {
         End { id, class, fd, newest: AtomicU64::new(0), gone: AtomicBool::new(false), sent: AtomicU64::new(0),
-              granted: AtomicU64::new(0), inbox: Mutex::new(None) }
+              granted: AtomicU64::new(0), inbox: Mutex::new(None), received: AtomicU64::new(0),
+              taken: AtomicU64::new(0) }
     }
 }
 
@@ -330,6 +341,7 @@ impl Outbox {
 struct Reliable {
     next: u64,
     unacked: VecDeque<(u64, Vec<u8>)>,
+    unacked_bytes: usize,
     heard: u64,
     acknowledged: u64,  // the newest of theirs we said we have
 }
@@ -754,15 +766,26 @@ impl Session {
         if self.is_closed() {
             return Err("the session is over".into());
         }
-        if self.channels.lock().unwrap().len() >= MAX_CHANNELS {
-            return Err(format!("{feature}/{name}: {MAX_CHANNELS} channels open already"));
-        }
-        let id = self.next_id.fetch_add(2, Ordering::Relaxed);
         let (ours, theirs) = sys::seqpacket_pair(CHANNEL_BUFFER).map_err(|e| e.to_string())?;
         // Ours before the other side hears of it: what it sends at once waits in the socket.
-        let end = Arc::new(End::new(id, class, ours));
+        let end = {
+            let mut channels = self.channels.lock().unwrap();
+            if channels.len() >= MAX_CHANNELS {
+                return Err(format!("{feature}/{name}: {MAX_CHANNELS} channels open already"));
+            }
+            // Ids come round again (u16): none in use, and never the path's own.
+            let id = loop {
+                let id = self.next_id.fetch_add(2, Ordering::Relaxed);
+                if id != DATAGRAM_PATH && !channels.contains_key(&id) {
+                    break id;
+                }
+            };
+            let end = Arc::new(End::new(id, class, ours));
+            channels.insert(id, end.clone());
+            end
+        };
+        let id = end.id;
         self.inbox(&end);
-        self.channels.lock().unwrap().insert(id, end.clone());
         let (answer, answered) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, answer);
         self.send_message(json!({"t": "open", "id": id, "feature": feature, "channel": name, "class": class.name()}));
@@ -814,7 +837,8 @@ impl Session {
     fn pump(self: &Arc<Self>, end: Arc<End>) {
         let (me, id) = (self.clone(), end.id);
         let spawned = std::thread::Builder::new().name("link-channel".into()).spawn(move || {
-            let mut buf = vec![0u8; if end.class == Class::Control { frame::MAX } else { 64 << 10 }];
+            // A control message numbered (8 bytes more) is still a frame.
+            let mut buf = vec![0u8; if end.class == Class::Control { frame::MAX - 8 } else { 64 << 10 }];
             let mut sealed = Vec::with_capacity(2048);
             loop {
                 let length = match sys::recv(end.fd.as_raw_fd(), &mut buf) {
@@ -855,7 +879,7 @@ impl Session {
                 return false;
             }
             let sent = end.sent.load(Ordering::Relaxed);
-            if sent + length <= end.granted.load(Ordering::Relaxed) + WINDOW {
+            if sent.saturating_add(length) <= end.granted.load(Ordering::Relaxed).saturating_add(WINDOW) {
                 end.sent.store(sent + length, Ordering::Relaxed);
                 return true;
             }
@@ -874,12 +898,12 @@ impl Session {
         *end.inbox.lock().unwrap() = Some(inbox);
         let (me, end) = (Arc::downgrade(self), end.clone());
         let _ = std::thread::Builder::new().name("link-inbox".into()).spawn(move || {
-            let (mut taken, mut told) = (0u64, 0u64);
+            let mut told = 0u64;
             while let Ok(Some(message)) = arriving.recv() {
                 if sys::send(end.fd.as_raw_fd(), &message, true).is_err() {
                     break;  // its feature gone
                 }
-                taken += message.len() as u64;
+                let taken = end.taken.fetch_add(message.len() as u64, Ordering::Relaxed) + message.len() as u64;
                 if taken - told >= GRANT_EVERY {
                     told = taken;
                     let Some(me) = me.upgrade() else { break };
@@ -914,18 +938,41 @@ impl Session {
         }
     }
 
-    /// A message for a channel, from the other side, into its socket.
-    fn deliver(&self, id: u16, body: &[u8], count: Option<u64>) {
+    /// A message for a channel, from the other side, into its socket: a
+    /// reliable one for a control channel, a datagram for the others
+    /// (count: its counter, if it came sealed), else dropped.
+    fn deliver(&self, id: u16, body: &[u8], reliable: bool, count: Option<u64>) {
         let Some(end) = self.channels.lock().unwrap().get(&id).cloned() else { return };
+        if (end.class == Class::Control) != reliable {
+            return;
+        }
         if let (Class::Input, Some(count)) = (end.class, count) {
             // An older state must not undo a newer one.
-            if count < end.newest.fetch_max(count + 1, Ordering::Relaxed) {
+            if count < end.newest.fetch_max(count.saturating_add(1), Ordering::Relaxed) {
                 return;
             }
         }
-        if let Some(inbox) = end.inbox.lock().unwrap().as_ref() {
-            let _ = inbox.send(Some(body.to_vec()));
-            return;
+        let overflowed = match end.inbox.lock().unwrap().as_ref() {
+            Some(inbox) => {
+                // The other side sends WINDOW past what it was told the
+                // feature took, at most: more, and it ignores the flow.
+                let received = end.received.fetch_add(body.len() as u64, Ordering::Relaxed) + body.len() as u64;
+                let over = received > end.taken.load(Ordering::Relaxed).saturating_add(WINDOW + GRANT_EVERY);
+                if !over {
+                    let _ = inbox.send(Some(body.to_vec()));
+                }
+                Some(over)
+            }
+            None => None,
+        };
+        match overflowed {
+            Some(true) => {
+                log!("{}: channel {id} sent past its window: closed", self.label());
+                self.close_channel(id, true);
+                return;
+            }
+            Some(false) => return,
+            None => {}
         }
         let fd = end.fd.as_raw_fd();
         let mut result = sys::send(fd, body, false);
@@ -978,6 +1025,7 @@ impl Session {
             let mut bytes = Vec::with_capacity(frame::HEADER + numbered.len());
             frame::encode(waiting.kind, waiting.channel, &numbered, &mut bytes);
             out.extend_from_slice(&bytes);
+            reliable.unacked_bytes += bytes.len();
             reliable.unacked.push_back((number, bytes));
         }
     }
@@ -1093,7 +1141,7 @@ impl Session {
         let mut next_udp_ping = Instant::now();
         // Frames that came with the hello.
         while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
-            self.frame(path, kind, channel, body);
+            self.frame(kind, channel, body)?;
         }
         loop {
             if self.is_closed() {
@@ -1108,7 +1156,8 @@ impl Session {
             if !conn.wants_write() {
                 let reliable = {
                     let mut pace = self.pace.lock().unwrap();
-                    if pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
+                    let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
+                    if room && pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
                 };
                 let (mut out, fresh, taken) = self.outbox.lock().unwrap().take(reliable);
                 if !fresh.is_empty() {
@@ -1160,7 +1209,7 @@ impl Session {
             }
             let ack_due = {
                 let reliable = self.reliable.lock().unwrap();
-                reliable.heard >= reliable.acknowledged + ACK_AFTER
+                reliable.heard >= reliable.acknowledged.saturating_add(ACK_AFTER)
             };
             if now >= next_ping || ack_due {
                 next_ping = now + PING_EVERY;
@@ -1218,27 +1267,33 @@ impl Session {
             }
             while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
                 path.heard();
-                self.frame(path, kind, channel, body);
+                self.frame(kind, channel, body)?;
             }
         }
     }
 
-    fn frame(self: &Arc<Self>, _path: &Arc<Path>, kind: u8, channel: u16, body: Vec<u8>) {
+    /// A frame from the stream; an error ends the path (the other side
+    /// broke the protocol).
+    fn frame(self: &Arc<Self>, kind: u8, channel: u16, body: Vec<u8>) -> Result<(), String> {
         match kind {
             frame::SESSION | frame::MESSAGE => {
                 if body.len() < 8 {
-                    return;
+                    return Err("a reliable frame with no number".into());
                 }
                 let number = u64::from_be_bytes(body[..8].try_into().unwrap());
                 {
                     let mut reliable = self.reliable.lock().unwrap();
                     if number <= reliable.heard {
-                        return;  // had it: sent again after a path was lost
+                        return Ok(());  // had it: sent again after a path was lost
+                    }
+                    // A stream keeps them in order, and none is skipped.
+                    if number != reliable.heard + 1 {
+                        return Err(format!("frame {number} after {}", reliable.heard));
                     }
                     reliable.heard = number;
                 }
                 if kind == frame::MESSAGE {
-                    self.deliver(channel, &body[8..], None);
+                    self.deliver(channel, &body[8..], true, None);
                 } else {
                     match serde_json::from_slice::<Value>(&body[8..]) {
                         Ok(message) => self.message(&message),
@@ -1246,16 +1301,19 @@ impl Session {
                     }
                 }
             }
-            frame::DATAGRAM => self.deliver(channel, &body, None),
+            frame::DATAGRAM => self.deliver(channel, &body, false, None),
             frame::PING if body.len() >= 8 => {
                 let acknowledged = u64::from_be_bytes(body[..8].try_into().unwrap());
                 let mut reliable = self.reliable.lock().unwrap();
                 while reliable.unacked.front().is_some_and(|(number, _)| *number <= acknowledged) {
-                    reliable.unacked.pop_front();
+                    if let Some((_, bytes)) = reliable.unacked.pop_front() {
+                        reliable.unacked_bytes -= bytes.len();
+                    }
                 }
             }
             _ => log!("{}: a frame of kind {kind}", self.label()),
         }
+        Ok(())
     }
 
     fn message(self: &Arc<Self>, message: &Value) {
@@ -1293,10 +1351,11 @@ impl Session {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if let Some(path) = self.current() {
+        let current = self.current();
+        if let Some(path) = &current {
             path.realtime_us.store(path.us().max(1), Ordering::Relaxed);
         }
-        match self.current() {
+        match current {
             Some(path) if path.udp_works() => self.send_datagram_now(&path, channel, body, sealed),
             Some(_) => self.queue(frame::DATAGRAM, channel, body),
             None => {
@@ -1342,8 +1401,7 @@ impl Session {
     /// A datagram that came on path (from: where, for UDP): its channel's,
     /// or a ping answered, or a pong's round trip taken.
     fn datagram_in(&self, path: &Path, buf: &mut [u8], from: Option<SocketAddr>, sealed: &mut Vec<u8>) {
-        let Some((count, channel, body)) = self.opener.lock().unwrap().open(buf)
-            .map(|(count, channel, body)| (count, channel, body.to_vec())) else { return };
+        let Some((count, channel, body)) = self.opener.lock().unwrap().open(buf) else { return };
         path.heard();
         // Where it came from is where the other side is now (its address
         // may change; only a sealed packet can say so).
@@ -1354,9 +1412,9 @@ impl Session {
             }
         }
         if channel != DATAGRAM_PATH {
-            self.deliver(channel, &body, Some(count));
+            self.deliver(channel, body, false, Some(count));
         } else if body.len() == 9 && body[0] == PING {
-            let mut pong = body.clone();
+            let mut pong = body.to_vec();
             pong[0] = PONG;
             self.send_datagram_now(path, DATAGRAM_PATH, &pong, sealed);
         } else if body.len() == 9 && body[0] == PONG {

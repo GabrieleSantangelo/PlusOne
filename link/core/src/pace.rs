@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 /// Delay the network may add to realtime while bulk goes.
-pub const TARGET: Duration = Duration::from_millis(8);
+const TARGET: Duration = Duration::from_millis(8);
 /// The queue is the least of this many last samples beyond the path's
 /// least: Wi-Fi's own jitter (a retry, a beacon) is no queue; one that
 /// stays is (LEDBAT's current delay filter).
@@ -123,6 +123,7 @@ impl Pace {
         }
     }
 
+    #[cfg(test)]
     pub fn paced(&self) -> Option<f64> {
         self.rate
     }

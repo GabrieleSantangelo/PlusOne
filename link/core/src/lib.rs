@@ -7,7 +7,10 @@
 //! message). It never sees the path, the keys or the other channels.
 
 mod cc;
+#[cfg(fuzzing)]
+pub use cc::fuzz as fuzz_controller;
 pub mod frame;
+mod gate;
 pub mod identity;
 pub mod mdns;
 pub mod node;
@@ -56,11 +59,25 @@ impl Class {
 }
 
 /// A line on stderr, with the time (the journal, under a service).
+#[cfg(not(target_os = "android"))]
 pub fn log(line: &str) {
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&now, &mut tm) };
     eprintln!("{:02}:{:02}:{:02} link: {line}", tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+/// A line in the app's log (logcat, as the app's own: PlusOne, "link: ");
+/// an app's stderr goes nowhere.
+#[cfg(target_os = "android")]
+pub fn log(line: &str) {
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(priority: libc::c_int, tag: *const libc::c_char, text: *const libc::c_char) -> libc::c_int;
+    }
+    const INFO: libc::c_int = 4;
+    let text = std::ffi::CString::new(format!("link: {line}").replace('\0', " ")).unwrap_or_default();
+    unsafe { __android_log_write(INFO, c"PlusOne".as_ptr(), text.as_ptr()) };
 }
 
 #[macro_export]

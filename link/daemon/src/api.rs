@@ -31,7 +31,9 @@ pub fn listen(path: &Path) -> io::Result<OwnedFd> {
         && std::env::var("LISTEN_FDS").ok().as_deref() == Some("1") {
         return Ok(unsafe { OwnedFd::from_raw_fd(3) });
     }
-    if let Some(parent) = path.parent() {
+    // Its folder ours alone, if we make it (one that is there, say the
+    // home folder for --socket ~/link, is left as it is).
+    if let Some(parent) = path.parent().filter(|parent| !parent.exists()) {
         std::fs::create_dir_all(parent)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;

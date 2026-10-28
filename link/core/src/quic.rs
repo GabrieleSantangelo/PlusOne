@@ -14,12 +14,12 @@ use crate::log;
 use bytes::Bytes;
 use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, ServerConfig,
             TransportConfig};
-use std::collections::HashMap;
+use crate::gate::Gate;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -31,9 +31,9 @@ const LOCAL_MTU: u16 = 1452;
 /// Realtime that would wait longer than this for the window: dropped.
 const LATE: Duration = Duration::from_millis(100);
 const DATAGRAM_SEND_BUFFER: usize = 512 << 10;
-/// What quinn takes from the session's stream before it is sent: about a
-/// fast path's bandwidth-delay product, no more (it waits behind nothing
-/// realtime, which goes as datagrams, but a path's change requeues it).
+/// What quinn takes from the session's stream before it is acknowledged,
+/// at first (about a fast path's bandwidth-delay product); then the
+/// bridge has it follow the rate (WINDOW_EVERY).
 const SEND_WINDOW: u64 = 2 << 20;
 const BRIDGE_CHUNK: usize = 16 << 10;
 /// What the bridge hands quinn ahead of the controller's rate: this long's
@@ -52,15 +52,13 @@ const WINDOW_EVERY: Duration = Duration::from_millis(10);
 /// (MacCids).
 const CID_NONCE: usize = 8;
 const CID_MAC: usize = 4;
-/// Handshakes at once from one address, at most: one address's flood
-/// holds up no other's. Over RETRY_OVER at once, an address proves it is
-/// one (a Retry's token back) before its handshake costs anything
-/// (architecture §3.14: under load, Retry is the cookie).
-const PER_SOURCE: usize = 2;
+/// Over this many handshakes at once (gate.rs), an address proves it is
+/// one (a Retry's token back) before its handshake costs anything, or
+/// counts as its (architecture §3.14: under load, Retry is the cookie).
 const RETRY_OVER: usize = 2;
 
 /// The core's own runtime for quinn: two threads, whatever the program.
-pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
+fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("link-quic").enable_all().build()
@@ -148,21 +146,26 @@ fn client_config(client: &Arc<rustls::ClientConfig>) -> Result<(ClientConfig, Ar
     Ok((config, rate))
 }
 
-fn server_config(server: &Arc<rustls::ServerConfig>) -> Result<(ServerConfig, Arc<AtomicU64>), String> {
+/// The server's TLS for QUIC: made once, for every connection.
+fn server_crypto(server: &Arc<rustls::ServerConfig>) -> Result<Arc<quinn::crypto::rustls::QuicServerConfig>, String> {
     let mut tls = (**server).clone();
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| e.to_string())?;
+    Ok(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| e.to_string())?))
+}
+
+/// A connection's: its own controller, whose rate it shares.
+fn server_config(crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>) -> (ServerConfig, Arc<AtomicU64>) {
     let rate: Arc<AtomicU64> = Arc::default();
-    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    let mut config = ServerConfig::with_crypto(crypto.clone());
     config.transport_config(Arc::new(transport(rate.clone())));
-    Ok((config, rate))
+    (config, rate)
 }
 
 /// An endpoint bound to address (port 0: any): it dials, and with server
 /// configs it is dialed too.
 pub(crate) fn endpoint(address: SocketAddr, server: Option<&Arc<rustls::ServerConfig>>) -> io::Result<Endpoint> {
     let server = match server {
-        Some(server) => Some(server_config(server).map_err(io::Error::other)?.0),
+        Some(server) => Some(server_config(&server_crypto(server).map_err(io::Error::other)?).0),
         None => None,
     };
     let socket = std::net::UdpSocket::bind(address)?;
@@ -236,66 +239,28 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
     })
 }
 
-/// A handshake under way, counted until it is dropped: in all, and from
-/// its address.
-struct Handshake {
-    all: Arc<AtomicUsize>,
-    sources: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    from: IpAddr,
-}
-
-impl Handshake {
-    /// One more, unless there are limit already, or PER_SOURCE from there.
-    fn start(all: &Arc<AtomicUsize>, sources: &Arc<Mutex<HashMap<IpAddr, usize>>>, from: IpAddr, limit: usize)
-             -> Option<Handshake> {
-        let mut by_source = sources.lock().unwrap();
-        if by_source.get(&from).is_some_and(|theirs| *theirs >= PER_SOURCE) {
-            return None;
-        }
-        if all.fetch_add(1, Ordering::SeqCst) >= limit {
-            all.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        *by_source.entry(from).or_insert(0) += 1;
-        Some(Handshake { all: all.clone(), sources: sources.clone(), from })
-    }
-}
-
-impl Drop for Handshake {
-    fn drop(&mut self) {
-        self.all.fetch_sub(1, Ordering::SeqCst);
-        let mut by_source = self.sources.lock().unwrap();
-        if let Some(theirs) = by_source.get_mut(&self.from) {
-            *theirs -= 1;
-            if *theirs == 0 {
-                by_source.remove(&self.from);
-            }
-        }
-    }
-}
-
 /// Paired devices' QUIC connections, each a path: to on (on a thread of
-/// its own: the session's TLS and hellos block). handshakes: those not yet
-/// a path; at most `limit` at once, PER_SOURCE from one address. What is
-/// over is ignored (nothing back: a flood learns nothing).
-pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, handshakes: Arc<AtomicUsize>,
-                     limit: usize, whole: Duration, on: impl Fn(UnixStream, Quic) + Send + Sync + 'static) {
+/// its own: the session's TLS and hellos block). The gate says who may
+/// start a handshake; the others are ignored (nothing back: a flood
+/// learns nothing).
+pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate: Arc<Gate>, whole: Duration,
+                     on: impl Fn(UnixStream, Quic) + Send + Sync + 'static) {
     let on = Arc::new(on);
-    let sources: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
+    let crypto = match server_crypto(&server) {
+        Ok(crypto) => crypto,
+        Err(e) => return log!("QUIC: {e}"),
+    };
     runtime().spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            if handshakes.load(Ordering::SeqCst) >= RETRY_OVER && !incoming.remote_address_validated()
-                && incoming.may_retry() {
+            if gate.running() >= RETRY_OVER && !incoming.remote_address_validated() && incoming.may_retry() {
                 let _ = incoming.retry();
                 continue;
             }
-            let Some(handshake) = Handshake::start(&handshakes, &sources, incoming.remote_address().ip(), limit) else {
+            let Some(handshake) = gate.start(incoming.remote_address().ip()) else {
                 incoming.ignore();
                 continue;
             };
-            let Ok((config, rate)) = server_config(&server) else {
-                continue;
-            };
+            let (config, rate) = server_config(&crypto);
             let on = on.clone();
             tokio::spawn(async move {
                 let from = incoming.remote_address();
@@ -405,6 +370,7 @@ mod tests {
     use super::*;
     use crate::identity::{Identity, Paired};
     use std::io::{Read, Write};
+    use std::sync::Mutex;
     use std::time::Instant;
 
     fn identity() -> Identity {
@@ -425,7 +391,7 @@ mod tests {
         let address = endpoint.local_addr().unwrap();
         let (paths, came) = std::sync::mpsc::channel();
         let paths = Mutex::new(paths);
-        listen(endpoint, server, Arc::default(), 8, Duration::from_secs(5), move |stream, quic| {
+        listen(endpoint, server, Gate::new(), Duration::from_secs(5), move |stream, quic| {
             let _ = paths.lock().unwrap().send((stream, quic));
         });
         (tablet, address, came)

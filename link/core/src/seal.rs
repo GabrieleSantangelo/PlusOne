@@ -5,8 +5,8 @@
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const NONCE: usize = 12;
-pub const TAG: usize = 16;
+const NONCE: usize = 12;
+const TAG: usize = 16;
 /// A datagram's bytes besides the channel's own.
 pub const OVERHEAD: usize = NONCE + 2 + TAG;
 /// From the side that connected, and from the side that listened.
@@ -14,7 +14,7 @@ pub const DIALER: u32 = 1;
 pub const LISTENER: u32 = 2;
 /// How far behind the newest a datagram may come and still count
 /// (Wi-Fi reorders; a reordered packet is not a replay).
-pub const WINDOW: u64 = 1024;
+const WINDOW: u64 = 1024;
 
 fn key(bytes: &[u8; 32]) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&AES_256_GCM, bytes).expect("a 32-byte key"))

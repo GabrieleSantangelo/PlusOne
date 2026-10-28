@@ -5,14 +5,14 @@
 //! and a stolen resumption secret stands for no one.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{verify_tls13_signature, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{alg_id, CertificateDer, PrivateKeyDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Whether a certificate (its fingerprint) is a paired device's.
 pub type Paired = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -22,8 +22,12 @@ pub fn fingerprint(der: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, der).as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// aws-lc-rs's, with the hybrid post-quantum key exchange first
+/// (X25519MLKEM768: architecture §3.14), and X25519 for an app or PC from
+/// before it (TLS 1.3 signs the choice: no one in between can force it).
 pub(crate) fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    use rustls::crypto::aws_lc_rs::{default_provider, kx_group};
+    Arc::new(CryptoProvider { kx_groups: vec![kx_group::X25519MLKEM768, kx_group::X25519], ..default_provider() })
 }
 
 /// Our certificate and what signs for it: a key we hold, or one that never
@@ -105,11 +109,26 @@ impl rustls::server::ResolvesServerCert for Ours {
 /// taken (architecture §3.14, F-8).
 const SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
+/// The verifiers for SCHEME, P-256 keys' alone (aws-lc-rs takes P-384
+/// ones for it too).
+fn p256(all: &WebPkiSupportedAlgorithms) -> WebPkiSupportedAlgorithms {
+    static ONLY: OnceLock<WebPkiSupportedAlgorithms> = OnceLock::new();
+    *ONLY.get_or_init(|| {
+        let algorithms: Vec<&'static dyn SignatureVerificationAlgorithm> = all.mapping.iter()
+            .filter(|(scheme, _)| *scheme == SCHEME)
+            .flat_map(|(_, algorithms)| algorithms.iter().copied())
+            .filter(|a| a.public_key_alg_id() == alg_id::ECDSA_P256 && a.signature_alg_id() == alg_id::ECDSA_SHA256)
+            .collect();
+        let algorithms: &'static [&'static dyn SignatureVerificationAlgorithm] = Box::leak(algorithms.into_boxed_slice());
+        WebPkiSupportedAlgorithms { all: algorithms, mapping: Box::leak(Box::new([(SCHEME, algorithms)])) }
+    })
+}
+
 /// The other side's certificate: a paired one (the whole certificate, its
 /// key with it), and its signature good.
 struct Pinned {
     paired: Paired,
-    provider: Arc<CryptoProvider>,
+    algorithms: WebPkiSupportedAlgorithms,
 }
 
 impl fmt::Debug for Pinned {
@@ -120,7 +139,7 @@ impl fmt::Debug for Pinned {
 
 impl Pinned {
     fn new(paired: Paired) -> Pinned {
-        Pinned { paired, provider: provider() }
+        Pinned { paired, algorithms: p256(&provider().signature_verification_algorithms) }
     }
 
     fn check(&self, certificate: &CertificateDer<'_>) -> Result<(), Error> {
@@ -136,7 +155,7 @@ impl Pinned {
         if dss.scheme != SCHEME {
             return Err(Error::PeerIncompatible(rustls::PeerIncompatible::NoSignatureSchemesInCommon));
         }
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn schemes(&self) -> Vec<SignatureScheme> {
@@ -265,6 +284,8 @@ mod tests {
             let c = handshake(&client, &server).unwrap();
             assert!(!c.is_handshaking());
             assert_eq!(c.handshake_kind(), Some(HandshakeKind::Full));
+            assert_eq!(c.negotiated_key_exchange_group().map(|group| group.name()),
+                       Some(rustls::NamedGroup::X25519MLKEM768));
         }
         paired.store(false, Ordering::SeqCst);
         assert!(handshake(&client, &server).is_err());
