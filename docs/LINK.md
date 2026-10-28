@@ -80,6 +80,18 @@ goes over the cable, Wi-Fi Direct or Bluetooth instead.
   against the paired ones. Its exporter gives the session's secrets: the
   datagram keys, one per direction, and the token other paths join with.
   No key is ever sent in a message.
+- **Every handshake whole**: no session resumed, no tickets, no early
+  data, so a device forgotten is refused at its next handshake and a
+  stolen resumption secret stands for no one. Only ECDSA P-256 with
+  SHA-256 signs, against the whole pinned certificate.
+- **A QUIC path** (`quic.rs`) is dialled with the same certificates.
+  Its connection IDs carry a 4-byte HMAC under the endpoint's key: a
+  packet for no connection we know whose ID fails it is dropped, and
+  nothing goes back (no stateless reset to strangers). Handshakes: 8 at
+  once at most, 2 from one address; over 2 at once, an address answers
+  a Retry first. One stream, the session's. Keys change within the first
+  1,000 packets, then before the AEAD's limit (2²³ packets for AES-GCM),
+  and the connection ends at its integrity limit (quinn).
 - **More paths join** with a token (an HMAC of the session's secret and a
   fresh number): no second handshake, no signing.
 - **The hello** says the features each side has, each with its version

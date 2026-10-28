@@ -1,6 +1,8 @@
 //! Who we are and whom we trust. No CA: each side keeps a self-signed
 //! certificate, and the other's (its SHA-256) once paired. TLS 1.3 only,
-//! both sides' certificates asked for.
+//! both sides' certificates asked for, every time: no session is resumed
+//! (architecture §3.14, F-1), so a device forgotten is refused at once,
+//! and a stolen resumption secret stands for no one.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls13_signature, CryptoProvider};
@@ -56,18 +58,24 @@ impl Identity {
     }
 
     pub(crate) fn client_config(&self, paired: Paired) -> Result<Arc<rustls::ClientConfig>, String> {
-        let config = rustls::ClientConfig::builder_with_provider(provider())
+        let mut config = rustls::ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13]).map_err(|e| e.to_string())?
             .dangerous().with_custom_certificate_verifier(Arc::new(Pinned::new(paired)))
             .with_client_cert_resolver(Arc::new(Ours(self.key.clone())));
+        config.resumption = rustls::client::Resumption::disabled();
         Ok(Arc::new(config))
     }
 
     pub(crate) fn server_config(&self, paired: Paired) -> Result<Arc<rustls::ServerConfig>, String> {
-        let config = rustls::ServerConfig::builder_with_provider(provider())
+        let mut config = rustls::ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13]).map_err(|e| e.to_string())?
             .with_client_cert_verifier(Arc::new(Pinned::new(paired)))
             .with_cert_resolver(Arc::new(Ours(self.key.clone())));
+        // No tickets, no sessions kept, no early data (0 already: QUIC's
+        // 0-RTT is never taken either).
+        config.send_tls13_tickets = 0;
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.max_early_data_size = 0;
         Ok(Arc::new(config))
     }
 }
@@ -92,7 +100,13 @@ impl rustls::server::ResolvesServerCert for Ours {
     }
 }
 
-/// The other side's certificate: a paired one, and its signature good.
+/// The one signature either side makes: ECDSA P-256 with SHA-256 (the
+/// tablet's keystore key, the PC's plusone/link/trust.py); no other is
+/// taken (architecture §3.14, F-8).
+const SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+
+/// The other side's certificate: a paired one (the whole certificate, its
+/// key with it), and its signature good.
 struct Pinned {
     paired: Paired,
     provider: Arc<CryptoProvider>,
@@ -119,11 +133,14 @@ impl Pinned {
 
     fn signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct)
                  -> Result<HandshakeSignatureValid, Error> {
+        if dss.scheme != SCHEME {
+            return Err(Error::PeerIncompatible(rustls::PeerIncompatible::NoSignatureSchemesInCommon));
+        }
         verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        vec![SCHEME]
     }
 }
 
@@ -178,5 +195,98 @@ impl ClientCertVerifier for Pinned {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::{ClientConnection, HandshakeKind, ServerConnection};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn made(algorithm: &'static rcgen::SignatureAlgorithm) -> (Vec<u8>, Vec<u8>) {
+        let key = rcgen::KeyPair::generate_for(algorithm).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["plus-one".into()]).unwrap().self_signed(&key).unwrap();
+        (cert.der().to_vec(), key.serialize_der())
+    }
+
+    fn identity() -> Identity {
+        let (cert, key) = made(&rcgen::PKCS_ECDSA_P256_SHA256);
+        Identity::new(cert, key).unwrap()
+    }
+
+    fn only(fingerprint: String) -> Paired {
+        Arc::new(move |seen: &str| seen == fingerprint)
+    }
+
+    /// A handshake in memory, the two ends' bytes to each other until
+    /// neither has more: the client's end, or the first error.
+    fn handshake(client: &Arc<rustls::ClientConfig>, server: &Arc<rustls::ServerConfig>) -> Result<ClientConnection, Error> {
+        let mut c = ClientConnection::new(client.clone(), ServerName::try_from("plus-one.invalid").unwrap())?;
+        let mut s = ServerConnection::new(server.clone())?;
+        loop {
+            let mut moved = false;
+            let mut bytes = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut bytes).unwrap();
+            }
+            let mut left = &bytes[..];
+            while !left.is_empty() {
+                moved = true;
+                s.read_tls(&mut left).unwrap();
+                s.process_new_packets()?;
+            }
+            bytes.clear();
+            while s.wants_write() {
+                s.write_tls(&mut bytes).unwrap();
+            }
+            let mut left = &bytes[..];
+            while !left.is_empty() {
+                moved = true;
+                c.read_tls(&mut left).unwrap();
+                c.process_new_packets()?;
+            }
+            if !moved {
+                return Ok(c);
+            }
+        }
+    }
+
+    #[test]
+    fn every_handshake_is_whole_and_a_device_forgotten_is_refused_at_once() {
+        let (tablet, pc) = (identity(), identity());
+        let paired = Arc::new(AtomicBool::new(true));
+        let still = paired.clone();
+        let pc_fingerprint = pc.fingerprint();
+        let server = tablet.server_config(Arc::new(move |seen: &str| still.load(Ordering::SeqCst) && seen == pc_fingerprint))
+            .unwrap();
+        let client = pc.client_config(only(tablet.fingerprint())).unwrap();
+        for _ in 0..2 {
+            let c = handshake(&client, &server).unwrap();
+            assert!(!c.is_handshaking());
+            assert_eq!(c.handshake_kind(), Some(HandshakeKind::Full));
+        }
+        paired.store(false, Ordering::SeqCst);
+        assert!(handshake(&client, &server).is_err());
+    }
+
+    #[test]
+    fn the_paired_certificate_signed_by_another_key_is_refused() {
+        let (tablet, pc, thief) = (identity(), identity(), identity());
+        let server = tablet.server_config(only(pc.fingerprint())).unwrap();
+        // The PC's certificate (public), the thief's key.
+        let posing = Identity::signed_by(pc.key.cert[0].to_vec(), thief.key.key.clone());
+        assert!(handshake(&posing.client_config(only(tablet.fingerprint())).unwrap(), &server).is_err());
+        assert!(handshake(&thief.client_config(only(tablet.fingerprint())).unwrap(), &server).is_err());
+        assert!(handshake(&pc.client_config(only(tablet.fingerprint())).unwrap(), &server).is_ok());
+    }
+
+    #[test]
+    fn only_ecdsa_p256_signs_for_a_device() {
+        let tablet = identity();
+        let (cert, key) = made(&rcgen::PKCS_ED25519);
+        let pc = Identity::new(cert, key).unwrap();
+        let server = tablet.server_config(only(pc.fingerprint())).unwrap();
+        assert!(handshake(&pc.client_config(only(tablet.fingerprint())).unwrap(), &server).is_err());
     }
 }

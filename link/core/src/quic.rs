@@ -12,12 +12,14 @@
 
 use crate::log;
 use bytes::Bytes;
-use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TransportConfig};
+use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, ServerConfig,
+            TransportConfig};
+use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -46,6 +48,16 @@ const AHEAD_LEAST: f64 = 32.0 * 1024.0;
 /// (handed a quarter over the rate, it kept up to SEND_WINDOW unsent: a
 /// second on a 15 Mbit/s path, and a channel's open waited behind it).
 const WINDOW_EVERY: Duration = Duration::from_millis(10);
+/// A connection ID: this many random bytes, then this many of their MAC
+/// (MacCids).
+const CID_NONCE: usize = 8;
+const CID_MAC: usize = 4;
+/// Handshakes at once from one address, at most: one address's flood
+/// holds up no other's. Over RETRY_OVER at once, an address proves it is
+/// one (a Retry's token back) before its handshake costs anything
+/// (architecture §3.14: under load, Retry is the cookie).
+const PER_SOURCE: usize = 2;
+const RETRY_OVER: usize = 2;
 
 /// The core's own runtime for quinn: two threads, whatever the program.
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
@@ -68,6 +80,9 @@ fn transport(rate: Arc<AtomicU64>) -> TransportConfig {
     t.send_window(SEND_WINDOW);
     t.datagram_receive_buffer_size(Some(4 << 20));
     t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+    // One stream, the dialer's: the session's (architecture §3.14, SEC-19).
+    t.max_concurrent_bidi_streams(1u32.into());
+    t.max_concurrent_uni_streams(0u32.into());
     // The peer acknowledges every second packet within 2 ms: cc.rs reads
     // the delay's growth off the acknowledgements' times.
     let mut ack = quinn::AckFrequencyConfig::default();
@@ -151,8 +166,56 @@ pub(crate) fn endpoint(address: SocketAddr, server: Option<&Arc<rustls::ServerCo
         None => None,
     };
     let socket = std::net::UdpSocket::bind(address)?;
+    let key = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+        .map_err(|_| io::Error::other("no random key"))?;
+    let mut config = EndpointConfig::default();
+    config.cid_generator(move || Box::new(MacCids(key.clone())));
     let _entered = runtime().enter();
-    Endpoint::new(EndpointConfig::default(), server, socket, Arc::new(quinn::TokioRuntime))
+    Endpoint::new(config, server, socket, Arc::new(quinn::TokioRuntime))
+}
+
+/// Connection IDs that carry a MAC under a key of the endpoint's
+/// (architecture §3.14, F-2). quinn checks it on a packet for no
+/// connection it knows before anything else, and drops it if it fails: a
+/// stranger's packets get nothing back, no stateless reset either.
+struct MacCids(ring::hmac::Key);
+
+impl MacCids {
+    fn mac(&self, nonce: &[u8]) -> [u8; CID_MAC] {
+        let tag = ring::hmac::sign(&self.0, nonce);
+        let mut mac = [0u8; CID_MAC];
+        mac.copy_from_slice(&tag.as_ref()[..CID_MAC]);
+        mac
+    }
+}
+
+impl ConnectionIdGenerator for MacCids {
+    fn generate_cid(&mut self) -> ConnectionId {
+        let mut cid = [0u8; CID_NONCE + CID_MAC];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut cid[..CID_NONCE])
+            .expect("random bytes");
+        let mac = self.mac(&cid[..CID_NONCE]);
+        cid[CID_NONCE..].copy_from_slice(&mac);
+        ConnectionId::new(&cid)
+    }
+
+    fn validate(&self, cid: &ConnectionId) -> Result<(), quinn_proto::InvalidCid> {
+        if cid.len() != CID_NONCE + CID_MAC {
+            return Err(quinn_proto::InvalidCid);
+        }
+        let mac = self.mac(&cid[..CID_NONCE]);
+        // In constant time.
+        let differ = mac.iter().zip(&cid[CID_NONCE..]).fold(0u8, |d, (a, b)| d | (a ^ b));
+        if differ == 0 { Ok(()) } else { Err(quinn_proto::InvalidCid) }
+    }
+
+    fn cid_len(&self) -> usize {
+        CID_NONCE + CID_MAC
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// A path to the device at address: the session's stream (bridged) and the
@@ -173,24 +236,67 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
     })
 }
 
+/// A handshake under way, counted until it is dropped: in all, and from
+/// its address.
+struct Handshake {
+    all: Arc<AtomicUsize>,
+    sources: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    from: IpAddr,
+}
+
+impl Handshake {
+    /// One more, unless there are limit already, or PER_SOURCE from there.
+    fn start(all: &Arc<AtomicUsize>, sources: &Arc<Mutex<HashMap<IpAddr, usize>>>, from: IpAddr, limit: usize)
+             -> Option<Handshake> {
+        let mut by_source = sources.lock().unwrap();
+        if by_source.get(&from).is_some_and(|theirs| *theirs >= PER_SOURCE) {
+            return None;
+        }
+        if all.fetch_add(1, Ordering::SeqCst) >= limit {
+            all.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        *by_source.entry(from).or_insert(0) += 1;
+        Some(Handshake { all: all.clone(), sources: sources.clone(), from })
+    }
+}
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.all.fetch_sub(1, Ordering::SeqCst);
+        let mut by_source = self.sources.lock().unwrap();
+        if let Some(theirs) = by_source.get_mut(&self.from) {
+            *theirs -= 1;
+            if *theirs == 0 {
+                by_source.remove(&self.from);
+            }
+        }
+    }
+}
+
 /// Paired devices' QUIC connections, each a path: to on (on a thread of
 /// its own: the session's TLS and hellos block). handshakes: those not yet
-/// a path, counted with the TCP ones; at most `limit` at once.
-pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, handshakes: Arc<std::sync::atomic::AtomicUsize>,
+/// a path; at most `limit` at once, PER_SOURCE from one address. What is
+/// over is ignored (nothing back: a flood learns nothing).
+pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, handshakes: Arc<AtomicUsize>,
                      limit: usize, whole: Duration, on: impl Fn(UnixStream, Quic) + Send + Sync + 'static) {
     let on = Arc::new(on);
+    let sources: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
     runtime().spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            if handshakes.fetch_add(1, Ordering::SeqCst) >= limit {
-                handshakes.fetch_sub(1, Ordering::SeqCst);
-                incoming.refuse();
+            if handshakes.load(Ordering::SeqCst) >= RETRY_OVER && !incoming.remote_address_validated()
+                && incoming.may_retry() {
+                let _ = incoming.retry();
                 continue;
             }
-            let Ok((config, rate)) = server_config(&server) else {
-                handshakes.fetch_sub(1, Ordering::SeqCst);
+            let Some(handshake) = Handshake::start(&handshakes, &sources, incoming.remote_address().ip(), limit) else {
+                incoming.ignore();
                 continue;
             };
-            let (on, handshakes) = (on.clone(), handshakes.clone());
+            let Ok((config, rate)) = server_config(&server) else {
+                continue;
+            };
+            let on = on.clone();
             tokio::spawn(async move {
                 let from = incoming.remote_address();
                 let accepted = async {
@@ -207,20 +313,14 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, hand
                         // gives the handshake back when it is done.
                         let spawned = std::thread::Builder::new().name("link-accept".into()).spawn(move || {
                             on(stream, quic);
-                            handshakes.fetch_sub(1, Ordering::SeqCst);
+                            drop(handshake);
                         });
                         if spawned.is_err() {
                             log!("{from}: QUIC: no thread for it");
                         }
                     }
-                    Ok(Err(e)) => {
-                        handshakes.fetch_sub(1, Ordering::SeqCst);
-                        log!("{from}: QUIC: {e}");
-                    }
-                    Err(_) => {
-                        handshakes.fetch_sub(1, Ordering::SeqCst);
-                        log!("{from}: QUIC: no stream in time");
-                    }
+                    Ok(Err(e)) => log!("{from}: QUIC: {e}"),
+                    Err(_) => log!("{from}: QUIC: no stream in time"),
                 }
             });
         }
@@ -298,4 +398,134 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
         let _ = send.finish();
     });
     Ok(theirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{Identity, Paired};
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    fn identity() -> Identity {
+        let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
+        Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap()
+    }
+
+    fn only(fingerprint: String) -> Paired {
+        Arc::new(move |seen: &str| seen == fingerprint)
+    }
+
+    /// A tablet's QUIC listener for pc: its address, and the session's end
+    /// of each path that comes.
+    fn tablet_for(pc: &Identity) -> (Identity, SocketAddr, std::sync::mpsc::Receiver<(UnixStream, Quic)>) {
+        let tablet = identity();
+        let server = tablet.server_config(only(pc.fingerprint())).unwrap();
+        let endpoint = endpoint(([127, 0, 0, 1], 0).into(), Some(&server)).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let (paths, came) = std::sync::mpsc::channel();
+        let paths = Mutex::new(paths);
+        listen(endpoint, server, Arc::default(), 8, Duration::from_secs(5), move |stream, quic| {
+            let _ = paths.lock().unwrap().send((stream, quic));
+        });
+        (tablet, address, came)
+    }
+
+    #[test]
+    fn connection_ids_carry_their_mac() {
+        let key = |seed: u8| ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[seed; 32]);
+        let mut ours = MacCids(key(1));
+        let cid = ours.generate_cid();
+        assert_eq!(cid.len(), CID_NONCE + CID_MAC);
+        assert!(ours.validate(&cid).is_ok());
+        assert!(MacCids(key(2)).validate(&cid).is_err());
+        let mut forged = cid.to_vec();
+        forged[0] ^= 1;
+        assert!(ours.validate(&ConnectionId::new(&forged)).is_err());
+        assert!(ours.validate(&ConnectionId::new(&forged[..8])).is_err());
+    }
+
+    #[test]
+    fn a_strangers_packets_get_nothing_back() {
+        let (_tablet, address, _paths) = tablet_for(&identity());
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let random = ring::rand::SystemRandom::new();
+        for i in 0..64u8 {
+            let mut packet = vec![0u8; 40 + i as usize * 16];
+            ring::rand::SecureRandom::fill(&random, &mut packet).unwrap();
+            // Short headers (a connection's packets, with IDs of no one's),
+            // and long ones that are no first packet.
+            if i % 2 == 0 {
+                packet[0] = 0x40 | (packet[0] & 0x3f);
+            } else {
+                packet[0] = 0xe0 | (packet[0] & 0x0f);  // QUIC v1's Handshake
+                packet[1..5].copy_from_slice(&1u32.to_be_bytes());
+                packet[5] = (CID_NONCE + CID_MAC) as u8;
+            }
+            socket.send_to(&packet, address).unwrap();
+        }
+        let mut buf = [0u8; 2048];
+        assert!(socket.recv_from(&mut buf).is_err(), "an answer to a stranger");
+    }
+
+    #[test]
+    fn a_flood_of_handshakes_holds_up_no_one_else() {
+        let pc = identity();
+        let (tablet, address, paths) = tablet_for(&pc);
+        // Strangers (their certificates no paired one's) from one address,
+        // all at once; the PC meanwhile from another.
+        let strangers: Vec<_> = (0..32).map(|_| {
+            let client = identity().client_config(only(tablet.fingerprint())).unwrap();
+            std::thread::spawn(move || {
+                let endpoint = endpoint(([127, 0, 0, 1], 0).into(), None).unwrap();
+                let _ = dial(&endpoint, &client, address, Duration::from_secs(3));
+            })
+        }).collect();
+        std::thread::sleep(Duration::from_millis(50));
+        let client = pc.client_config(only(tablet.fingerprint())).unwrap();
+        let endpoint = endpoint(([127, 0, 0, 2], 0).into(), None).unwrap();
+        let started = Instant::now();
+        let (mut stream, _quic) = dial(&endpoint, &client, address, Duration::from_secs(3)).unwrap();
+        stream.write_all(b"hello").unwrap();
+        let (mut theirs, _) = paths.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut hello = [0u8; 5];
+        theirs.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello, b"hello");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        for stranger in strangers {
+            stranger.join().unwrap();
+        }
+        assert!(paths.try_recv().is_err(), "a stranger's path");
+    }
+
+    #[test]
+    fn keys_change_and_the_stream_goes_on() {
+        let pc = identity();
+        let (tablet, address, paths) = tablet_for(&pc);
+        let client = pc.client_config(only(tablet.fingerprint())).unwrap();
+        let endpoint = endpoint(([127, 0, 0, 1], 0).into(), None).unwrap();
+        let (mut stream, quic) = dial(&endpoint, &client, address, Duration::from_secs(3)).unwrap();
+        // 2 MiB: over 1,000 packets, so quinn changes keys on its own too
+        // (the first time within 10 to 1,000; then before the AEAD's limit).
+        let sent: Vec<u8> = (0..2u32 << 20).map(|i| (i % 251) as u8).collect();
+        let writer = {
+            let sent = sent.clone();
+            std::thread::spawn(move || {
+                for (i, chunk) in sent.chunks(256 << 10).enumerate() {
+                    if i % 2 == 1 {
+                        quic.conn.force_key_update();
+                    }
+                    stream.write_all(chunk).unwrap();
+                }
+                stream
+            })
+        };
+        let (mut theirs, _) = paths.recv_timeout(Duration::from_secs(3)).unwrap();
+        theirs.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut came = vec![0u8; sent.len()];
+        theirs.read_exact(&mut came).unwrap();
+        assert!(came == sent);
+        drop(writer.join().unwrap());
+    }
 }
