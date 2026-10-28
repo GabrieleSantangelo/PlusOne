@@ -577,6 +577,60 @@ mod tests {
         assert!(gcc.cuts[0] + gcc.cuts[1] > 0, "{:?}", gcc.cuts);
     }
 
+    /// link/target/cc-replay.txt (a record: PLUSONE_LINK_CC_RECORD), its
+    /// first controller's, through today's: its rate against what went
+    /// through (over a second), and its cuts.
+    ///   tools/link-docker.sh test -p plus-one-link --lib -- --ignored replay --nocapture
+    #[test]
+    #[ignore]
+    fn replay() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/cc-replay.txt");
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let start = Instant::now();
+        let at = |us: u64| start + Duration::from_micros(us);
+        let mut gcc = Gcc::new(start, 1452, Arc::default());
+        let mut through: VecDeque<(u64, u64)> = VecDeque::new();
+        let (mut through_bytes, mut next, mut over_double, mut seconds) = (0u64, 1_000_000u64, 0u32, 0u32);
+        let mut ratios = Vec::new();
+        for line in text.lines() {
+            let f: Vec<u64> = line.split(' ').filter_map(|w| w.parse().ok()).collect();
+            if !line.starts_with("0 ") || f.len() < 2 {
+                continue;
+            }
+            let us = f[1];
+            match line.as_bytes()[2] {
+                b'a' if f.len() == 5 => {
+                    let sent = at(us).checked_sub(Duration::from_micros(f[2])).unwrap_or(start).max(start);
+                    gcc.ack(at(us), sent, f[3], Duration::from_micros(f[4]));
+                    through.push_back((us, f[3]));
+                    through_bytes += f[3];
+                    while through.front().is_some_and(|(t, _)| us - t > 1_000_000) {
+                        through_bytes -= through.pop_front().unwrap().1;
+                    }
+                }
+                b'e' if f.len() == 3 => {
+                    gcc.end_acks(at(us), f[2] == 1);
+                    if us >= next {
+                        next += 1_000_000;
+                        seconds += 1;
+                        let went = through_bytes as f64;
+                        if went > 10_000.0 {
+                            ratios.push(gcc.rate / went);
+                            over_double += (gcc.rate > 2.0 * went) as u32;
+                        }
+                    }
+                }
+                b'l' if f.len() == 4 => Controller::on_congestion_event(&mut gcc, at(us), at(us), f[3] == 1, f[2]),
+                _ => {}
+            }
+        }
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |p: f64| ratios.get(((ratios.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0.0);
+        println!("replay: {seconds} s, rate / what went through (1 s): p10 {:.2}, p50 {:.2}, p90 {:.2}, max {:.2}; \
+                  over twice {over_double} s; cuts: {} by trend, {} by queue, {} by loss",
+                 q(0.1), q(0.5), q(0.9), q(1.0), gcc.cuts[0], gcc.cuts[1], gcc.cuts[2]);
+    }
+
     #[test]
     fn a_queue_that_stands_is_cut() {
         let start = Instant::now();
