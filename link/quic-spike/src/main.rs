@@ -482,8 +482,30 @@ async fn client(address: SocketAddr, cc: String, seconds: u64, tests: Vec<String
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
+/// QBENCH_LOG: quinn's and quinn-udp's messages on stderr (why GSO went off).
+struct Stderr;
+
+impl log::Log for Stderr {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Debug && metadata.target().starts_with("quinn")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{} {}: {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: Stderr = Stderr;
+
 #[tokio::main]
 async fn main() {
+    if std::env::var_os("QBENCH_LOG").is_some() {
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Debug));
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("probe") => {

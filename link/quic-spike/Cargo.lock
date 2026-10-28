@@ -200,6 +200,7 @@ name = "quic-spike"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "log",
  "quinn",
  "quinn-proto",
  "quinn-udp",

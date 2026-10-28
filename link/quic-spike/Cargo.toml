@@ -23,6 +23,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 bytes = "1"
+log = "0.4"
 
 [profile.release]
 debug = false
