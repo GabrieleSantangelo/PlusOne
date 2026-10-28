@@ -56,14 +56,6 @@ const BUCKET: Duration = Duration::from_millis(50);
 /// to 58 ms on a phone's hotspot): that cut a session doing nothing to the
 /// least rate, 17 times, and the screen started again from there.
 const STANDING_BUCKETS: usize = 6;
-/// The trend says overuse; it is ours only if the least round trip of the
-/// last RISING is over the path's least by RISING_QUEUE too: a queue we
-/// fill raises it within tens of milliseconds, a Wi-Fi's jitter does not
-/// (a few packets late, 9 to 30 ms, the least unchanged). On a phone's
-/// hotspot the trend alone cut 12 times in 90 s with 1 ms queued, a video
-/// of 4 Mbit/s on a path that takes 20.
-const RISING: Duration = Duration::from_millis(150);
-const RISING_QUEUE: Duration = Duration::from_millis(4);
 
 #[derive(Debug, Clone)]
 pub struct GccConfig {
@@ -274,9 +266,6 @@ impl Gcc {
 
     fn control(&mut self, now: Instant, app_limited: bool) {
         let Some(acked) = self.acked_rate(now) else { return };
-        if self.signal == Signal::Over && self.why == 0 && self.queued(now, RISING, 2) < RISING_QUEUE {
-            self.signal = Signal::Normal;  // jitter: no queue of ours
-        }
         if self.standing_queue(now) > QUEUE_LIMIT {
             self.signal = Signal::Over;
             self.why = 1;

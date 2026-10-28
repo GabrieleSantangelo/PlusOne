@@ -228,7 +228,6 @@ on all of them).
 | Trendline window, smoothing, gain | 20 groups, 0.9, 4 | published: WebRTC's `TrendlineEstimator` |
 | Overuse threshold | 12.5 ms at first, 6-600 ms, k_up 0.0087, k_down 0.039 | published: GCC (adapts to the path's jitter while running) |
 | Overuse lasting | 20 ms | chosen (WebRTC's 10 ms cut on Wi-Fi's bursts) |
-| Overuse is ours only if | the least round trip of 150 ms is 4 ms over the path's least | chosen: on a phone's hotspot the trend alone cut 12 times in 90 s on the radio's jitter, 1 ms queued |
 | Cut | 0.85 of the rate acknowledged | published: GCC |
 | Increase | 8 % a second; near the last cut a packet a round trip (and 100 ms), at least 5 % a second | published: GCC; the 5 % floor chosen |
 | Never above | 1.5 × acknowledged + 10 KB/s, going up; never down for it | published: WebRTC (`AimdRateControl`); applied going down too, a still screen took the rate, and the screen with it, to the least in seconds |
