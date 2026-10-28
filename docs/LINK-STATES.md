@@ -198,7 +198,7 @@ while a channel is open (the desktop, the speakers), so its pings go on.
 | 17 | Two paths succeed at once (race) | dialing is one at a time per device (`finding` lock) **[built]**; an extra path adopted only if better, else closed **[built]** |
 | 18 | Version mismatch | the hello's features say what the other has; a missing feature is refused per channel ("not served"), not the session **[built]**; an incompatible link protocol → the user told to update |
 | 19 | Many unauthenticated connections (an attacker on the Wi-Fi) | 8 handshakes at once at most, 8 s each **[built]** |
-| 20 | The Wi-Fi Direct firmware bug (AX211: same channel as the PC's Wi-Fi) | the candidate is skipped when the PC's own Wi-Fi is on the group's channel; a crash marks the transport unusable for the boot |
+| 20 | The Wi-Fi Direct firmware bug (AX211 firmware 89.123cf747, Ubuntu 24.04's: same channel as the PC's Wi-Fi; not in 89.b20dcd1f) | the candidate is skipped when the PC's own Wi-Fi is on the group's channel; a crash marks the transport unusable for the boot |
 | 21 | The tablet charging by cable, nothing in use | the cable session stays (cheap: no radio woken) **[built]**; Wi-Fi sessions close after `IDLE` **[built]** |
 | 22 | The phone hotspot as a repeater (100+ ms spikes) | Suspect is not Lost; the desktop's rate control lowers the bitrate; Upgrading looks for the cable or Wi-Fi Direct |
 

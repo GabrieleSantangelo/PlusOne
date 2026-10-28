@@ -39,7 +39,7 @@ connection and the rest.
 | Path | Found by | Expect | Notes |
 |---|---|---|---|
 | USB (Android Open Accessory, as Android Auto by cable) | the cable plugged in (udev; the app's accessory intent) | ~1 ms, tens of MB/s | charges the tablet; Android asks once "open Plus One for this accessory" |
-| Wi-Fi Direct, or the PC's own access point (a second adapter) | Wi-Fi Direct's peers; the app's local-only network request | one hop through the air | this PC's AX211 (firmware 89) crashes with Wi-Fi Direct on its own Wi-Fi's channel |
+| Wi-Fi Direct, or the PC's own access point (a second adapter) | Wi-Fi Direct's peers; the app's local-only network request | one hop through the air | this PC's AX211 crashed with Wi-Fi Direct on its own Wi-Fi's channel with firmware 89.123cf747 (Ubuntu 24.04's), not with 89.b20dcd1f; one radio for both costs half the speed or more |
 | The same network (home Wi-Fi, a hotspot, Ethernet) | mDNS, Bluetooth LE, the last addresses | two hops (through the access point) | blocked where clients are isolated (eduroam, guest networks) |
 | Bluetooth (L2CAP or RFCOMM) | Bluetooth LE, bonded devices | 1-2 Mbit/s, tens of ms | the pen, signing, sound; the desktop only small and slow |
 | A relay over the internet (later) | an account on a server | the internet's | needs a server: not before the rest |

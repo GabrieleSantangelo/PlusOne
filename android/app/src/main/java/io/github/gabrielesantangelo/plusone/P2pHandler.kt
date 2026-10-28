@@ -72,8 +72,9 @@ class P2pHandler(private val service: CompanionService) : Handler {
             if (link.receive().optString("type") != "p2p-go") return false  // the PC's attempt under way
             // Not remembered: a group Android remembers it offers back to the
             // PC (an invitation) instead of negotiating, and the PC knows none.
-            // The group on 5 GHz: on the PC's own channel (Wi-Fi and Wi-Fi
-            // Direct at once) Intel's AX211 firmware (89, the latest) crashes.
+            // The group on 5 GHz. (On the PC's own Wi-Fi's channel, Wi-Fi and
+            // Wi-Fi Direct at once, Intel's AX211 firmware 89.123cf747 crashed;
+            // 89.b20dcd1f does not.)
             val config = WifiP2pConfig.Builder().setDeviceAddress(MacAddress.fromString(pc.deviceAddress))
                 .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_5GHZ)
                 .enablePersistentMode(false).build().apply {

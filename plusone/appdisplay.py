@@ -69,8 +69,10 @@ KEY_SUPER, KEY_ESCAPE = 0xffeb, 0xff1b
 KEY_PAGE_UP, KEY_PAGE_DOWN = 0xff55, 0xff56
 # The bitrate follows the network (RateControl): from the one set (its
 # most) down to MIN_KBPS while the app reports frames lost or the delay
-# growing, up again slowly while it does not.
-MIN_KBPS = 1500
+# growing, up again slowly while it does not. The least: a home Wi-Fi on
+# 2.4 GHz far from its router took about 1 Mbit/s, under the 1500 of before
+# (the stream stayed above what the network takes, frames lost every second).
+MIN_KBPS = 800
 QUEUE_MS = 60    # data waiting to go out past this many ms of the bitrate: the next frames are not encoded
 # The kernel counts a packet waiting to go out with its buffers (TIOCOUTQ:
 # about 2.3 KB for 1472 bytes), not its bytes alone.
@@ -499,6 +501,15 @@ class LinkPackets:
         except (OSError, ValueError, plusone_link.LinkError):
             return 0
 
+    def rtt(self):
+        """The session's round trip (seconds), or None if not known."""
+        try:
+            device = next((d for d in self.connection.devices() if d["id"] == self.device), None)
+        except (OSError, ValueError, plusone_link.LinkError):
+            return None
+        ms = device.get("rtt_ms") if device else None
+        return ms / 1000 if ms else None
+
     def receive(self, timeout):
         """A body from the app, or None (nothing in time, or the channels over)."""
         try:
@@ -701,8 +712,15 @@ class AppStreamer:
         self.on_visible(shown)
 
     def force_keyframe(self):
+        # Not again before the last one can have come: a round trip, and its
+        # own time on the way (a keyframe is up to VBV_FRAMES frames' worth).
+        # The app asks at each frame it cannot decode; each answered was one
+        # more keyframe into the queue the first one waits in (seen on a slow
+        # home Wi-Fi: lost, asked, more lost, asked again every second).
         now = time.monotonic()
-        if now - self._last_keyframe < MIN_KEYFRAME_GAP:
+        rtt = self.channel.rtt() if hasattr(self.channel, "rtt") else None
+        gap = max(MIN_KEYFRAME_GAP, 1.5 * rtt + media.VBV_FRAMES / self.fps) if rtt else MIN_KEYFRAME_GAP
+        if now - self._last_keyframe < gap:
             return
         self._last_keyframe = now
         self.keyframes.request()

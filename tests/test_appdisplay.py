@@ -1,6 +1,7 @@
 """The app display's packets: their layout, sealed both ways, replays refused."""
 import socket
 import struct
+import types
 
 import pytest
 
@@ -388,3 +389,19 @@ def test_what_is_still_to_go_out_is_known():
         channel.close()
         app.close()
     assert channel.queued() == 0  # closed: nothing
+
+
+def test_keyframes_asked_again_wait_for_the_last_to_come(monkeypatch):
+    clock, asked = [100.0], []
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    streamer = types.SimpleNamespace(channel=types.SimpleNamespace(rtt=lambda: 0.2), fps=60, _last_keyframe=0.0,
+                                     keyframes=types.SimpleNamespace(request=lambda: asked.append(clock[0])))
+    for t in (100.0, 100.3, 100.4):  # a round trip and a half, and the keyframe's own 4/60 s: 0.367 s
+        clock[0] = t
+        appdisplay.AppStreamer.force_keyframe(streamer)
+    assert asked == [100.0, 100.4]
+    streamer.channel = types.SimpleNamespace()  # the link of before: no round trip known
+    for t in (101.0, 101.2, 101.3):
+        clock[0] = t
+        appdisplay.AppStreamer.force_keyframe(streamer)
+    assert asked[2:] == [101.0, 101.3]

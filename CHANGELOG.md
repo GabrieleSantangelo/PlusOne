@@ -46,6 +46,12 @@
 - **A big transfer never chokes the cable**: plus-one-link feeds a PDF or
   the app to the link only as fast as it goes, so the desktop and the sound
   sharing the cable go on meanwhile.
+- **The desktop on a slow Wi-Fi**: on a home Wi-Fi at 2.4 GHz far from its
+  router (about 1 Mbit/s left for it) the desktop stayed at its least,
+  1500 kbit/s, above what the network took, and stuttered; it now goes down
+  to 800 kbit/s. A keyframe the tablet asks for again is sent only once the
+  last one could have come (a round trip, and its own time on the way):
+  each one more went into the queue the first one waited in.
 
 ## 0.10.0
 

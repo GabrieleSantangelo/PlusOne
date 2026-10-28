@@ -11,9 +11,13 @@ the group (192.168.49.1, the owner's, Android's always), better than the
 LAN's: the session moves to it. The group lasts while the feature's channel
 does (Group.close(), or Plus One gone: the connection is bound to it).
 
-Only a radio of its own (a second adapter): a group on the radio that is
-on a network already crashed Intel's AX211 firmware (89) as it joined, on
-5 GHz and 2.4 alike (docs/RUST.md). PLUSONE_P2P_SAME_RADIO=1 tries anyway.
+A radio of its own (a second adapter) unless told otherwise. On the radio
+that is on a network already, Intel's AX211 firmware 89.123cf747 (Ubuntu
+24.04's) crashed as the group joined, on 5 GHz and 2.4 alike; 89.b20dcd1f
+(newer linux-firmware) does not, but the group then shares the radio's air
+with that network: 15 MB/s one way and 25 ms realtime, against 38 MB/s and
+3.5 ms on a radio of its own (docs/CHANNELS.md). PLUSONE_P2P_SAME_RADIO=1
+shares it.
 As learned with Second Screen: an activation is never cut short (the app
 may accept as late as its end).
 """
