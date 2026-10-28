@@ -207,7 +207,10 @@ impl Gcc {
         // not a cut at each group while it drains (it went down to the
         // least in a second so).
         if self.signal == Signal::Over {
-            let wait = self.srtt.clamp(Duration::from_millis(10), Duration::from_millis(200));
+            // (At least 100 ms: what is acknowledged, over ACKED_WINDOW, shows
+            // a cut only that much later; cut again sooner, on it, and the
+            // rate fell 19 → 8 → 2 MB/s in three round trips on a hotspot.)
+            let wait = self.srtt.clamp(Duration::from_millis(100), Duration::from_millis(200));
             if now.duration_since(self.last_over) < wait && acked >= 0.5 * self.rate {
                 self.signal = Signal::Normal;
             }
@@ -221,7 +224,8 @@ impl Gcc {
         match self.state {
             State::Decrease => {
                 self.slow_start = false;
-                self.rate = (BETA * acked).max(MIN_RATE).min(self.rate);
+                // At most 30 % a cut.
+                self.rate = (BETA * acked).max(0.7 * self.rate).max(MIN_RATE).min(self.rate);
                 // Where it was cut: its mean and spread (near it, go up slowly).
                 let mean = self.max_mean.map(|m| 0.95 * m + 0.05 * acked).unwrap_or(acked);
                 let norm = mean.max(1.0);
