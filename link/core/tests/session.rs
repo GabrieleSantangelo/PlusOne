@@ -732,3 +732,81 @@ fn a_session_by_quic_alone() {
     control.send(b"hello").unwrap();
     assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
 }
+
+/// A stream at about 100 KB/s, as Bluetooth goes: the PC's end and the
+/// session on it.
+fn slow_session() -> (Node, Node, Arc<plusone_link::Session>) {
+    let (pc, tablet, _address) = pair();
+    let (cable, far) = std::os::unix::net::UnixStream::pair().unwrap();
+    cable.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let (mut reading, mut writing) = (cable.try_clone().unwrap(), cable);
+    let pcs_end = plusone_link::stream::bridge(
+        move |buf| {
+            use std::io::Read;
+            reading.read(buf).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock {
+                std::io::Error::from(std::io::ErrorKind::TimedOut)
+            } else { e })
+        },
+        move |data| {
+            use std::io::Write;
+            std::thread::sleep(Duration::from_micros(data.len() as u64 * 10));
+            writing.write_all(data)
+        },
+        4096).unwrap();
+    let accepter = tablet.clone();
+    std::thread::spawn(move || accepter.accept_stream(Box::new(far), "bt").map(|_| ()));
+    let session = pc.connect_stream(Box::new(pcs_end), "bt").unwrap();
+    (pc, tablet, session)
+}
+
+#[test]
+fn a_channel_opens_ahead_of_a_transfer_on_a_slow_path() {
+    // A transfer fills its channel's queue (128 KiB: more than a second at
+    // this pace); a channel opened meanwhile, and a message there and back
+    // on it, go ahead of it: the session's messages first, the channels in
+    // turn. (They waited behind it, and an open went unanswered.)
+    let (_pc, _tablet, session) = slow_session();
+    let bulk = session.open("echo", "bulk", Class::Control).unwrap();
+    let draining = {
+        let bulk = bulk.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 17];
+            while let Ok(Some(n)) = bulk.recv(&mut buf, Some(Duration::from_secs(3))) {
+                if n == 0 {
+                    break;
+                }
+            }
+        })
+    };
+    let chunk = vec![7u8; 32 << 10];
+    let sending = std::thread::spawn(move || {
+        for _ in 0..40 {
+            if bulk.send(&chunk).is_err() {
+                break;
+            }
+        }
+        bulk
+    });
+    std::thread::sleep(Duration::from_millis(500));  // the transfer's queue full
+    let begun = Instant::now();
+    let other = session.open("echo", "other", Class::Control).unwrap();
+    other.send(b"ahead").unwrap();
+    let mut buf = vec![0u8; 64];
+    assert_eq!(other.recv(&mut buf, WAIT).unwrap(), Some(5));
+    let took = begun.elapsed();
+    // (3.3 s before. What is left: the transfer's whole messages already on
+    // their way, 32 KiB each at 100 KB/s; a message is not cut short.)
+    assert!(took < Duration::from_millis(1500), "an open and a round trip took {took:?} behind a transfer");
+    drop(sending.join().unwrap());
+    let _ = draining.join();
+}
+
+#[test]
+fn the_sixty_fifth_channel_is_refused() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let open: Vec<_> = (0..64).map(|i| session.open("echo", &format!("c{i}"), Class::Control).unwrap()).collect();
+    let refused = session.open("echo", "one too many", Class::Control).err().unwrap();
+    assert!(refused.contains("64 channels"), "{refused}");
+    drop(open);
+}

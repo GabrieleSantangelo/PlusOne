@@ -6,7 +6,7 @@
 # examples/pathbench in the other; TCP, then QUIC; RUNS times. Docker
 # alone: the host's own network is not touched. Build the examples first
 # (tools/link-docker.sh build --release --examples).
-#   tools/netbench.sh PROFILE [RUNS] [SECONDS] [VIDEO_KBPS]
+#   tools/netbench.sh PROFILE [RUNS] [SECONDS] [VIDEO_KBPS] [OPENS]
 # PROFILE, each way: tim (3 Mbit/s, 10 ms, 0.5 % lost, 300 ms of queue: a
 # home Wi-Fi far from its router), hotspot (50 Mbit/s, 5 ms, 0.1 %, 80 ms),
 # p2p (300 Mbit/s, 1 ms, 0.05 %, 20 ms), or any as RATE,DELAY_MS,LOSS_%,QUEUE_MS
@@ -18,6 +18,7 @@ profile=${1:?a profile: tim, hotspot or p2p}
 runs=${2:-3}
 seconds=${3:-6}
 video=${4:-}
+opens=${5:-20}
 case $profile in
     tim) rate=3mbit; delay=10; loss=0.5; queue=300 ;;
     hotspot) rate=50mbit; delay=5; loss=0.1; queue=80 ;;
@@ -50,15 +51,15 @@ chmod -R a+rX "$work"
 shape="tc qdisc add dev eth0 root handle 1: netem delay ${delay}ms loss ${loss}% $slot limit 100000 \
        && tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate $rate burst 64kb latency ${queue}ms"
 if [ "${extra:-}" = steps ]; then
-    shape="$shape && (while sleep 5; do tc qdisc change dev eth0 parent 1:1 handle 10: tbf rate $low burst 64kb \
+    shape="$shape && { (while sleep 5; do tc qdisc change dev eth0 parent 1:1 handle 10: tbf rate $low burst 64kb \
        latency ${queue}ms; sleep 5; tc qdisc change dev eth0 parent 1:1 handle 10: tbf rate $rate burst 64kb \
-       latency ${queue}ms; done) &"
+       latency ${queue}ms; done) & }"
 fi
 cross_tablet=""
 cross_pc=""
 if [ "${extra:-}" = cross ]; then
     cross_tablet="(nc -lk 5001 > /dev/null &) &&"
-    cross_pc="(sleep 1; cat /dev/zero | nc po-tablet 5001 > /dev/null) &"
+    cross_pc="{ (sleep 1; cat /dev/zero | nc po-tablet 5001 > /dev/null) & } &&"
 fi
 for run in $(seq "$runs"); do
     for transport in tcp quic; do
@@ -73,6 +74,6 @@ for run in $(seq "$runs"); do
         echo "== $profile run $run $transport"
         docker run --rm --network po-bench --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" plus-one-netbench \
             sh -c "$shape && $cross_pc /b/pathbench --cert /w/pc/cert.pem --key /w/pc/key.pem --trust $(cat "$work/tablet/fp") \
-            --tablet $ip:47101 --seconds $seconds $flag ${video:+--video $video}" || echo "test=failed"
+            --tablet $ip:47101 --seconds $seconds --opens $opens $flag ${video:+--video $video}" || echo "test=failed"
     done
 done

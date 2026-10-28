@@ -9,7 +9,7 @@
 //! 5 ms: its gaps) under a transfer; channels opened while one runs (how
 //! long, how many never were). One line a test, key=value.
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
-//!             [--quic] [--seconds S] [--video KBPS]
+//!             [--quic] [--seconds S] [--video KBPS] [--opens N]
 
 use plusone_link::session::MAX_DATAGRAM;
 use plusone_link::{Class, Identity, Node, Session};
@@ -240,6 +240,7 @@ fn main() {
     let seconds: f64 = value("--seconds").and_then(|s| s.parse().ok()).unwrap_or(6.0);
     let video_kbps: Option<u64> = value("--video").and_then(|v| v.parse().ok());
     let quic = args.iter().any(|a| a == "--quic");
+    let opened: usize = value("--opens").and_then(|n| n.parse().ok()).unwrap_or(20);
     let node = Node::new("Bench PC", &identity, Arc::new(move |fp: &str| fp == trusted)).unwrap();
     node.upgrade_to_quic(quic);
     let session = node.connect(tablet, Duration::from_secs(5)).expect("a session");
@@ -295,7 +296,7 @@ fn main() {
         std::thread::spawn(move || transfer(&session, "sink", 2.0 * seconds))
     };
     std::thread::sleep(Duration::from_millis(500));
-    let (times, failed) = opens(&session, 20);
+    let (times, failed) = opens(&session, opened);
     println!("test=opens_up ok={} failed={failed} {} mbs={:.2}", times.len(), quantiles(times), up.join().unwrap());
     println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
 }

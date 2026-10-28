@@ -105,6 +105,14 @@ refuses it (not served, not allowed). Four classes:
 - Datagrams: AES-256-GCM, the nonce the direction and a counter, the
   channel inside the sealed part. Replays: a window of 1024 for realtime;
   input only newer than the newest (an older state must not undo a newer).
+- Reliable frames are numbered as they leave, not as they are queued, so
+  the queue may put some ahead: the session's own messages (opening a
+  channel and its answer, credits) go first; the channels go in turn, so
+  a message on one waits behind no other's transfer (on a 100 KB/s path,
+  opening a channel and a round trip on it beside a transfer took 3.3 s,
+  now 1 s: what is left is the transfer's whole messages already on their
+  way); a channel's close goes after its own messages, "bye" after all.
+  At most 64 channels at once, each side's.
 - A path change keeps the channels: control resends what the other side
   had not acknowledged; realtime and input go on (a video channel's
   feature hears "path changed" and asks for a keyframe); bulk starts over.

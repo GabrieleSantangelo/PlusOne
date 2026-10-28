@@ -26,7 +26,7 @@ use crate::stream::Stream;
 use crate::sys::{self, Wake};
 use crate::{log, Class};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -92,6 +92,9 @@ const GRANT_EVERY: u64 = 64 << 10;
 /// the stream goes, never ahead of it, so what shares the stream (the
 /// cable's realtime packets, under STREAM_BUDGET) never waits behind more.
 const CONTROL_BACKLOG: usize = 128 << 10;
+/// Channels a session may have at once (architecture §3.13); one more is
+/// refused, either side's.
+const MAX_CHANNELS: usize = 64;
 /// Realtime counts as going this long after its last datagram (pace.rs).
 const REALTIME_GOING: Duration = Duration::from_millis(500);
 /// The path's pings this often while realtime and bulk go together
@@ -203,14 +206,49 @@ impl End {
     }
 }
 
-/// What waits to go on the stream, in two queues: the urgent (input and
-/// realtime frames, pings) never wait behind the reliable (control
-/// messages, a big transfer's), which go to TLS frame by frame, a slice at
-/// a time; between two slices the urgent go first.
+/// A reliable frame not numbered yet: it is numbered as it leaves
+/// (Outbox::take), in the order frames leave, so the queue may put one
+/// ahead of others (the other side takes numbers in order only).
+struct Waiting {
+    kind: u8,
+    channel: u16,
+    body: Vec<u8>,
+}
+
+impl Waiting {
+    fn size(&self) -> usize {
+        frame::HEADER + 8 + self.body.len()
+    }
+}
+
+/// Where a reliable frame waits.
+#[derive(Clone, Copy)]
+enum Queue {
+    /// The session's own messages (opens and their answers, credits): ahead
+    /// of every channel's, never behind a transfer (an opened channel went
+    /// unanswered behind seconds of one on a slow path).
+    Ahead,
+    /// A channel's: in its order, the channels in turn (a message on one
+    /// waits behind no other's transfer); a channel's close after its data.
+    Channel(u16),
+    /// After everything ("bye").
+    Last,
+}
+
+/// What waits to go on the stream: the urgent (input and realtime frames,
+/// pings) never wait behind the reliable (control messages, a big
+/// transfer's), which go to TLS frame by frame, a slice at a time; between
+/// two slices the urgent go first.
 #[derive(Default)]
 struct Outbox {
     urgent: Vec<u8>,
-    reliable: VecDeque<Vec<u8>>,
+    /// Numbered already: what a lost path had not delivered, first again.
+    resend: VecDeque<Vec<u8>>,
+    ahead: VecDeque<Waiting>,
+    channels: BTreeMap<u16, (VecDeque<Waiting>, usize)>,
+    last: VecDeque<Waiting>,
+    /// The channel whose turn comes next.
+    turn: u16,
     reliable_bytes: usize,
 }
 
@@ -223,27 +261,66 @@ impl Outbox {
         self.len() == 0
     }
 
-    fn push_reliable(&mut self, frame: Vec<u8>) {
-        self.reliable_bytes += frame.len();
-        self.reliable.push_back(frame);
+    /// What one channel has waiting (bytes).
+    fn channel_len(&self, id: u16) -> usize {
+        self.channels.get(&id).map_or(0, |(_, bytes)| *bytes)
     }
 
-    fn clear(&mut self) {
-        *self = Outbox::default();
-    }
-
-    /// The next for TLS: every urgent frame, then whole reliable frames
-    /// up to reliable bytes (0: none now); and how many of those.
-    fn take(&mut self, reliable: usize) -> (Vec<u8>, usize) {
-        let mut out = std::mem::take(&mut self.urgent);
-        let urgent = out.len();
-        while out.len() - urgent < reliable {
-            let Some(frame) = self.reliable.pop_front() else { break };
-            self.reliable_bytes -= frame.len();
-            out.extend_from_slice(&frame);
+    fn push(&mut self, waiting: Waiting, queue: Queue) {
+        self.reliable_bytes += waiting.size();
+        match queue {
+            Queue::Ahead => self.ahead.push_back(waiting),
+            Queue::Last => self.last.push_back(waiting),
+            Queue::Channel(id) => {
+                let (frames, bytes) = self.channels.entry(id).or_default();
+                *bytes += waiting.size();
+                frames.push_back(waiting);
+            }
         }
-        let taken = out.len() - urgent;
-        (out, taken)
+    }
+
+    /// A new path: the urgent are stale; what the last one had not
+    /// delivered (numbered) goes first again, the rest as it was.
+    fn restart(&mut self, unacked: impl Iterator<Item = Vec<u8>>) {
+        self.reliable_bytes -= self.resend.iter().map(Vec::len).sum::<usize>();
+        self.urgent.clear();
+        self.resend = unacked.collect();
+        self.reliable_bytes += self.resend.iter().map(Vec::len).sum::<usize>();
+    }
+
+    /// The next channel's frame, the channels in turn.
+    fn next_channel(&mut self) -> Option<Waiting> {
+        let id = self.channels.range(self.turn..).chain(self.channels.range(..self.turn)).map(|(id, _)| *id).next()?;
+        let (frames, bytes) = self.channels.get_mut(&id)?;
+        let waiting = frames.pop_front()?;
+        *bytes -= waiting.size();
+        if frames.is_empty() {
+            self.channels.remove(&id);
+        }
+        self.turn = id.wrapping_add(1);
+        Some(waiting)
+    }
+
+    /// The next for TLS: every urgent frame and those to send again, then
+    /// reliable frames up to reliable bytes (0: none now) to be numbered;
+    /// and how many bytes of the reliable.
+    fn take(&mut self, reliable: usize) -> (Vec<u8>, Vec<Waiting>, usize) {
+        let mut out = std::mem::take(&mut self.urgent);
+        let (mut fresh, mut taken) = (Vec::new(), 0);
+        while taken < reliable {
+            if let Some(bytes) = self.resend.pop_front() {
+                taken += bytes.len();
+                self.reliable_bytes -= bytes.len();
+                out.extend_from_slice(&bytes);
+                continue;
+            }
+            let next = self.ahead.pop_front().or_else(|| self.next_channel()).or_else(|| self.last.pop_front());
+            let Some(waiting) = next else { break };
+            taken += waiting.size();
+            self.reliable_bytes -= waiting.size();
+            fresh.push(waiting);
+        }
+        (out, fresh, taken)
     }
 }
 
@@ -677,6 +754,9 @@ impl Session {
         if self.is_closed() {
             return Err("the session is over".into());
         }
+        if self.channels.lock().unwrap().len() >= MAX_CHANNELS {
+            return Err(format!("{feature}/{name}: {MAX_CHANNELS} channels open already"));
+        }
         let id = self.next_id.fetch_add(2, Ordering::Relaxed);
         let (ours, theirs) = sys::seqpacket_pair(CHANNEL_BUFFER).map_err(|e| e.to_string())?;
         // Ours before the other side hears of it: what it sends at once waits in the socket.
@@ -712,6 +792,9 @@ impl Session {
         if id == DATAGRAM_PATH || id % 2 == self.next_id.load(Ordering::Relaxed) % 2
             || self.channels.lock().unwrap().contains_key(&id) {
             return refuse("bad id");
+        }
+        if self.channels.lock().unwrap().len() >= MAX_CHANNELS {
+            return refuse("too many channels");
         }
         let (ours, theirs) = match sys::seqpacket_pair(CHANNEL_BUFFER) {
             Ok(pair) => pair,
@@ -750,7 +833,7 @@ impl Session {
                         if me.flow && !me.wait_for_credit(&end, length as u64) {
                             break;
                         }
-                        me.wait_for_room();
+                        me.wait_for_room(end.id);
                         me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
                     }
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
@@ -807,9 +890,11 @@ impl Session {
         });
     }
 
-    /// Until the queue is under CONTROL_BACKLOG, or the session is over.
-    fn wait_for_room(&self) {
-        while !self.is_closed() && self.outbox.lock().unwrap().len() > CONTROL_BACKLOG {
+    /// Until the channel's own queue is under CONTROL_BACKLOG, or the
+    /// session is over (the channels go in turn: one's backlog holds up no
+    /// other).
+    fn wait_for_room(&self, id: u16) {
+        while !self.is_closed() && self.outbox.lock().unwrap().channel_len(id) > CONTROL_BACKLOG {
             std::thread::sleep(ROOM_POLL);
         }
     }
@@ -864,24 +949,37 @@ impl Session {
     // -- the queue -------------------------------------------------------------------
 
     fn send_message(&self, message: Value) {
-        self.queue_reliable(frame::SESSION, 0, message.to_string().as_bytes());
+        let queue = match message["t"].as_str() {
+            // After the channel's own messages, not ahead of them.
+            Some("close") => Queue::Channel(message["id"].as_u64().unwrap_or(0) as u16),
+            Some("bye") => Queue::Last,
+            _ => Queue::Ahead,
+        };
+        self.outbox.lock().unwrap().push(Waiting { kind: frame::SESSION, channel: 0, body: message.to_string().into_bytes() },
+                                         queue);
+        self.wake.wake();
     }
 
-    /// A frame numbered, kept until the other side says it has it, queued.
+    /// A channel's message, queued (numbered as it leaves).
     fn queue_reliable(&self, kind: u8, channel: u16, body: &[u8]) {
-        let mut bytes = Vec::with_capacity(frame::HEADER + 8 + body.len());
-        {
-            let mut reliable = self.reliable.lock().unwrap();
+        self.outbox.lock().unwrap().push(Waiting { kind, channel, body: body.to_vec() }, Queue::Channel(channel));
+        self.wake.wake();
+    }
+
+    /// Frames leaving: numbered in the order they leave, kept until the
+    /// other side says it has them, onto out.
+    fn number(&self, fresh: Vec<Waiting>, out: &mut Vec<u8>) {
+        let mut reliable = self.reliable.lock().unwrap();
+        for waiting in fresh {
             let number = reliable.next;
             reliable.next += 1;
             let mut numbered = number.to_be_bytes().to_vec();
-            numbered.extend_from_slice(body);
-            frame::encode(kind, channel, &numbered, &mut bytes);
-            reliable.unacked.push_back((number, bytes.clone()));
-            // In the queue under the same lock: in the order of their numbers.
-            self.outbox.lock().unwrap().push_reliable(bytes);
+            numbered.extend_from_slice(&waiting.body);
+            let mut bytes = Vec::with_capacity(frame::HEADER + numbered.len());
+            frame::encode(waiting.kind, waiting.channel, &numbered, &mut bytes);
+            out.extend_from_slice(&bytes);
+            reliable.unacked.push_back((number, bytes));
         }
-        self.wake.wake();
     }
 
     fn queue(&self, kind: u8, channel: u16, body: &[u8]) {
@@ -955,11 +1053,7 @@ impl Session {
             // What the path before did not deliver goes first; datagrams
             // waiting for it are stale now.
             let reliable = self.reliable.lock().unwrap();
-            let mut outbox = self.outbox.lock().unwrap();
-            outbox.clear();
-            for (_, bytes) in &reliable.unacked {
-                outbox.push_reliable(bytes.clone());
-            }
+            self.outbox.lock().unwrap().restart(reliable.unacked.iter().map(|(_, bytes)| bytes.clone()));
         }
         *self.path.lock().unwrap() = Some(path.clone());
         *self.pace.lock().unwrap() = crate::pace::Pace::new(Instant::now());
@@ -1016,7 +1110,10 @@ impl Session {
                     let mut pace = self.pace.lock().unwrap();
                     if pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
                 };
-                let (out, taken) = self.outbox.lock().unwrap().take(reliable);
+                let (mut out, fresh, taken) = self.outbox.lock().unwrap().take(reliable);
+                if !fresh.is_empty() {
+                    self.number(fresh, &mut out);
+                }
                 let mut pace = self.pace.lock().unwrap();
                 pace.spent(taken);
                 paced = pace.wait();

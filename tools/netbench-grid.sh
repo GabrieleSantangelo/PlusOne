@@ -1,11 +1,12 @@
 #!/bin/sh
 # tools/netbench.sh on a grid of networks, each RUNS times, summed up: the
 # link's parameters are kept only if they hold on all of them, not on one.
-#   tools/netbench-grid.sh [RUNS] [SECONDS] > grid.txt
+#   tools/netbench-grid.sh [RUNS] [SECONDS] [OPENS] > grid.txt
 set -e
 cd "$(dirname "$0")/.."
 runs=${1:-2}
 seconds=${2:-6}
+opens=${3:-20}
 logs=$(mktemp -d)
 trap 'rm -rf "$logs"' EXIT
 # name rate,delay ms,loss %,queue ms[,steps|bursts|cross]. From about 15 Mbit/s up (a home ADSL
@@ -26,7 +27,7 @@ degraded 3mbit,10,0.5,300"
 echo "$grid" | while read -r name profile; do
     [ -n "$name" ] || continue
     echo "######## $name ($profile)"
-    tools/netbench.sh "$profile" "$runs" "$seconds" > "$logs/$name.log" 2>&1 || true
+    tools/netbench.sh "$profile" "$runs" "$seconds" "" "$opens" > "$logs/$name.log" 2>&1 || true
     grep -c "test=failed" "$logs/$name.log" | sed 's/^/failed runs: /'
     python3 -I tools/netbench-summary.py < "$logs/$name.log"
 done
