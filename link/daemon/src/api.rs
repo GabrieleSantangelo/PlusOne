@@ -118,6 +118,12 @@ pub fn send_now(client: RawFd, message: &serde_json::Value) -> io::Result<()> {
     if sent < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
+/// The app's connection shut, both ways: it sees its end (and so does
+/// whoever reads it here).
+pub fn hang_up(client: RawFd) {
+    unsafe { libc::shutdown(client, libc::SHUT_RDWR) };
+}
+
 /// One message to an app, with a descriptor if there is one (ours closes
 /// once sent: the app has its own).
 pub fn send(client: RawFd, message: &serde_json::Value, fd: Option<OwnedFd>) -> io::Result<()> {

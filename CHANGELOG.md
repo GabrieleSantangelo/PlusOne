@@ -45,6 +45,10 @@
   minutes now, as over the link of before. And a plus-one-link that stops
   answering no longer freezes Plus One: a request to it gives up after a
   few seconds.
+- **The desktop follows the network after a busy moment too**: a feature
+  that fell behind reading plus-one-link's news (the link's budget, the
+  tablet's path) heard none of it from then on, and never knew; now it
+  misses only what came while it was behind.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

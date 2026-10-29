@@ -377,10 +377,22 @@ impl Daemon {
             }
             Event::Gone(device, reason) => (json!({"event": "gone", "device": device, "reason": reason}), None),
         };
-        // Never waiting on an app: one that does not read loses its events.
         for message in std::iter::once(message).chain(also) {
-            self.watchers.lock().unwrap().retain(|watcher| api::send_now(watcher.as_raw_fd(), &message).is_ok());
+            self.tell(&message);
         }
+    }
+
+    /// An event to the apps that watch, never waiting on one: one that does
+    /// not read loses it; one that cannot be told (gone, broken) watches no
+    /// more, and its connection is shut: the app sees its end.
+    fn tell(&self, message: &Value) {
+        self.watchers.lock().unwrap().retain(|watcher| match api::send_now(watcher.as_raw_fd(), message) {
+            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                api::hang_up(watcher.as_raw_fd());
+                false
+            }
+            _ => true,
+        });
     }
 
     /// A session's path lost: another made at once, the network's (the
@@ -590,6 +602,44 @@ mod tests {
     fn ask(app: &OwnedFd, request: Value) -> Value {
         api::send(app.as_raw_fd(), &request, None).unwrap();
         heard(app).expect("no reply")
+    }
+
+    /// Whether the app's connection ended (within 5 s).
+    fn ended(app: &OwnedFd) -> bool {
+        let mut byte = 0u8;
+        unsafe { libc::recv(app.as_raw_fd(), &mut byte as *mut u8 as *mut libc::c_void, 1, 0) == 0 }
+    }
+
+    #[test]
+    fn a_watcher_that_falls_behind_loses_events_not_its_watch() {
+        let daemon = daemon("behind");
+        let (app, _served) = app(&daemon);
+        assert_eq!(ask(&app, json!({"op": "watch"}))["ok"], true);
+        let budget = json!({"event": "budget", "device": "a".repeat(64), "kbps": 12345});
+        for _ in 0..10_000 {  // far more than its connection holds
+            daemon.tell(&budget);
+        }
+        assert_eq!(daemon.watchers.lock().unwrap().len(), 1);
+        let mut buf = vec![0u8; REQUEST];
+        let mut unread = 0;
+        while unsafe { libc::recv(app.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) } > 0 {
+            unread += 1;
+        }
+        assert!(unread > 0 && unread < 10_000, "{unread}");
+        let gone = json!({"event": "gone", "device": "a".repeat(64), "reason": "bye"});
+        daemon.tell(&gone);
+        assert_eq!(heard(&app), Some(gone));
+    }
+
+    #[test]
+    fn a_watcher_that_cannot_be_told_sees_its_end() {
+        let daemon = daemon("broken");
+        let (app, served) = app(&daemon);
+        assert_eq!(ask(&app, json!({"op": "watch"}))["ok"], true);
+        daemon.tell(&json!({"event": "budget", "device": "a".repeat(1 << 20)}));  // more than a connection ever holds
+        assert!(daemon.watchers.lock().unwrap().is_empty());
+        assert!(ended(&app));
+        served.join().unwrap();
     }
 
     #[test]
