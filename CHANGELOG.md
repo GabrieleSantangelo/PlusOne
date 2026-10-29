@@ -2,6 +2,11 @@
 
 ## Unreleased (1.0)
 
+- **A steadier picture on a shared network**: the link judged how much
+  goes through on the last fifth of a second, which one big frame of the
+  desktop fills; it now takes half a second. With a download beside on
+  an emulated home Wi-Fi, a 4 Mbit/s picture went from 65 % to 99 % of
+  frames whole.
 - **No more black minute after a burst of losses**: on a Wi-Fi whose
   queue overflowed, the link's QUIC read the lost packets as a path that
   carries smaller ones, and for a minute no packet of the desktop fitted:

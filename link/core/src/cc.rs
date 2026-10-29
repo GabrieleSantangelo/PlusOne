@@ -32,7 +32,11 @@ const OVERUSE_TIME_MS: f64 = 20.0;
 const K_UP: f64 = 0.0087;
 const K_DOWN: f64 = 0.039;
 const BETA: f64 = 0.85;
-const ACKED_WINDOW: Duration = Duration::from_millis(200);
+/// What is acknowledged, measured over this. Over 200 ms a keyframe filled
+/// it: on a hotspot's replay the rate allowed was 3.3 times what went
+/// through, 2.3 over 500 ms; on the emulated grid a fixed 4 Mbit/s video
+/// beside a download went from 65 to 99 % of frames whole.
+const ACKED_WINDOW: Duration = Duration::from_millis(500);
 /// Clean this long with the window full: probe up fast again.
 const PROBE_AFTER: Duration = Duration::from_secs(2);
 const MIN_RATE: f64 = 30_000.0;     // bytes a second

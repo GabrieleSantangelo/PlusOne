@@ -231,9 +231,9 @@ on all of them).
 | Cut | 0.85 of the rate acknowledged | published: GCC |
 | Increase | 8 % a second; near the last cut a packet a round trip (and 100 ms), at least 5 % a second | published: GCC; the 5 % floor chosen |
 | Never above | 1.5 × acknowledged + 10 KB/s, going up; never down for it | published: WebRTC (`AimdRateControl`); applied going down too, a still screen took the rate, and the screen with it, to the least in seconds |
-| Cuts apart | a round trip, 100-200 ms | published: WebRTC's `TimeToReduceFurther` (10-200 ms); the 100 ms floor chosen (what is acknowledged is measured over 200 ms) |
+| Cuts apart | a round trip, 100-200 ms | published: WebRTC's `TimeToReduceFurther` (10-200 ms); the 100 ms floor chosen (what is acknowledged shows a cut only later: it is measured over 500 ms) |
 | A cut on a stale measurement | at most 30 % | chosen |
-| Rate acknowledged, over | 200 ms | chosen |
+| Rate acknowledged, over | 500 ms | published: WebRTC's acknowledged bitrate estimator starts on 500 ms; measured: over 200 ms a keyframe filled it, the rate allowed 3.3 times what went through on a hotspot's replay (2.3 over 500 ms); on the emulated grid a fixed 4 Mbit/s video beside a download 65 → 99 % of frames whole, nothing worse over 10 runs of the steps |
 | Loss | past 10 %: cut by half the loss | published: GCC's loss-based controller |
 | Queue standing | past 20 ms (least round trip of 500 ms over the least of 10 s): cut; only with packets in 6 of its 10 buckets of 50 ms | the design's emergency cut (architecture §3.11); the windows chosen; idle, a Wi-Fi asleep lengthened the keepalives' round trips: 17 cuts to the least |
 | Window | rate × (round trip + 5 ms), 4 packets at least | chosen; QUIC's least is 2 (RFC 9002) |
