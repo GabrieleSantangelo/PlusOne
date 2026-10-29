@@ -1,6 +1,8 @@
 """Background application helpers: settings file and autostart entry."""
 import json
 
+import pytest
+
 from plusone.app import APP_ID, load_settings, set_autostart
 from plusone.engine import Settings
 
@@ -115,3 +117,64 @@ def test_exec_lines_survive_the_key_file(tmp_path):
     exec_line = keyfile.get_string("Desktop Entry", "Exec")
     ok, argv = GLib.shell_parse_argv(exec_line.replace("%%", "%"))
     assert ok and argv[0] == command and argv[1:] == ["--sign", "%F"]
+
+
+def replacing(monkeypatch, version, busy=None, state="idle"):
+    """replace_older_instance with a Plus One of version running (pid 4242),
+    no bus: what its Busy() and State answer (None: not known to it;
+    app.BUSY: no answer in time). The signals it was sent, what it was asked."""
+    import types
+    from plusone import app
+    owner, signals, asked = [4242], [], []
+
+    def answer(name):
+        asked.append(name)
+        return {"Version": version, "Busy": busy, "State": state}[name]
+
+    def kill(pid, number):
+        signals.append((pid, number))
+        owner.clear()
+    monkeypatch.setattr(app, "IN_FLATPAK", False)
+    monkeypatch.setattr(app, "Gio", types.SimpleNamespace(bus_get_sync=lambda *a: "bus", BusType=app.Gio.BusType))
+    monkeypatch.setattr(app, "_owner_pid", lambda bus: owner[0] if owner else None)
+    monkeypatch.setattr(app, "_running_property", lambda bus, name: answer(name))
+    monkeypatch.setattr(app, "_running_call", lambda bus, interface, method, args=None: answer(method))
+    monkeypatch.setattr(app.os, "kill", kill)
+    app.replace_older_instance()
+    return signals, asked
+
+
+def test_an_older_plus_one_with_nothing_in_use_is_replaced(monkeypatch):
+    import signal
+    assert replacing(monkeypatch, "0.9.2", busy=False)[0] == [(4242, signal.SIGTERM)]
+    # 0.3 said no version, and older ones nothing: their connection is all they tell.
+    assert replacing(monkeypatch, None, busy=None, state="idle")[0] == [(4242, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("version, busy, state", [
+    ("0.9.2", True, "idle"),          # the camera, a PDF out for signing...: in use
+    ("0.9.2", None, "streaming"),     # one before Busy(): connected
+    ("0.9.2", "no answer", "idle"),
+    ("0.10.0", False, "idle"),        # this version
+    ("0.11.0", False, "idle"),        # a newer one: never replaced by an older
+    ("0.10.0~rc1", False, "idle"),
+])
+def test_a_plus_one_newer_or_in_use_is_left_running(monkeypatch, version, busy, state):
+    from plusone import app
+    if busy == "no answer":
+        busy = app.BUSY
+    signals, asked = replacing(monkeypatch, version, busy, state)
+    assert signals == []
+    if not version.startswith("0.9"):
+        assert asked == ["Version"]  # not even asked whether it is busy
+
+
+def test_busy_is_told_over_d_bus():
+    import types
+    from plusone import app
+    for busy in (True, False):
+        returned = []
+        running = types.SimpleNamespace(busy=lambda: busy)
+        invocation = types.SimpleNamespace(return_value=returned.append)
+        app.PlusOneApp._dbus_method(running, None, None, app.OBJECT_PATH, app.INTERFACE, "Busy", None, invocation)
+        assert [value.unpack() for value in returned] == [(busy,)]

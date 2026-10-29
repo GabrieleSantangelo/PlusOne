@@ -28,6 +28,13 @@
   switch to another user's session that program could still click in
   theirs. The pen helper now takes it away as soon as its session is no
   longer the one in front, and gives none to a session that is not.
+- **The camera in a call is not cut by an upgrade**: after an upgrade,
+  starting Plus One (Sign on Tablet, say) stopped the older one still
+  running, unless it was connected, even with the tablet's camera,
+  microphone or speakers in use or a PDF out for signing; and it stopped
+  a newer one as well. Only an older Plus One with nothing in use is
+  replaced now; one in use takes the request, and starts again by itself
+  once nothing is.
 - **The app's no over the link says what to do again**: the tablet's
   app refusing the desktop over the link (it could not come to the front,
   say) showed "the app answered 'refused'"; it says what to do now, as

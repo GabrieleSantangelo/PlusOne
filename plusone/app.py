@@ -9,6 +9,7 @@ the Quick Settings toggle connects at once.
 import collections
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -49,6 +50,9 @@ INTERFACE_XML = f"""
     <method name="ShowWindow"/>
     <method name="SignDocument">
       <arg type="s" name="path" direction="in"/>
+    </method>
+    <method name="Busy">
+      <arg type="b" name="busy" direction="out"/>
     </method>
     <property name="Version" type="s" access="read"/>
     <property name="State" type="s" access="read"/>
@@ -655,6 +659,9 @@ class PlusOneApp(Adw.Application):
                                    GLib.Variant("(sa{sv}as)", (INTERFACE, self._properties(), [])))
 
     def _dbus_method(self, connection, sender, path, interface, method, params, invocation):
+        if method == "Busy":  # a newer Plus One starting: whether to leave this one running
+            invocation.return_value(GLib.Variant("(b)", (self.busy(),)))
+            return
         try:
             if method == "Connect":
                 self.controller.start()
@@ -692,10 +699,9 @@ def _owner_pid(bus):
 BUSY = object()  # the running instance did not answer in time
 
 
-def _running_property(bus, name):
+def _running_call(bus, interface, method, args=None):
     try:
-        return bus.call_sync(APP_ID, OBJECT_PATH, "org.freedesktop.DBus.Properties", "Get",
-                             GLib.Variant("(ss)", (INTERFACE, name)), None,
+        return bus.call_sync(APP_ID, OBJECT_PATH, interface, method, args, None,
                              Gio.DBusCallFlags.NO_AUTO_START, 2000, None).unpack()[0]
     except GLib.Error as e:
         if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT) or \
@@ -704,10 +710,25 @@ def _running_property(bus, name):
         return None  # 0.3 had no Version; older releases no interface at all
 
 
+def _running_property(bus, name):
+    return _running_call(bus, "org.freedesktop.DBus.Properties", "Get", GLib.Variant("(ss)", (INTERFACE, name)))
+
+
+def _older(version):
+    """Whether a running Plus One of version (None: one too old to say) is
+    older than this one: 0.9.2 is, 0.10.0 and 0.11.0 are not."""
+    def numbers(version):
+        return tuple(int(re.match(r"\d*", part).group() or 0) for part in version.split("."))
+    return version is None or numbers(version) < numbers(__version__)
+
+
 def replace_older_instance():
     """After an upgrade the previous version may still run in the background,
     and GApplication would hand it requests it does not know (like --sign).
-    Stop it, unless it is in the middle of a connection."""
+    Stop it, unless something is in use there (a connection, a PDF out for
+    signing, the tablet's camera, microphone or speakers). One left running,
+    or a newer one, takes this start's request as any Plus One running does
+    (SelfUpdate starts an older one again once nothing is in use)."""
     if IN_FLATPAK:
         return  # its PID would be the host's: not one to signal from here
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -715,14 +736,17 @@ def replace_older_instance():
     if pid is None:
         return
     version = _running_property(bus, "Version")
-    if version == __version__:
-        return
-    state = _running_property(bus, "State")
-    if BUSY in (version, state):
+    if version is not BUSY and not _older(version):
+        return  # this version, or a newer one
+    busy = version if version is BUSY else _running_call(bus, INTERFACE, "Busy")
+    if busy is None:  # one before Busy: its connection is all it tells
+        state = _running_property(bus, "State")
+        busy = BUSY if state is BUSY else state in ("connecting", "streaming")
+    if busy is BUSY:
         log("Plus One is running but busy; leaving it running")
         return
-    if state in ("connecting", "streaming"):
-        log(f"Plus One {version or '(older)'} is connected; leaving it running")
+    if busy:
+        log(f"Plus One {version or '(older)'} is in use; leaving it running")
         return
     log(f"replacing Plus One {version or '(older)'} (pid {pid}) with {__version__}")
     try:
