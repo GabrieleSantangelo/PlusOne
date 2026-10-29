@@ -9,10 +9,12 @@ channel in CHUNK pieces, as on the link of before it follows on the
 socket; so does a message longer than a channel message may be (a signed
 document's marks): "long" says how long, the pieces follow.
 """
+import collections
 import json
 import select
 import socket
 import threading
+import time
 
 from .. import log
 from .link import Refused
@@ -25,6 +27,30 @@ except ImportError:  # a Plus One without the link: the link of before only
 
 ANSWER_WAIT = 10.0  # seconds for the app's answer to a request
 CHUNK = 64 << 10   # bytes of a payload or a long message per channel message
+SENDING_OVER = 1.0  # seconds what the channels send a tablet is measured over
+WIRE = 92  # bytes a datagram takes on the network besides its body: the seal's 30, QUIC's 34, UDP and IPv4's 28
+
+# What the channels of this process sent each tablet lately: device ->
+# (when, bytes) each body; read by sending_kbps().
+_sent = {}
+_sent_lock = threading.Lock()
+
+
+def sending_kbps(device):
+    """What this process's channels send device now (kbit/s, as the network
+    carries it): the screen's share of the link's budget leaves it (the
+    speakers' PCM, 1.7 Mbit/s, on a hotspot of 3)."""
+    with _sent_lock:
+        sent = _sent.get(device)
+        if not sent:
+            return 0
+        _forget(sent, time.monotonic())
+        return sum(size for _at, size in sent) * 8 / 1000 / SENDING_OVER
+
+
+def _forget(sent, now):
+    while sent and now - sent[0][0] > SENDING_OVER:
+        sent.popleft()
 
 
 def connect(app_id, feature):
@@ -201,6 +227,12 @@ class ChannelPackets:
             if e.errno not in self.errors:
                 self.errors.add(e.errno)
                 log(f"{self.channel.feature}: cannot send:", e.strerror)
+            return
+        now = time.monotonic()
+        with _sent_lock:
+            sent = _sent.setdefault(self.device, collections.deque())
+            sent.append((now, len(body) + WIRE))
+            _forget(sent, now)
 
     def receive(self, timeout):
         if self._ended:

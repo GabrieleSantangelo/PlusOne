@@ -368,14 +368,17 @@ def test_the_links_budget_is_followed_as_it_changes():
     assert link.closed
     # The streamer: the new budget at once, between the reports.
     bitrates = []
+    others = [0]
     streamer = types.SimpleNamespace(rate=appdisplay.RateControl(20000), _rate_lock=threading.Lock(), _running=True,
-                                     _bitrate=bitrates.append)
+                                     _bitrate=bitrates.append, channel=types.SimpleNamespace(others_kbps=lambda: others[0]))
     appdisplay.AppStreamer._budget(streamer, 10000)
     appdisplay.AppStreamer._budget(streamer, 10300)  # a few percent: no change
     appdisplay.AppStreamer._budget(streamer, None)
+    others[0] = 1700  # the speakers play: the screen leaves them theirs
+    appdisplay.AppStreamer._budget(streamer, 10000)
     streamer._running = False
     appdisplay.AppStreamer._budget(streamer, 4000)
-    assert bitrates == [8500]
+    assert bitrates == [8500, 6800]
 
 
 def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():

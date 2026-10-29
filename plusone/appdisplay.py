@@ -22,6 +22,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 from . import link, log, media, once, pen  # noqa: E402
+from .link import channels  # noqa: E402
 from .link.datagrams import NONCE, TAG, Datagrams  # noqa: E402
 
 try:
@@ -430,16 +431,17 @@ class RateControl:
         self.ceiling_age = 0  # reports since
         self.delays = collections.deque(maxlen=self.HISTORY)
 
-    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None):
+    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None, others=0):
         """A report, and the frames not encoded since the last; the new
         bitrate if it changed, else None. budget: what the path's congestion
         controller allows (kbit/s), if it has one (QUIC's GCC): the bitrate
         is SHARE of it, and a frame lost is a keyframe's business, not the
         bitrate's (a Wi-Fi loses one now and then; cut by a third each time,
         the picture went from 20 to 4 Mbit/s in 4 s on a hotspot taking 36,
-        and took 50 s to come back)."""
+        and took 50 s to come back). others: what else of ours goes to the
+        tablet now (kbit/s), out of the budget's share."""
         if budget:
-            return self.budget(budget)
+            return self.budget(budget, others)
         delay = capture_to_decoded - first_to_decoded if shown >= self.FRAMES else None
         if delay is not None:
             self.delays.append(delay)
@@ -474,12 +476,13 @@ class RateControl:
             return self._set(max(up, self.kbps + 1))
         return None
 
-    def budget(self, budget):
+    def budget(self, budget, others=0):
         """The path's congestion controller's budget (kbit/s), now (also as
-        plus-one-link tells it changed, between reports): the new bitrate
-        if it changed, else None."""
+        plus-one-link tells it changed, between reports), and what else of
+        ours goes to the tablet (the speakers): the new bitrate if it
+        changed, else None."""
         self.clean, self.ceiling = 0, None
-        target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE)))
+        target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE - others)))
         if abs(target - self.kbps) < self.kbps * self.STEADY:
             return None
         return self._set(target)
@@ -534,6 +537,10 @@ class LinkPackets:
         if self._budget is not None:
             return self._budget or None
         return self._device().get("rate_kbps") or None
+
+    def others_kbps(self):
+        """What else of ours goes to the tablet now (kbit/s): the speakers'."""
+        return channels.sending_kbps(self.device)
 
     def watch_budget(self, on_budget):
         """on_budget(kbit/s, or None: no controller of its own) each time
@@ -662,8 +669,9 @@ class AppStreamer:
         not at the next report (a second later: the queue filled meanwhile)."""
         if not kbps or not self._running:
             return
+        others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
         with self._rate_lock:
-            changed = self.rate.budget(kbps)
+            changed = self.rate.budget(kbps, others)
             if changed is not None:
                 self._bitrate(changed)
 
@@ -758,9 +766,10 @@ class AppStreamer:
                 encoded, self._encoded = sorted(self._encoded), []
                 skipped, self.skipped = self.skipped, 0
                 budget = self.channel.budget_kbps() if hasattr(self.channel, "budget_kbps") else None
+                others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
                 with self._rate_lock:
                     before = self.rate.kbps
-                    kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget)
+                    kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget, others)
                     if kbps is not None:
                         self._bitrate(kbps)
                 self.on_stats({"shown": shown, "lost": lost,

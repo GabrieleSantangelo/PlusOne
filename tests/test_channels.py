@@ -10,6 +10,7 @@ import pytest
 pytest.importorskip("plusone_link")
 import plusone_link  # noqa: E402
 
+from plusone.link import channels  # noqa: E402
 from plusone.link.channels import CHUNK, ChannelLink  # noqa: E402
 
 
@@ -90,3 +91,20 @@ def test_a_long_message_over_its_limit_or_its_size_is_refused(ends):
 def test_nothing_readable_in_time(ends):
     link, _theirs = ends
     assert not link.readable(0.05)
+
+
+def test_what_the_channels_send_a_tablet_is_measured(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(channels.time, "monotonic", lambda: now[0])
+    sent = []
+    channel = type("FakeChannel", (), {"send": lambda self, body: sent.append(body), "feature": "speakers"})()
+    pcm = channels.ChannelPackets(None, "tab-measured", channel)
+    for _ in range(200):  # a second of 5 ms packets of PCM
+        pcm.send(bytes(965))
+        now[0] += 0.005
+    assert len(sent) == 200
+    kbps = channels.sending_kbps("tab-measured")
+    assert 1600 <= kbps <= 1700, kbps  # with what the network adds to each
+    assert channels.sending_kbps("another") == 0
+    now[0] += 2  # silence: nothing sent
+    assert channels.sending_kbps("tab-measured") == 0
