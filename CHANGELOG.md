@@ -49,6 +49,10 @@
   that fell behind reading plus-one-link's news (the link's budget, the
   tablet's path) heard none of it from then on, and never knew; now it
   misses only what came while it was behind.
+- **Nothing left behind by a session's channels**: each control channel
+  still open as a session ended (a PDF on its way, the desktop's) kept a
+  thread and a socket in plus-one-link and in the tablet's app, for as
+  long as they ran; they go with the session now.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

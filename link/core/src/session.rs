@@ -789,6 +789,9 @@ impl Session {
             let _ = waiting.send(Err("the session is over".into()));
         }
         for (_, end) in self.channels.lock().unwrap().drain() {
+            // Its inbox let go too: its thread holds the end, and would
+            // wait for it for ever (and keep its socket).
+            end.inbox.lock().unwrap().take();
             sys::shutdown(end.fd.as_raw_fd());
         }
         if let Some(node) = self.node.upgrade() {
