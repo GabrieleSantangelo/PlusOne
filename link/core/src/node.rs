@@ -386,6 +386,11 @@ impl Node {
         self.0.add(established).map_err(|e| e.to_string())
     }
 
+    /// Whether close() was called: nothing more is made on it.
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::SeqCst)
+    }
+
     /// Everything over: no more listening, every session closed.
     pub fn close(&self) {
         // Under the sessions' lock: a session being added sees it, or is seen.

@@ -43,12 +43,32 @@ static NEXT: AtomicI64 = AtomicI64::new(1);
 /// Whether the cable has its owner (cable() running).
 static CABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The USB accessory, from its opening until the cable is out: sessions on
-/// it one after the other. Each: READY and a number, again every
-/// USB_AGAIN, until the PC's GO with it; then the session's bytes both
-/// ways, until its stream ends (the session over, or on another path);
-/// then the next READY. One reader of the accessory throughout: a stale
-/// reader never holds it, nor reads another session's bytes.
+/// The cable's ownership, taken (CABLE): given back as it is dropped,
+/// however its owner ends (its thread not made, a panic).
+struct CableOwner;
+
+impl CableOwner {
+    fn take() -> Option<CableOwner> {
+        (!CABLE.swap(true, Ordering::SeqCst)).then_some(CableOwner)
+    }
+}
+
+impl Drop for CableOwner {
+    fn drop(&mut self) {
+        CABLE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The USB accessory, from its opening until the cable is out, or its node
+/// closed (the app's service stopped): sessions on it one after the other.
+/// Each: READY and a number, again every USB_AGAIN, until the PC's GO with
+/// it; then the session's bytes both ways, until its stream ends (the
+/// session over, or on another path); then the next READY. One reader of
+/// the accessory throughout: a stale reader never holds it, nor reads
+/// another session's bytes. Its read cannot be woken but by the PC's bytes:
+/// with the node closed, READY still goes, for the PC's answer to end it,
+/// and no session is made; the accessory is let go, for the next service
+/// in this process to open it.
 fn cable(node: Node, file: std::fs::File, kind: &str) {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
@@ -59,12 +79,13 @@ fn cable(node: Node, file: std::fs::File, kind: &str) {
     let gone = Arc::new(AtomicBool::new(false));
     let (handshake, transfers) = mpsc::channel::<Vec<u8>>();
     {
-        let (sink, gone) = (sink.clone(), gone.clone());
+        let (sink, gone, node) = (sink.clone(), gone.clone(), node.clone());
         let _ = std::thread::Builder::new().name("link-cable-in".into()).spawn(move || {
             let mut buf = vec![0u8; 16 << 10];
             loop {
                 let n = match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,  // the cable out
+                    Ok(_) if node.is_closed() => break,
                     Ok(n) => n,
                 };
                 let mut sink = sink.lock().unwrap();
@@ -106,8 +127,8 @@ fn cable(node: Node, file: std::fs::File, kind: &str) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break false,
             }
         };
-        if !answered {
-            return;
+        if !answered || node.is_closed() {
+            return;  // closed: the reader ends on the PC's next bytes (its TLS)
         }
         let Ok((ours, theirs)) = UnixStream::pair() else { return };
         plusone_link::stream::little_room(&theirs);
@@ -258,13 +279,11 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
             // opened it once (Android's accessory opens only once).
             let fd: i32 = number(request, "fd", None)?;
             let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-            if CABLE.swap(true, Ordering::SeqCst) {
-                return Err("the cable has an owner already".into());
-            }
+            let owner = CableOwner::take().ok_or("the cable has an owner already")?;
             let (node, kind) = (core.node.clone(), text("path").unwrap_or("usb").to_owned());
             std::thread::Builder::new().name("link-cable".into()).spawn(move || {
+                let _owner = owner;
                 cable(node, file, &kind);
-                CABLE.store(false, Ordering::SeqCst);
             }).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true}))
         }
@@ -414,6 +433,65 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
+
+    /// A key that signs nothing: no handshake gets that far here.
+    #[derive(Debug)]
+    struct NoKey;
+
+    impl SigningKey for NoKey {
+        fn choose_scheme(&self, _offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            None
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::ECDSA
+        }
+    }
+
+    fn node() -> Node {
+        let identity = Identity::signed_by(b"a tablet".to_vec(), Arc::new(NoKey));
+        Node::new("tablet", &identity, Arc::new(|_: &str| false)).unwrap()
+    }
+
+    /// The PC on the accessory's other end: the app's READY answered with GO.
+    fn go(pc: &mut UnixStream) {
+        let mut buf = [0u8; 256];
+        let n = pc.read(&mut buf).unwrap();
+        let number = plusone_link::stream::usb_number(plusone_link::stream::USB_READY, &buf[..n]).unwrap();
+        let mut go = plusone_link::stream::USB_GO.to_vec();
+        go.extend_from_slice(&number);
+        pc.write_all(&go).unwrap();
+    }
+
+    #[test]
+    fn the_cable_lets_the_accessory_go_once_its_node_is_closed() {
+        // The service stopped (nativeStop): the next one in this process opens the accessory again.
+        let (accessory, mut pc) = UnixStream::pair().unwrap();
+        let node = node();
+        let cable_node = node.clone();
+        let cable = std::thread::spawn(move || cable(cable_node, std::fs::File::from(OwnedFd::from(accessory)), "usb"));
+        node.close();
+        go(&mut pc);
+        // No session tried on the closed node (a handshake, the keystore's
+        // signature): each of the cable's descriptors closed instead.
+        pc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 256];
+        assert_eq!(pc.read(&mut buf).map_err(|e| e.kind()), Ok(0));
+        cable.join().unwrap();
+    }
+
+    #[test]
+    fn the_cables_owner_is_given_back_however_it_ends() {
+        let owner = CableOwner::take().unwrap();
+        assert!(CableOwner::take().is_none());
+        // Its thread not made: the closure that held it dropped, as a panic would.
+        let _ = std::panic::catch_unwind(move || {
+            let _owner = owner;
+            panic!("the cable's thread failed");
+        });
+        assert!(CableOwner::take().is_some());
+    }
 
     #[test]
     fn a_number_out_of_its_range_is_an_error_not_another() {

@@ -298,6 +298,12 @@
 - Fixed: a PDF to sign sent again by the PC while the first upload of it
   was still on its way was written over the first, and the job left in
   the queue lost its PDF; the second is refused now, the first goes on.
+- Fixed: Plus One stopping on the tablet (not always ready, nothing used
+  for a while) with the cable plugged in kept the cable, and went on
+  answering the PC on it with nothing behind, a handshake every few
+  seconds; started again, it could not use the cable until it was
+  plugged in again. It lets go of the cable now, at the PC's next
+  answer, and takes it again as it starts.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.
