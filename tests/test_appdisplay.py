@@ -331,7 +331,8 @@ def test_the_pen_is_made_as_the_desktop_comes_up():
                                    has_flags=lambda flags: False)
     sink = types.SimpleNamespace(emit=lambda signal: types.SimpleNamespace(get_buffer=lambda: buffer))
     streamer = types.SimpleNamespace(_captured=collections.deque(), channel=types.SimpleNamespace(send=lambda d: None),
-                                     _frame=0, _encoded=[], _state_lock=threading.Lock(), shown=True, active=True,
+                                     _frame=0, _keyframes=0, _encoded=[], _state_lock=threading.Lock(), shown=True,
+                                     active=True,
                                      gated=False, _capture=lambda: None, force_keyframe=lambda: None,
                                      on_visible=lambda shown: None,
                                      input=types.SimpleNamespace(prepare=lambda: prepared.append(1),
@@ -456,7 +457,8 @@ def test_the_links_budget_is_followed_as_it_changes():
     bitrates = []
     others = [0]
     streamer = types.SimpleNamespace(rate=appdisplay.RateControl(20000), _rate_lock=threading.Lock(), _running=True,
-                                     _bitrate=bitrates.append, channel=types.SimpleNamespace(others_kbps=lambda: others[0]))
+                                     _bitrate=lambda kbps, why: bitrates.append(kbps),
+                                     channel=types.SimpleNamespace(others_kbps=lambda: others[0]))
     appdisplay.AppStreamer._budget(streamer, 10000)
     appdisplay.AppStreamer._budget(streamer, 10300)  # a few percent: no change
     appdisplay.AppStreamer._budget(streamer, None)
@@ -465,6 +467,31 @@ def test_the_links_budget_is_followed_as_it_changes():
     streamer._running = False
     appdisplay.AppStreamer._budget(streamer, 4000)
     assert bitrates == [8500, 6800]
+
+
+def test_every_change_of_the_bitrate_is_said_with_its_cause(monkeypatch):
+    # The live tests count them: those from the budget's events wrote
+    # nothing (13 said of 51 in 10 minutes), and each is a keyframe.
+    said = []
+    monkeypatch.setattr(appdisplay, "log", lambda *args: said.append(" ".join(map(str, args))))
+    enc = types.SimpleNamespace(set_property=lambda *_: None, find_property=lambda _: None)
+    streamer = types.SimpleNamespace(rate=appdisplay.RateControl(20000), _rate_lock=threading.Lock(), _running=True,
+                                     kbps=20000, enc=enc, fps=60, channel=types.SimpleNamespace(others_kbps=lambda: 1700))
+    streamer._bitrate = lambda kbps, why: appdisplay.AppStreamer._bitrate(streamer, kbps, why)
+    appdisplay.AppStreamer._budget(streamer, 10000)
+    appdisplay.AppStreamer._budget(streamer, 9800)  # no change: nothing said
+    assert said == ["app display: 20000 -> 6800 kbit/s, as the network takes (the budget 10000 kbit/s, the others' 1700)"]
+    rate = appdisplay.RateControl(20000)
+    rate.report(55, 3, 30, 20)
+    assert rate.why == "3 frames lost"
+    rate.report(40, 0, 30, 20, skipped=15)
+    assert rate.why == "15 not encoded"
+    # Each second a keyframe went is said, with how many.
+    display = types.SimpleNamespace(_reports=1)
+    appdisplay.AppDisplay._stats(display, {"shown": 60, "lost": 0, "capture_to_decoded": [20, 30, 40],
+                                           "whole_to_decoded": [10, 12, 14], "capture_to_sent": 5, "skipped": 0,
+                                           "kbps": 6800, "keyframes": 2})
+    assert said[-1].endswith("; 6800 kbit/s; 2 keyframes")
 
 
 def test_on_quic_a_frame_is_left_out_before_the_link_would_drop_it():

@@ -483,6 +483,7 @@ class RateControl:
         self.ceiling_age = 0  # reports since
         self.delays = collections.deque(maxlen=self.HISTORY)
         self.changed_at = -math.inf  # the bitrate's last change for a budget (time.monotonic())
+        self.why = None  # what the last change returned was for, for the log
 
     def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None, others=0, now=None):
         """A report, and the frames not encoded since the last; the new
@@ -507,6 +508,8 @@ class RateControl:
             self.clean = 0
             if queue and (self.ceiling is None or self.kbps >= self.ceiling * self.NEAR):
                 self.ceiling, self.ceiling_age = self.kbps, 0
+            self.why = "; ".join(why for why in (lost and f"{lost} frames lost", grown and "the delay grew",
+                                                 skipped >= self.SKIPPED and f"{skipped} not encoded") if why)
             return self._set(self.kbps * 2 // 3)
         if skipped:
             return None  # not clean, but not a reason to count again from naught
@@ -517,6 +520,7 @@ class RateControl:
             if self.clean < self.PROBE_EVERY:
                 return None
             self.clean = 0
+            self.why = "clean, past where a queue showed"
             kbps = self._set(int(self.kbps * self.PROBE))
             if self.kbps >= self.ceiling:
                 self.ceiling = None  # it takes as much now
@@ -526,6 +530,7 @@ class RateControl:
             up = self.kbps * 11 // 10 + 100
             if self.ceiling:
                 up = min(up, int(self.ceiling * self.NEAR))
+            self.why = f"clean for {self.CLEAN} s"
             return self._set(max(up, self.kbps + 1))
         return None
 
@@ -546,6 +551,7 @@ class RateControl:
         kbps = self._set(target)
         if kbps is not None:
             self.changed_at = now
+            self.why = f"the budget {budget} kbit/s, the others' {others:.0f}"
         return kbps
 
     def _set(self, kbps):
@@ -687,6 +693,7 @@ class AppStreamer:
         media.cap_keyframes(enc, bitrate, fps)
         self.fps = fps
         self.rate = RateControl(bitrate)
+        self.kbps = bitrate  # the encoder's
         self._rate_lock = threading.Lock()  # the stats' thread and the link's budget events
         self.skipped = 0  # frames not encoded: the network behind
         # The path's budget (kbit/s), if its controller is its own (QUIC's):
@@ -706,6 +713,7 @@ class AppStreamer:
         self._bus_handler = bus.connect("message::error", self._failed)
         self._frame = 0
         self._last_keyframe = 0.0
+        self._keyframes = 0  # sent since the last stats
         self._encoded = []  # ms from capture to sent, since the last stats
         self._running = True
         self._feedback = threading.Thread(target=self._listen, daemon=True)
@@ -729,9 +737,14 @@ class AppStreamer:
         with self._rate_lock:
             changed = self.rate.budget(kbps, others)
             if changed is not None:
-                self._bitrate(changed)
+                self._bitrate(changed, self.rate.why)
 
-    def _bitrate(self, kbps):
+    def _bitrate(self, kbps, why):
+        """The encoder's bitrate changed, and said (each change, from the
+        budget's events too: the live tests count them, and each is a
+        keyframe on Intel's encoders)."""
+        log(f"app display: {self.kbps} -> {kbps} kbit/s, as the network takes ({why})")
+        self.kbps = kbps
         self.enc.set_property("bitrate", kbps)
         media.cap_keyframes(self.enc, kbps, self.fps)
 
@@ -794,6 +807,7 @@ class AppStreamer:
             # The monitor is Mutter's now (the pen is mapped onto it): the
             # pen made ahead of the first stroke, not on the listening thread.
             self.input.prepare()
+        self._keyframes += keyframe
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
             self.channel.send(header + data[index * payload:(index + 1) * payload])
@@ -835,17 +849,16 @@ class AppStreamer:
                 skipped, self.skipped = self.skipped, 0
                 budget = self.channel.budget_kbps() if hasattr(self.channel, "budget_kbps") else None
                 others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
+                keyframes, self._keyframes = self._keyframes, 0
                 with self._rate_lock:
-                    before = self.rate.kbps
                     kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget, others)
                     if kbps is not None:
-                        self._bitrate(kbps)
+                        self._bitrate(kbps, self.rate.why)
                 self.on_stats({"shown": shown, "lost": lost,
                                "capture_to_decoded": [v / 10 for v in ms[:3]],
                                "whole_to_decoded": [v / 10 for v in ms[3:]],
                                "capture_to_sent": encoded[len(encoded) // 2] if encoded else None,
-                               "skipped": skipped, "kbps": self.rate.kbps,
-                               "changed": kbps is not None and (before, kbps)})
+                               "skipped": skipped, "kbps": self.rate.kbps, "keyframes": keyframes})
 
     def visible(self, shown):
         """The app shows the desktop, or not: nothing is captured or encoded
@@ -905,7 +918,8 @@ def describe(stats):
             f"(90%: {decoded[1]:.1f}, max {decoded[2]:.1f}); of which capture to sent "
             f"{sent if sent is None else round(sent, 1)} ms, first packet to decoded {stats['whole_to_decoded'][0]:.1f} ms"
             + (f"; {stats['skipped']} not encoded (the network behind)" if stats.get("skipped") else "")
-            + (f"; {stats['kbps']} kbit/s" if "kbps" in stats else ""))
+            + (f"; {stats['kbps']} kbit/s" if "kbps" in stats else "")
+            + (f"; {stats['keyframes']} keyframe{'s' if stats['keyframes'] > 1 else ''}" if stats.get("keyframes") else ""))
 
 
 class AppDisplay:
@@ -1097,10 +1111,9 @@ class AppDisplay:
     def _stats(self, stats):
         """From the listening thread: the app's report of the last second."""
         self._reports += 1
-        if stats.get("changed"):
-            before, now = stats["changed"]
-            log(f"app display: {before} -> {now} kbit/s, as the network takes")
-        if stats["lost"] or stats.get("skipped") or self._reports % STATS_EVERY == 1:
+        # Each second something went wrong, or a keyframe went (the live
+        # tests follow the chain: a cut, frames not encoded, lost, asked for).
+        if stats["lost"] or stats.get("skipped") or stats.get("keyframes") or self._reports % STATS_EVERY == 1:
             log("app display:", describe(stats))
 
     def _scale(self, tries):

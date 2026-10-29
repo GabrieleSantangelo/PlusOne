@@ -254,6 +254,14 @@ queue, its cuts by why); `PLUSONE_LINK_CC_RECORD=FILE` writes every event
 it gets (each acknowledgement's times, losses), a real network's to replay
 in a test.
 
+What a live test follows, always in the logs, a line a second at most:
+the link's "realtime dropped over 1.0 s: N late, N for room, in N runs"
+(a run: a channel's datagrams dropped one after the other, a frame's tail
+or frames); the desktop's every change of bitrate with its cause ("A -> B
+kbit/s, as the network takes (the budget …)", from the budget's events
+too), and each second with frames lost, not encoded or a keyframe sent
+(how many of each).
+
 ## Measured
 
 ### The emulated grid, the reference
