@@ -54,12 +54,26 @@ def test_merging_with_the_tablet():
 
 def test_a_signature_whose_numbers_are_past_any_page_is_not_kept():
     # Finite, and yet inf once scaled onto a page (1e307 times its width):
-    # the signing window's snapshot failed on it each time.
+    # the signing window's snapshot failed on it each time. A pressure of
+    # 1e9 is no pressure either.
     import math
     from plusone.ink import bounds, place
     huge = dict(drawn(), id="huge", strokes=[[[0.0, 0.0, 0.5], [1e307, 0.0, 0.5]]])
-    pressed = dict(drawn(), id="pressed", strokes=[[[0.0, 0.0, 0.5], [1.0, 0.2, 7.0]]])
+    pressed = dict(drawn(), id="pressed", strokes=[[[0.0, 0.0, 0.5], [1.0, 0.2, 1e9]]])
     signatures.merge({"signatures": [huge, pressed, dict(drawn(), id="fine")], "removed": []})
     found, _removed = signatures.load()
     assert [s["id"] for s in found] == ["fine"]
     assert all(math.isfinite(v) for v in bounds(place(found[0], 100, 100)[0]))
+
+
+def test_a_tablet_s_pressure_past_full_is_kept_as_full():
+    # Android's pressure goes past 1.0 as the stylus's calibration says,
+    # and the tablet keeps it as it came: the signature is one all the
+    # same, and is drawn at full pressure.
+    from plusone.ink import place
+    theirs = dict(drawn(), id="tablet", strokes=[[[0.0, 0.0, 0.5], [1.0, 0.2, 1.02]]])
+    signatures.merge({"signatures": [theirs], "removed": []})
+    found, _removed = signatures.load()
+    assert [s["id"] for s in found] == ["tablet"] and found[0]["strokes"][0][1] == [1.0, 0.2, 1.0]
+    assert max(p for _x, _y, p in place(found[0], 100, 100)[0].points) == 1.0
+    assert signatures.message()["signatures"][0]["strokes"] == found[0]["strokes"]

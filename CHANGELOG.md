@@ -115,10 +115,11 @@
   for ever. The next name is taken now ("contract-signed-2.pdf"), the
   link left as it is.
 - **A garbled saved signature no longer breaks the signing window**: a
-  signature shared by the tablet with a point far past any page (and a
-  pressure past full) was kept as any other, and once placed on a page
-  the signing window failed at each picture it took of it. Such a
-  signature is left out now, as one that is no signature.
+  signature shared by the tablet with a point far past any page (or a
+  pressure no pen gives) was kept as any other, and once placed on a
+  page the signing window failed at each picture it took of it. Such a
+  signature is left out now, as one that is no signature; one pressed a
+  little past full, as Android may say, is drawn at full.
 - **What is signed on the PC is the PDF shown**: the signing window
   showed the PDF as it was when it opened, and read it again to save:
   moved or deleted meanwhile, the signature was lost (Plus One asked

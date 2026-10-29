@@ -29,6 +29,10 @@ MAX_POINTS = 20000  # samples in a signature: a long one has a few thousand
 # Its coordinates, of a signature 1 wide: initials far taller than wide are
 # a few; past this a number scaled onto a page was no longer one (inf).
 MAX_COORDINATE = 1000.0
+# Its pressures as the tablet keeps them, Android's own: past full (1.0)
+# where the stylus's calibration says so, taken as full (_parse); past
+# this, no pressure at all.
+MAX_PRESSURE = 16.0
 
 
 def _number(v):
@@ -36,9 +40,10 @@ def _number(v):
 
 
 def _point(pt):
-    """(x, y, pressure): coordinates within MAX_COORDINATE, pressure 0..1."""
+    """(x, y, pressure): coordinates within MAX_COORDINATE, pressure 0 to
+    MAX_PRESSURE."""
     return (isinstance(pt, list) and len(pt) == 3 and all(_number(v) for v in pt)
-            and abs(pt[0]) <= MAX_COORDINATE and abs(pt[1]) <= MAX_COORDINATE and 0 <= pt[2] <= 1)
+            and abs(pt[0]) <= MAX_COORDINATE and abs(pt[1]) <= MAX_COORDINATE and 0 <= pt[2] <= MAX_PRESSURE)
 
 
 def valid(signature):
@@ -57,6 +62,9 @@ def valid(signature):
 
 
 def _parse(data):
+    """(signatures, removed ids) of a list ({"signatures", "removed"}): the
+    valid ones, their pressures at most full. Every signature kept comes
+    through here, whoever made it: what draws them never sees more."""
     if not isinstance(data, dict):
         return [], []
     found = data.get("signatures")
@@ -65,7 +73,7 @@ def _parse(data):
     for s in found if isinstance(found, list) else []:
         if valid(s) and s["id"] not in seen:  # one of each
             seen.add(s["id"])
-            kept.append(s)
+            kept.append(dict(s, strokes=[[[x, y, min(1.0, p)] for x, y, p in stroke] for stroke in s["strokes"]]))
     return (kept[:MAX_SIGNATURES],
             list(dict.fromkeys(r for r in removed if isinstance(r, str) and 0 < len(r) <= 64))[-KEEP_REMOVED:]
             if isinstance(removed, list) else [])
@@ -85,10 +93,10 @@ def load(path=None, old=None):
         with open(old) as f:
             single = json.load(f)
         if isinstance(single, dict) and single.get("strokes"):
-            single = dict(single, id=uuid.uuid4().hex)
-            if valid(single):
-                save([single], [], path)  # its id must stay the same
-                return [single], []
+            found, _removed = _parse({"signatures": [dict(single, id=uuid.uuid4().hex)]})
+            if found:
+                save(found, [], path)  # its id must stay the same
+                return found, []
     except (OSError, ValueError):
         pass
     return [], []
@@ -113,11 +121,11 @@ def add(signature, path=None):
     """Keeps a normalized signature, first in the list; returns it with its
     id. ValueError if it is no signature (nothing in it, numbers that are not)."""
     signatures, removed = load(path)
-    kept = dict(thin(signature), id=uuid.uuid4().hex)
-    if not valid(kept):
+    kept, _removed = _parse({"signatures": [dict(thin(signature), id=uuid.uuid4().hex)]})
+    if not kept:
         raise ValueError("not a signature")
-    save([kept] + signatures, removed, path)
-    return kept
+    save(kept + signatures, removed, path)
+    return kept[0]
 
 
 def remove(signature_id, path=None):
