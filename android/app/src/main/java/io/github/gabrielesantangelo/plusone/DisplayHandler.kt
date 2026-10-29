@@ -50,7 +50,7 @@ class DisplayHandler(private val service: CompanionService) : Handler {
                  ready: (JSONObject) -> Unit, hold: () -> Unit, end: () -> Unit) {
             // Ended here (Back, Stop): the link closes, and the PC with it.
             session.onEnd = { Thread { end() }.start() }
-            session.onVisible = { service.lowLatency(false) }  // no low-latency Wi-Fi while nothing is shown
+            session.onVisible = { service.lowLatency() }  // no low-latency Wi-Fi while nothing is shown
             // This one takes the screen: the one before ends, its PC told (its
             // link closes), not left encoding for nobody with its monitor up.
             val before = synchronized(DisplaySession) {
@@ -69,7 +69,7 @@ class DisplayHandler(private val service: CompanionService) : Handler {
                 service.startActivity(Intent(service, DisplayActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 service.displaying = pc
                 service.showSessions()
-                service.lowLatency(true)
+                service.lowLatency()
                 hold()
             } finally {
                 session.stop()
@@ -77,7 +77,7 @@ class DisplayHandler(private val service: CompanionService) : Handler {
                 android.os.Handler(service.mainLooper).post { DisplayActivity.ended(session) }
                 if (DisplaySession.current == null) service.displaying = null
                 service.showSessions()
-                service.lowLatency(false)
+                service.lowLatency()
             }
         }
     }

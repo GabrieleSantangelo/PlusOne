@@ -67,7 +67,7 @@ class CaptureHandler(private val service: CompanionService) : Handler {
             link.send(JSONObject().put("type", "answer").put("sdp", answer))
             service.showSessions()
             Notifications.inUse(service, kind, link.pc)  // seen, with Stop
-            service.lowLatency(true)
+            service.lowLatency()
             // The PC holds it as long as its program uses the device, and pings.
             link.hold()
         } finally {

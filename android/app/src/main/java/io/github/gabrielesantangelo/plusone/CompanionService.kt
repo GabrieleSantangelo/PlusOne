@@ -10,8 +10,10 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.util.Log
+import io.github.gabrielesantangelo.plusone.link.ChannelLink
 import io.github.gabrielesantangelo.plusone.link.Link
 import io.github.gabrielesantangelo.plusone.link.LinkServer
+import io.github.gabrielesantangelo.plusone.link.LinkStatus
 import io.github.gabrielesantangelo.plusone.link.MdnsAnnouncer
 import io.github.gabrielesantangelo.plusone.link.TcpListener
 import java.io.File
@@ -108,7 +110,8 @@ class CompanionService : Service(), LinkServer.Host {
             return
         }
         link = core
-        core.onEvent = { io.github.gabrielesantangelo.plusone.link.LinkStatus.event(it) }
+        core.onEvent = { LinkStatus.event(it) }
+        LinkStatus.listen(pathChanged)
         core.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         PcOptions.adoptPaired(this, io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         // A cable plugged in before the service was up, or while it was not.
@@ -182,8 +185,9 @@ class CompanionService : Service(), LinkServer.Host {
         linkAnnouncer?.stop()
         bluetooth?.stop()
         link?.close()
+        LinkStatus.unlisten(pathChanged)
         // Its PCs with it: the main screen says "Connected" by them.
-        io.github.gabrielesantangelo.plusone.link.LinkStatus.clear()
+        LinkStatus.clear()
         super.onDestroy()
     }
 
@@ -248,7 +252,7 @@ class CompanionService : Service(), LinkServer.Host {
     fun ended(owner: Any) {
         synchronized(sessions) { sessions.remove(owner) }
         showSessions()
-        lowLatency(false)
+        lowLatency()
     }
 
     /** The PC whose desktop is shown here (DisplayHandler), or null. */
@@ -338,24 +342,29 @@ class CompanionService : Service(), LinkServer.Host {
         getSystemService(android.app.NotificationManager::class.java).notify(Notifications.SERVICE_ID, notification())
 
     // Wi-Fi without power saving while the PC uses the camera, the microphone or
-    // the speakers, or its desktop is on screen: saving, it holds packets back
-    // and sends them in bunches every 100-300 ms.
+    // the speakers, or its desktop is on screen, over Wi-Fi: saving, it holds
+    // packets back and sends them in bunches every 100-300 ms. Not while they
+    // go by cable or Bluetooth, where it would only cost power: as a session
+    // moves (LinkStatus), the lock follows.
     private val wifiLock by lazy {
         getSystemService(android.net.wifi.WifiManager::class.java)
             .createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "plusone:capture")
             .apply { setReferenceCounted(false) }
     }
 
-    @Synchronized  // from the main thread (onVisible) and the links': in order
-    fun lowLatency(using: Boolean) {
-        val any = synchronized(sessions) { sessions.isNotEmpty() }
+    @Synchronized  // from the main thread (onVisible, a path's change) and the links': in order
+    fun lowLatency() {
+        // Each session's PC (null: over the link of before), the shown desktop's.
+        val devices = synchronized(sessions) { sessions.values.map { (it.link as? ChannelLink)?.fingerprint } } +
+            listOfNotNull(DisplaySession.current?.takeIf { displaying != null && it.visible }).map { it.device }
         try {
-            val showing = displaying != null && DisplaySession.current?.visible == true
-            if (using || any || showing) wifiLock.acquire() else wifiLock.release()
+            if (devices.any { LinkStatus.overWifi(LinkStatus.path(it)) }) wifiLock.acquire() else wifiLock.release()
         } catch (e: Exception) {
             Log.w(TAG, "Wi-Fi lock: $e")
         }
     }
+
+    private val pathChanged: (LinkStatus.Pc?, LinkStatus.Pc?) -> Unit = { _, _ -> lowLatency() }
 
     companion object {
         /** The link's core listens here, if it can. */

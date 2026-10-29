@@ -313,6 +313,10 @@
   showed), it never tried again: every later request waited on that one
   and was refused, and the camera and the microphone stayed out of the
   PC's reach until the app was opened. It tries again at the next one.
+- Fixed: with the desktop, the camera, the microphone or the speakers
+  going by cable or Bluetooth, the tablet's Wi-Fi was still kept from
+  saving power for the whole session; it saves power now while the
+  session is off Wi-Fi, and stops saving again as soon as it moves back.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.

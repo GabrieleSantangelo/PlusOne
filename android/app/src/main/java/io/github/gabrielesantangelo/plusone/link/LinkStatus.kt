@@ -61,6 +61,16 @@ object LinkStatus {
         if (before.isNotEmpty()) main.post { for (pc in before) for (listener in listeners) listener(pc, null) }
     }
 
+    /** The path a session with device is on now: its PC's over the link's
+     * core (null while it waits for one); over the link of before (no
+     * device), the network's. */
+    fun path(device: String?): String? = if (device == null) "lan" else pcs[device]?.path
+
+    /** Whether a session on path goes through the tablet's Wi-Fi: a LAN's,
+     * Wi-Fi Direct, the PC's access point, the internet's (the relay); not
+     * the cable nor Bluetooth, nor while it waits for a path. */
+    fun overWifi(path: String?): Boolean = path != null && path !in setOf("usb", "bt", "bluetooth")
+
     fun icon(path: String?): Int = when (path) {
         "usb" -> R.drawable.ic_cable
         "bt", "bluetooth" -> R.drawable.ic_bluetooth

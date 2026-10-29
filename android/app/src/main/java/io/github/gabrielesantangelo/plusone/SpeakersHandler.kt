@@ -49,7 +49,7 @@ class SpeakersHandler(private val service: CompanionService) : Handler {
                     put("codecs", JSONArray().put("pcm").apply { if (OpusDecoder.available()) put("opus") })
                 }.toString()))
             service.showSessions()
-            service.lowLatency(true)
+            service.lowLatency()
             link.hold()
         } finally {
             playback.stop()
