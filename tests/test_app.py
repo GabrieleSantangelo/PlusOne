@@ -87,6 +87,24 @@ def test_settings_are_private(tmp_path, monkeypatch):
     assert os.stat(app.CONFIG).st_mode & 0o077 == 0
 
 
+def test_settings_saved_by_two_threads_at_once_are_both_whole(tmp_path, monkeypatch):
+    import os
+    from plusone import app
+    from plusone.engine import Settings
+    monkeypatch.setattr(app, "CONFIG", str(tmp_path / "plus-one" / "settings.json"))
+    replace = os.replace
+
+    def another_thread_saves_meanwhile(src, dst):
+        monkeypatch.setattr(os, "replace", replace)
+        app.save_settings(Settings(bitrate=9000))
+        replace(src, dst)
+    monkeypatch.setattr(os, "replace", another_thread_saves_meanwhile)
+    app.save_settings(Settings(bitrate=12000))
+    assert load_settings(app.CONFIG).bitrate == 12000  # the last one replaced it, whole
+    assert '\n  "bitrate": 12000' in open(app.CONFIG).read()
+    assert os.listdir(tmp_path / "plus-one") == ["settings.json"]
+
+
 def test_forgetting_the_tablet_in_use_ends_its_session(tmp_path):
     import types
     from plusone import app, link

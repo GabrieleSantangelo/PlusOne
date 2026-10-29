@@ -25,7 +25,7 @@ def once(fn, *args):
     return run
 
 
-def write_private(path, data):
+def write_private(path, data, indent=None):
     """Writes data (JSON-able) to path as a whole, replacing it at once, for
     this user only (the directory too): signatures are handwriting."""
     directory = os.path.dirname(path)
@@ -35,7 +35,7 @@ def write_private(path, data):
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part", dir=directory)
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=indent)
         os.replace(tmp, path)
     except BaseException:
         try:

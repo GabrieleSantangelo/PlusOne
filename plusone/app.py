@@ -25,7 +25,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 from gi.repository import Adw, Gio, GLib, Gst  # noqa: E402
 
-from . import __version__, add_log_handler, i18n, log, once, wifi  # noqa: E402
+from . import __version__, add_log_handler, i18n, log, once, wifi, write_private  # noqa: E402
 from .engine import Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .signing import Signing  # noqa: E402
@@ -105,12 +105,8 @@ def load_settings(path=CONFIG):
 
 
 def save_settings(settings):
-    os.makedirs(os.path.dirname(CONFIG), mode=0o700, exist_ok=True)
     # Replaced whole: the Files extension may read it meanwhile. Only ours to read.
-    fd = os.open(CONFIG + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(asdict(settings), f, indent=2)
-    os.replace(CONFIG + ".part", CONFIG)
+    write_private(CONFIG, asdict(settings), indent=2)
 
 
 def launcher():
