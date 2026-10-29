@@ -1,7 +1,9 @@
 """plusone_link against plus-one-link and a test tablet (link/core's
 examples/tablet.rs), both real processes on loopback. Needs them built
 (tools/link-docker.sh build --release --workspace --examples --bins):
-PLUSONE_LINK_BIN=link/target/release; skipped without it."""
+PLUSONE_LINK_BIN=link/target/release; skipped without it. The last tests
+play plus-one-link's end of the socket themselves."""
+import array
 import json
 import os
 import socket
@@ -12,10 +14,10 @@ import time
 
 import pytest
 
+import plusone_link
 from plusone_link import CONTROL, REALTIME, Link, LinkError
 
 BIN = os.environ.get("PLUSONE_LINK_BIN")
-pytestmark = pytest.mark.skipif(not BIN, reason="PLUSONE_LINK_BIN: the link's binaries")
 
 
 def identity(directory):
@@ -34,6 +36,8 @@ def identity(directory):
 @pytest.fixture
 def world(tmp_path):
     """plus-one-link, a tablet paired with it, a Link: (link, tablet's address, tablet's id, the tablet's process)."""
+    if not BIN:
+        pytest.skip("PLUSONE_LINK_BIN: the link's binaries")
     pc = tmp_path / "pc"
     _pc_cert, _pc_key, pc_fp = identity(pc)
     tablet_cert, tablet_key, tablet_fp = identity(tmp_path / "tablet")
@@ -182,3 +186,57 @@ def test_a_stream_made_here_is_a_path(world):
     channel = link.open(tablet_id, "echo", "x", CONTROL)
     channel.send(b"by Bluetooth")
     assert channel.recv(timeout=5) == b"by Bluetooth"
+
+
+def open_fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+def with_fd(sock, message, fd):
+    sock.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+
+
+@pytest.fixture
+def daemon(monkeypatch):
+    """plus-one-link's end of the next connection made: what it answers is
+    sent on it before the request comes."""
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    monkeypatch.setattr(plusone_link, "_connect", lambda path: ours)
+    yield theirs
+    ours.close()
+    theirs.close()
+
+
+@pytest.mark.parametrize("reply", [b"{garbled", b"[1]", b'"ok"'])
+def test_a_reply_not_a_message_leaves_no_descriptor_open(daemon, reply):
+    r, w = os.pipe()
+    with_fd(daemon, reply, r)
+    link = Link("fake")
+    before = open_fds()
+    with pytest.raises(ValueError if reply == b"{garbled" else LinkError):
+        link.devices()
+    assert open_fds() == before
+    for fd in (r, w):
+        os.close(fd)
+
+
+@pytest.mark.parametrize("reply", [b"{garbled", b"[]", b'{"ok": false, "error": "no"}'])
+def test_events_refused_or_garbled_close_their_connection(daemon, reply):
+    daemon.send(reply)
+    with pytest.raises((ValueError, LinkError)):
+        plusone_link._Events("fake", {"op": "watch"}, lambda event, fd: None, "test-watch")
+    assert plusone_link._connect("fake").fileno() == -1
+
+
+def test_a_descriptor_with_the_answer_to_a_stream_is_closed(daemon):
+    r, w = os.pipe()
+    with_fd(daemon, json.dumps({"ok": True, "device": "tab"}).encode(), r)
+    link = Link("fake")
+    given, other = socket.socketpair()
+    before = open_fds()
+    assert link.stream("bt", given) == "tab"
+    assert open_fds() == before
+    for fd in (r, w):
+        os.close(fd)
+    given.close()
+    other.close()

@@ -56,13 +56,20 @@ def _connect(path):
 
 
 def _receive(sock):
-    """(message, descriptor or None); LinkError if plus-one-link went."""
+    """(message, descriptor or None); LinkError if plus-one-link went, or
+    said what is not a message (ValueError: not JSON)."""
     data, fds, _flags, _address = socket.recv_fds(sock, REQUEST, 1)
-    if not data:
+    try:
+        if not data:
+            raise LinkError("plus-one-link went away")
+        message = json.loads(data)
+        if not isinstance(message, dict):
+            raise LinkError(f"plus-one-link said {data[:80]!r}")
+    except BaseException:
         for fd in fds:
             os.close(fd)
-        raise LinkError("plus-one-link went away")
-    return json.loads(data), (fds[0] if fds else None)
+        raise
+    return message, (fds[0] if fds else None)
 
 
 class Channel:
@@ -107,14 +114,19 @@ class _Events:
 
     def __init__(self, path, request, on_event, name):
         self.sock = _connect(path)
-        self.sock.send(json.dumps(request).encode())
-        reply, _fd = _receive(self.sock)
-        if not reply.get("ok"):
+        try:
+            self.sock.send(json.dumps(request).encode())
+            reply, fd = _receive(self.sock)
+            if fd is not None:
+                os.close(fd)
+            if not reply.get("ok"):
+                raise LinkError(reply.get("error", "refused"))
+            self._on_event = on_event
+            self.thread = threading.Thread(target=self._run, name=name, daemon=True)
+            self.thread.start()
+        except BaseException:
             self.sock.close()
-            raise LinkError(reply.get("error", "refused"))
-        self._on_event = on_event
-        self.thread = threading.Thread(target=self._run, name=name, daemon=True)
-        self.thread.start()
+            raise
 
     def _run(self):
         while True:
@@ -144,17 +156,20 @@ class Link:
     def stream(self, kind, sock):
         """A path on a stream socket made here (a Bluetooth one BlueZ gave:
         kind "bt"); the device whose session goes on it."""
-        with self._lock:
-            self._sock.sendmsg([json.dumps({"op": "stream", "kind": kind}).encode()],
-                               [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [sock.fileno()]))])
-            reply, _fd = _receive(self._sock)
-        if not reply.get("ok"):
-            raise LinkError(reply.get("error", "refused"))
+        reply, fd = self._request({"op": "stream", "kind": kind}, given=sock.fileno())
+        if fd is not None:
+            os.close(fd)
         return reply["device"]
 
-    def _request(self, message):
+    def _request(self, message, given=None):
+        """plus-one-link's answer to message (with given, a descriptor of
+        ours, if any): (reply, descriptor or None); LinkError if it said no."""
+        data = json.dumps(message).encode()
         with self._lock:
-            self._sock.send(json.dumps(message).encode())
+            if given is None:
+                self._sock.send(data)
+            else:
+                self._sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [given]))])
             reply, fd = _receive(self._sock)
         if not reply.get("ok"):
             if fd is not None:
