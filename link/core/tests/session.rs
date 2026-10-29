@@ -395,6 +395,7 @@ fn a_session_through_a_relay() {
     std::thread::spawn(move || tablet_side.relay(relay, &pc_fingerprint, false, Duration::from_secs(2)).map(|_| ()));
     let session = pc.relay(relay, &tablet_fp, true, Duration::from_secs(2)).unwrap();
     assert_eq!(session.path().as_deref(), Some("relay"));
+    assert_eq!(session.transport(), Some("tcp"));
     let control = session.open("echo", "c", Class::Control).unwrap();
     let mut buf = vec![0u8; 1 << 17];
     control.send(b"through the relay").unwrap();
@@ -518,6 +519,7 @@ fn a_session_goes_on_over_another_path() {
     let session = pc.connect_stream(Box::new(a), "usb").unwrap();
     assert_eq!(accepting.join().unwrap().unwrap(), session.id);
     assert_eq!(session.path().as_deref(), Some("usb"));
+    assert_eq!(session.transport(), Some("stream"));
     let control = session.open("echo", "c", Class::Control).unwrap();
     let video = session.open("echo", "v", Class::Realtime).unwrap();
     let mut buf = vec![0u8; 4096];
@@ -527,10 +529,12 @@ fn a_session_goes_on_over_another_path() {
     // The cable pulled: the session waits; what is said meanwhile waits too.
     cable.shutdown(std::net::Shutdown::Both).unwrap();
     until("the path lost", || session.path().is_none());
+    assert_eq!(session.transport(), None);
     control.send(b"while away").unwrap();
     let again = pc.connect(address, Duration::from_secs(2)).unwrap();
     assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
     until("on the network", || session.path().as_deref() == Some("lan"));
+    assert_eq!(session.transport(), Some("tcp"));
     assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(10));
     assert_eq!(&buf[..10], b"while away");
     video.send(&[7u8; 1000]).unwrap();
@@ -726,6 +730,41 @@ fn a_tcp_session_moves_to_quic() {
     assert!(session.by_quic());
 }
 
+/// What each side's events said: (event, path, transport) as each came.
+fn told(node: &Node) -> mpsc::Receiver<(&'static str, Option<String>, Option<&'static str>)> {
+    let (tell, told) = mpsc::channel();
+    node.on_event(move |event| {
+        let said = match event {
+            Event::Up(session) => ("up", session.path(), session.transport()),
+            Event::Moved(session) => ("moved", session.path(), session.transport()),
+            Event::Detached(session) => ("detached", session.path(), session.transport()),
+            _ => return,
+        };
+        let _ = tell.send(said);
+    });
+    told
+}
+
+#[test]
+fn a_move_from_tcp_to_quic_is_told_on_both_sides() {
+    // The path's kind stays "lan": only its transport changes, and both
+    // sides hear it (the tablet's label over the desktop says it).
+    let (pc, tablet, address) = quic_pair();
+    let (pc_told, tablet_told) = (told(&pc), told(&tablet));
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let lan = Some("lan".to_owned());
+    for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
+        let next = || told.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("{side}: nothing told"));
+        assert_eq!(next(), ("up", lan.clone(), Some("tcp")), "{side}");
+        assert_eq!(next(), ("moved", lan.clone(), Some("quic")), "{side}");
+    }
+    assert!(session.by_quic());
+    assert_eq!(session.transport(), Some("quic"));
+    // Nothing more: no detach on the way, nor a second move.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(pc_told.try_recv().is_err() && tablet_told.try_recv().is_err());
+}
+
 #[test]
 fn a_session_by_quic_alone() {
     let (pc, tablet, _address) = pair();
@@ -738,6 +777,7 @@ fn a_session_by_quic_alone() {
     let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
     let session = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
     assert!(session.by_quic());
+    assert_eq!(session.transport(), Some("quic"));
     let control = session.open("echo", "c", Class::Control).unwrap();
     let mut buf = vec![0u8; 1 << 10];
     control.send(b"hello").unwrap();

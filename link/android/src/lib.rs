@@ -9,7 +9,8 @@
 //!   descriptor in the answer's "fd", the caller's to own), serve, unserve,
 //!   devices, close;
 //! - nativeNext(handle, ms): the next event (a channel the PC opened, with
-//!   its "fd"; a PC up or gone), or null;
+//!   its "fd"; a PC up, moved, gone: "path" and "transport" with up and
+//!   moved), or null;
 //! - nativeStop(handle).
 
 use jni::objects::{GlobalRef, JByteArray, JObject, JObjectArray, JString, JValue};
@@ -208,7 +209,7 @@ impl Signer for Keystore {
 
 fn session_json(session: &plusone_link::Session) -> Value {
     json!({"id": session.peer, "name": session.name, "features": session.features(), "path": session.path(),
-           "channels": session.channels(),
+           "transport": session.transport(), "channels": session.channels(),
            "rtt_ms": session.rtt().map(|r| r.as_secs_f64() * 1000.0), "dropped": session.dropped()})
 }
 
@@ -330,7 +331,10 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
                 message["device"] = json!(session.peer);
                 message
             }
-            Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path()}),
+            // transport: "quic", "tcp", "stream" (Session::transport); a TCP
+            // path moved to QUIC is a "moved" at the same path.
+            Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path(),
+                                            "transport": session.transport()}),
             Event::Budget(session, rate) => json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}),
             Event::Detached(session) => json!({"event": "detached", "device": session.peer}),
             Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),

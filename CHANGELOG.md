@@ -2,6 +2,15 @@
 
 ## Unreleased (1.0)
 
+- **What carries the desktop**: the pill bottom left on the tablet says
+  it too ("PC screen · QUIC · Wi-Fi", "PC screen · TCP · Wi-Fi Direct";
+  a cable or Bluetooth has no transport to say), bright for 4 s when the
+  desktop comes up and whenever the link moves (to another path, or from
+  TCP to QUIC on the same one), then faint as before. A move to a better
+  path no longer shows "Reconnecting…" for a moment: the path left is
+  closed a second after, so the other side takes the new one first. On
+  the tablet the Bluetooth path was named and drawn as Wi-Fi.
+
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

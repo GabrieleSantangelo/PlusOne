@@ -46,6 +46,8 @@ pub const RESUME_WAIT: Duration = Duration::from_secs(15);
 /// The same with a channel open (the desktop, the speakers...): time for
 /// both devices to be moved to another network by hand.
 pub const RESUME_WAIT_IN_USE: Duration = Duration::from_secs(60);
+/// A path a better one took over from: its end this long after (run_path).
+const HANDOVER_LINGER: Duration = Duration::from_secs(1);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
@@ -354,6 +356,8 @@ struct Path {
     udp_peer: Mutex<Option<SocketAddr>>,
     /// A QUIC path's connection: its datagrams instead of UDP's.
     quic: Option<crate::quic::Quic>,
+    /// What carries it (Session::transport): "quic", "tcp", "stream".
+    transport: &'static str,
     started: Instant,
     heard_us: AtomicU64,   // since started: the stream's last frame, or an authenticated datagram
     proven_us: AtomicU64,  // a pong's (0: none yet)
@@ -567,8 +571,15 @@ fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
     if let Some(udp) = &udp {
         udp.set_read_timeout(Some(Duration::from_millis(500)))?;
     }
+    let quic = established.quic.take();
+    // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
+    let transport = match (&quic, established.stream.addresses()) {
+        (Some(_), _) => "quic",
+        (None, Some(_)) => "tcp",
+        (None, None) => "stream",
+    };
     Ok(Arc::new(Path { kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
-                       udp_peer: Mutex::new(established.udp_peer), quic: established.quic.take(),
+                       udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
                        gone: AtomicBool::new(false) }))
@@ -681,6 +692,14 @@ impl Session {
     /// The path is a QUIC connection (quic.rs), not a TCP one or a stream.
     pub fn by_quic(&self) -> bool {
         self.current().is_some_and(|path| path.quic.is_some())
+    }
+
+    /// What carries the path now: "quic", "tcp" (the LAN's, a Wi-Fi Direct
+    /// group's, the relay's), "stream" (a cable's or Bluetooth's: no IP);
+    /// None while it waits for one. A TCP path moved to QUIC at the same
+    /// kind is a path taken like any other: Event::Moved says it.
+    pub fn transport(&self) -> Option<&'static str> {
+        self.current().map(|path| path.transport)
     }
 
     /// What a QUIC path's congestion controller allows now (bytes a second).
@@ -1120,17 +1139,21 @@ impl Session {
             let _ = std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(path));
         }
         if let Some(quic) = &path.quic {
-            let (me, path) = (self.clone(), path.clone());
+            let (me, here) = (self.clone(), path.clone());
             quic.read_datagrams(move |datagram| {
                 let mut buf = datagram.to_vec();
-                me.datagram_in(&path, &mut buf, None, &mut Vec::new());
+                me.datagram_in(&here, &mut buf, None, &mut Vec::new());
             });
-            // Its budget told as it moves, until the path goes (quic.close()).
-            let (me, budget) = (Arc::downgrade(self), quic.budget());
+            // Its budget told as it moves, until the path goes (quic.close();
+            // not after a better one took over: HANDOVER_LINGER).
+            let (me, budget, here) = (Arc::downgrade(self), quic.budget(), path.clone());
             let _ = std::thread::Builder::new().name("link-budget".into()).spawn(move || {
                 let mut told = 0;
                 while let Some((count, rate)) = budget.wait(told) {
                     told = count;
+                    if here.gone.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     let Some(me) = me.upgrade() else { return };
                     if let Some(node) = me.node.upgrade() {
                         node.budget(&me, rate);
@@ -1139,13 +1162,34 @@ impl Session {
             });
         }
         conn.set_buffer_limit(None);
-        let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err().unwrap_or_else(|| "a better path".into());
+        let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err();
         path.gone.store(true, Ordering::SeqCst);
-        path.stream.shutdown();
-        if let Some(quic) = &path.quic {
-            quic.close();
+        // A better path took over: the other side takes it a moment after us
+        // (its hellos' end is behind ours), and until then would take this
+        // one's end for a path lost: detached, then moved (the tablet's
+        // "Reconnecting…" over the desktop at each move to QUIC, the PC
+        // dialing again). Its end HANDOVER_LINGER later, then: nobody reads
+        // it meanwhile, what the other side still sends on it comes again
+        // on the new one (not acknowledged), and its stream is a clone of
+        // ours (dropped now: no FIN while that one is open).
+        let end = |path: &Path| {
+            path.stream.shutdown();
+            if let Some(quic) = &path.quic {
+                quic.close();
+            }
+        };
+        let handed_over = reason.is_none() && !self.is_closed() && self.arriving.lock().unwrap().is_some();
+        let lingering = handed_over && {
+            let old = path.clone();
+            std::thread::Builder::new().name("link-handover".into()).spawn(move || {
+                std::thread::sleep(HANDOVER_LINGER);
+                end(&old);
+            }).is_ok()
+        };
+        if !lingering {
+            end(&path);
         }
-        reason
+        reason.unwrap_or_else(|| "a better path".into())
     }
 
     fn drive(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,

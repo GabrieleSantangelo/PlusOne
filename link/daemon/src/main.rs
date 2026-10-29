@@ -11,8 +11,10 @@
 //! Requests, each answered {"ok": true, ...} or {"ok": false, "error"}:
 //!   {"op": "devices"}            the paired tablets: id, name, connected,
 //!                                features, rtt_ms, path, quic (its path a
-//!                                QUIC one), rate_kbps (its controller's),
-//!                                dropped
+//!                                QUIC one), transport ("quic", "tcp",
+//!                                "stream": a cable's, Bluetooth's; null
+//!                                with no path), rate_kbps (its
+//!                                controller's), dropped
 //!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]
 //!    [, "kind": "p2p"|"ap"]}     a session with the tablet there (or with
 //!                                that one, wherever it is): its id; "p2p",
@@ -39,7 +41,9 @@
 //!                                each one's descriptor; until this
 //!                                connection closes
 //!   {"op": "watch"}              {"event": "up"|"moved"|"detached"|"gone",
-//!                                "device", ...} from then on; and
+//!                                "device", ...} from then on (up and moved
+//!                                with "path" and "transport", as devices';
+//!                                a TCP path moved to QUIC: "moved"); and
 //!                                {"event": "budget", "device", "kbps"}: what
 //!                                its path's congestion controller allows,
 //!                                as it moves (past 10 %, a cut at once:
@@ -110,6 +114,7 @@ impl Daemon {
                 "rtt_ms": session.and_then(|s| s.rtt()).map(|r| r.as_secs_f64() * 1000.0),
                 "path": session.and_then(|s| s.path()),
                 "quic": session.is_some_and(|s| s.by_quic()),
+                "transport": session.and_then(|s| s.transport()),
                 "rate_kbps": session.and_then(|s| s.rate()).map(|r| r * 8 / 1000),
                 "dropped": session.map(|s| s.dropped()).unwrap_or(0),
             }));
@@ -352,9 +357,11 @@ impl Daemon {
         };
         let (message, also) = match event {
             Event::Up(session) => (json!({"event": "up", "device": session.peer, "name": session.name,
-                                          "features": session.features(), "path": session.path()}),
+                                          "features": session.features(), "path": session.path(),
+                                          "transport": session.transport()}),
                                    no_budget(&session)),
-            Event::Moved(session) => (json!({"event": "moved", "device": session.peer, "path": session.path()}),
+            Event::Moved(session) => (json!({"event": "moved", "device": session.peer, "path": session.path(),
+                                             "transport": session.transport()}),
                                       no_budget(&session)),
             Event::Budget(session, rate) => {
                 (json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}), None)

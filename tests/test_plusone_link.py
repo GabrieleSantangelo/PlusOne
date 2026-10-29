@@ -144,6 +144,8 @@ def test_watch_sees_the_tablet_come_and_go(world):
     assert gone.wait(25), events
     kinds = [e["event"] for e in events]
     assert kinds[0] == "up" and kinds[-1] == "gone" and "detached" in kinds and events[0]["device"] == tablet_id
+    # What it is on, and what carries it (TCP: plus-one-link moves to QUIC only with PLUSONE_LINK_QUIC=1).
+    assert (events[0]["path"], events[0]["transport"]) == ("lan", "tcp")
     watcher.close()
 
 
@@ -175,7 +177,8 @@ def test_a_stream_made_here_is_a_path(world):
     sock = socket.create_connection((host, int(port)), timeout=5)
     assert link.stream("bt", sock) == tablet_id
     sock.close()  # the daemon has its own
-    assert next(d for d in link.devices() if d["id"] == tablet_id)["path"] == "bt"
+    device = next(d for d in link.devices() if d["id"] == tablet_id)
+    assert (device["path"], device["transport"]) == ("bt", "stream")
     channel = link.open(tablet_id, "echo", "x", CONTROL)
     channel.send(b"by Bluetooth")
     assert channel.recv(timeout=5) == b"by Bluetooth"

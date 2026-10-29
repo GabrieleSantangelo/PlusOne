@@ -26,12 +26,12 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     // newer session's, which a closing activity must leave alone.
     private var mine: DisplaySession? = null
     private lateinit var pathOverlay: PathOverlay
-    /** The path of the desktop's PC changed: shown over it. */
+    /** The path or transport of the desktop's PC changed: shown over it. */
     private val pathChanged: (io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?,
                               io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?) -> Unit = { before, now ->
         val device = mine?.device
         val pc = now ?: before
-        if (device != null && pc?.id == device) pathOverlay.changed(before?.path, now?.path, gone = now == null)
+        if (device != null && pc?.id == device) pathOverlay.changed(before, now, gone = now == null)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,6 +67,7 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         bind()
+        showPath()  // another desktop: what it comes by
     }
 
     override fun onStart() {
@@ -74,10 +75,22 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
         Front.started()  // the app is in front: the PC's camera or a new desktop may come up
         mine = DisplaySession.current
         mine?.show(true)
-        // What it comes by: the link's core says (its sessions' paths); the link of before is the network's.
-        val device = mine?.device
-        pathOverlay.show(if (device != null) io.github.gabrielesantangelo.plusone.link.LinkStatus.current(device)?.path else "lan")
+        showPath()
         io.github.gabrielesantangelo.plusone.link.LinkStatus.listen(pathChanged)
+    }
+
+    /** What the desktop comes by, for a few seconds (PathOverlay): the link's
+     * core says (its sessions' paths and transports). The link of before
+     * sends it as plain UDP over the network: "UDP · Wi-Fi", which tells it
+     * from the link's (an older Plus One on the PC, say). */
+    private fun showPath() {
+        val device = mine?.device
+        if (device != null) {
+            val pc = io.github.gabrielesantangelo.plusone.link.LinkStatus.current(device)
+            pathOverlay.show(pc?.path, pc?.transport)
+        } else {
+            pathOverlay.show("lan", "udp")
+        }
     }
 
     override fun onStop() {

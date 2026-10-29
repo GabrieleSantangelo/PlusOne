@@ -9,7 +9,10 @@ import android.graphics.drawable.GradientDrawable
 import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.RoundedCorner
 import android.view.View
+import android.view.WindowInsets
+import android.view.animation.AccelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
@@ -17,14 +20,22 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import io.github.gabrielesantangelo.plusone.link.LinkStatus
+import io.github.gabrielesantangelo.plusone.link.PathLabel
+import kotlin.math.ceil
+import kotlin.math.sqrt
 
 /**
- * Over the desktop (DisplayActivity), what it comes by: a small pill in a
- * corner, always there (faint after a moment, bright again at a change);
- * and while the link moves from one path to another, a screen that says
- * so, the old path's icon giving way to the arrows going round, then the
- * new one's coming in, until the desktop's frames come again on it. It
- * never takes a touch: the desktop under it gets them all.
+ * Over the desktop (DisplayActivity), whose screen it is and what it comes
+ * by: a small pill in the bottom left corner ("PC screen · QUIC · Wi-Fi",
+ * "PC screen · Cable"), bright for SHOWN_MS when the desktop comes up and
+ * at each change of its path or transport, then faint, always there
+ * (SEC-30); and while the link moves from one
+ * path to another, a screen that says so, the old path's icon giving way
+ * to the arrows going round, then the new one's coming in, until the
+ * desktop's frames come again on it. A TCP path moved to QUIC is the same
+ * path: the label alone says it. The label changes at the link's events
+ * only (LinkStatus), its one timer its own fade. It never takes a touch:
+ * the desktop under it gets them all.
  */
 class PathOverlay(context: Context, private val session: () -> DisplaySession?) : FrameLayout(context) {
     private val pillIcon = ImageView(context)
@@ -38,10 +49,15 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     private val detail = TextView(context)
     private var spin: ValueAnimator? = null
     private var shown: String? = null  // the path the pill says
+    private var shownTransport: String? = null  // and its transport
+    private val margin = context.dp(16)
+    private val fade = Runnable {
+        pill.animate().alpha(FAINT).setInterpolator(AccelerateInterpolator()).setStartDelay(0).setDuration(FADE_MS)
+    }
     private var movedAt = 0L           // uptime ms of the last move, waiting for a frame after it
 
     init {
-        // The pill: bottom left, clear of GNOME's bar and of most windows' buttons.
+        // The label, a pill: bottom left, clear of GNOME's bar and of most windows' buttons.
         pill.apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -54,8 +70,19 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
         pillText.setTextColor(Color.WHITE)
         pillText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
         addView(pill, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply {
-            setMargins(context.dp(16), 0, 0, context.dp(16))
+            setMargins(margin, 0, 0, margin)
         })
+        // Clear of a cutout on that side and of the screen's rounded corner
+        // (as far into it as its arc reaches: r (1 - 1/√2)). The system bars
+        // are hidden: a swipe shows them over everything for a moment.
+        setOnApplyWindowInsetsListener { _, insets ->
+            val cutout = insets.getInsets(WindowInsets.Type.displayCutout())
+            val radius = insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius ?: 0
+            val clear = maxOf(margin, ceil(radius * (1 - 1 / sqrt(2.0))).toInt())
+            (pill.layoutParams as LayoutParams).setMargins(cutout.left + clear, 0, 0, cutout.bottom + clear)
+            pill.requestLayout()
+            insets
+        }
 
         // The screen of a change.
         scrim.setBackgroundColor(0xC0000000.toInt())
@@ -90,32 +117,47 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
         isFocusable = false
     }
 
-    /** The path now, without a change's screen (the desktop just opened). */
-    fun show(path: String?) {
-        setPill(path, bright = true)
+    /** The path now and its transport, without a change's screen (the
+     * desktop just opened, or is in front again). */
+    fun show(path: String?, transport: String?) {
+        setPill(path, transport)
     }
 
-    /** A change of the path (LinkStatus): before's and now's. */
-    fun changed(before: String?, now: String?, gone: Boolean) {
+    /** A change of the PC's path or transport (LinkStatus): before and now. */
+    fun changed(before: LinkStatus.Pc?, now: LinkStatus.Pc?, gone: Boolean) {
         if (gone) return  // the session over: the activity goes
-        if (now == null) waiting(before ?: shown) else if (now != shown) moved(shown, now)
+        val path = now?.path
+        val transport = now?.transport
+        when {
+            path == null -> waiting(before?.path ?: shown)
+            path != shown -> moved(shown, path, transport)
+            transport != shownTransport -> setPill(path, transport)  // TCP to QUIC: the same path
+        }
     }
 
-    private fun setPill(path: String?, bright: Boolean) {
+    /** The pill, bright from now for SHOWN_MS, then faint (the system's
+     * animator duration scale makes the fade shorter or none; the time it
+     * stays bright is the user's to read, not an animation). */
+    private fun setPill(path: String?, transport: String?) {
         shown = path
+        shownTransport = transport
         pillIcon.setImageResource(LinkStatus.icon(path))
         // Whose screen this is, always (SEC-30): a picture from the PC could
         // look like Android's own, its lock screen say; this pill is the
         // app's, above it, and the stream cannot cover it.
-        pillText.text = context.getString(R.string.display_marker, LinkStatus.name(context, path))
+        pillText.text = PathLabel.marker(path, transport, context::getString)
+        removeCallbacks(fade)
         pill.animate().cancel()
-        if (bright) {
-            pill.alpha = 1f
+        pill.alpha = 1f
+        if (ValueAnimator.areAnimatorsEnabled()) {
             pill.scaleX = 0.8f
             pill.scaleY = 0.8f
-            pill.animate().scaleX(1f).scaleY(1f).setInterpolator(OvershootInterpolator(3f)).setDuration(350)
-                .withEndAction { pill.animate().alpha(FAINT).setStartDelay(BRIGHT_MS).setDuration(800) }
+            pill.animate().scaleX(1f).scaleY(1f).setInterpolator(OvershootInterpolator(3f)).setStartDelay(0).setDuration(350)
+        } else {
+            pill.scaleX = 1f
+            pill.scaleY = 1f
         }
+        postDelayed(fade, SHOWN_MS)
     }
 
     private fun showScrim() {
@@ -154,12 +196,12 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
             addUpdateListener { toIcon.rotation = it.animatedValue as Float }
             start()
         }
-        setPill(null, bright = true)
+        setPill(null, null)
     }
 
     /** On a path again (another, or a better one): the new icon comes in;
      * the screen goes once a frame came on it. */
-    private fun moved(from: String?, to: String) {
+    private fun moved(from: String?, to: String, transport: String?) {
         val wasWaiting = spin != null
         showScrim()
         spin?.cancel()
@@ -186,7 +228,7 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
             alpha = 0f
         }
         coming.animate().translationX(0f).alpha(1f).setInterpolator(OvershootInterpolator(2f)).setDuration(500).setStartDelay(150)
-        setPill(to, bright = true)
+        setPill(to, transport)
         movedAt = SystemClock.uptimeMillis()
         val since = movedAt
         // Steady: a frame decoded after the move (or, at worst, STEADY_MS).
@@ -232,8 +274,9 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     }
 
     companion object {
-        const val FAINT = 0.4f
-        const val BRIGHT_MS = 4000L  // the pill bright this long after a change
+        const val FAINT = 0.4f       // the pill's alpha once SHOWN_MS is over
+        const val SHOWN_MS = 4000L   // the pill bright this long after the desktop came up or a change
+        const val FADE_MS = 800L     // then it fades to FAINT this long
         const val STEADY_MS = 4000L  // the change's screen at most this long after the move
         const val SETTLE_MS = 500L   // and this long after the first frame on the new path
     }

@@ -14,16 +14,19 @@ import java.util.concurrent.CopyOnWriteArrayList
  * (PathOverlay).
  */
 object LinkStatus {
-    /** A PC with a session: its id (fingerprint), name, and path ("usb",
-     * "lan"...; null while the session waits for one). */
-    data class Pc(val id: String, val name: String, val path: String?)
+    /** A PC with a session: its id (fingerprint), name, path ("usb",
+     * "lan"...; null while the session waits for one) and what carries it
+     * ("quic", "tcp", "stream": a cable's or Bluetooth's; null with no path,
+     * or from a core that does not say). */
+    data class Pc(val id: String, val name: String, val path: String?, val transport: String? = null)
 
     @Volatile var pcs: Map<String, Pc> = emptyMap()
         private set
     private val listeners = CopyOnWriteArrayList<(Pc?, Pc?) -> Unit>()
     private val main = Handler(Looper.getMainLooper())
 
-    /** listener(before, now) on the main thread, for each change of a PC's path. */
+    /** listener(before, now) on the main thread, for each change of a PC's
+     * path or transport (a TCP path moved to QUIC: the same path). */
     fun listen(listener: (Pc?, Pc?) -> Unit) = listeners.add(listener)
     fun unlisten(listener: (Pc?, Pc?) -> Unit) = listeners.remove(listener)
 
@@ -34,10 +37,12 @@ object LinkStatus {
     fun event(event: JSONObject) {
         val id = event.optString("device").ifEmpty { return }
         val before = pcs[id]
+        // JSON's null comes as "null" from optString: neither is a path or a transport.
+        fun text(key: String) = if (event.isNull(key)) null else event.optString(key).ifEmpty { null }
         val now = when (event.optString("event")) {
-            "up" -> Pc(id, event.optString("name").ifEmpty { before?.name.orEmpty() }, event.optString("path").ifEmpty { null })
-            "moved" -> (before ?: Pc(id, "", null)).copy(path = event.optString("path").ifEmpty { null })
-            "detached" -> before?.copy(path = null) ?: return
+            "up" -> Pc(id, event.optString("name").ifEmpty { before?.name.orEmpty() }, text("path"), text("transport"))
+            "moved" -> (before ?: Pc(id, "", null)).copy(path = text("path"), transport = text("transport"))
+            "detached" -> before?.copy(path = null, transport = null) ?: return
             "gone" -> null
             else -> return
         }
@@ -47,18 +52,15 @@ object LinkStatus {
 
     fun icon(path: String?): Int = when (path) {
         "usb" -> R.drawable.ic_cable
+        "bt", "bluetooth" -> R.drawable.ic_bluetooth
         null -> R.drawable.ic_sync
         else -> R.drawable.ic_wifi
     }
 
     /** Its name, as a label ("Cable") or in a sentence ("via cable"). */
-    fun name(context: Context, path: String?, inSentence: Boolean = false): String = context.getString(when (path) {
-        "usb" -> if (inSentence) R.string.path_cable_lc else R.string.path_cable
-        "lan" -> R.string.path_wifi
-        "p2p", "wifi-direct", "ap" -> R.string.path_wifi_direct
-        "bluetooth" -> R.string.path_bluetooth
-        "relay" -> if (inSentence) R.string.path_internet_lc else R.string.path_internet
-        null -> R.string.path_reconnecting
-        else -> R.string.path_wifi
+    fun name(context: Context, path: String?, inSentence: Boolean = false): String = context.getString(when {
+        inSentence && path == "usb" -> R.string.path_cable_lc
+        inSentence && path == "relay" -> R.string.path_internet_lc
+        else -> PathLabel.place(path)
     })
 }
