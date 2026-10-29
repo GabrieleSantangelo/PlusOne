@@ -119,7 +119,7 @@ def _session(app_id):
     try:
         with plusone_link.Link() as connection:
             return next((d for d in connection.devices() if d["id"].startswith(app_id) and d.get("connected")), None)
-    except plusone_link.LinkError:
+    except (OSError, ValueError, plusone_link.LinkError):
         return None
 
 
@@ -132,8 +132,8 @@ def connected(app_id):
 def app_version(app_id):
     """The versionCode that tablet's app serves "update" at over the link
     (its own), while there is a session with it; else None."""
-    session = _session(app_id)
-    version = (session or {}).get("features", {}).get("update")
+    features = (_session(app_id) or {}).get("features")
+    version = features.get("update") if isinstance(features, dict) else None  # else: not known
     return version if type(version) is int and version > 1 else None
 
 

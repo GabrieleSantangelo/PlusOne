@@ -124,3 +124,41 @@ def test_a_payload_the_app_does_not_read_fails_in_time(ends):
     sending.start()
     sending.join(5)
     assert not sending.is_alive() and isinstance(outcome[0], TimeoutError)
+
+
+
+APP = "abcd" * 4
+
+
+def link_answering(monkeypatch, devices):
+    """plus-one-link as channels asks it: its devices() answer, or what it raises."""
+    class FakeLink:
+        def devices(self):
+            if isinstance(devices, BaseException):
+                raise devices
+            return devices
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+    monkeypatch.setattr(plusone_link, "Link", FakeLink)
+
+
+@pytest.mark.parametrize("features", [None, ["update"], "update", 7])
+def test_features_not_an_object_are_not_known(monkeypatch, features):
+    link_answering(monkeypatch, [{"id": APP + "0" * 48, "connected": True, "features": features}])
+    assert channels.app_version(APP) is None
+    assert channels.connected(APP)
+
+
+def test_the_app_s_version_from_its_features(monkeypatch):
+    link_answering(monkeypatch, [{"id": APP + "0" * 48, "connected": True, "features": {"update": 1000}}])
+    assert channels.app_version(APP) == 1000
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError(), ValueError("garbled"), plusone_link.LinkError("gone")])
+def test_plus_one_link_failing_is_no_session(monkeypatch, error):
+    link_answering(monkeypatch, error)
+    assert channels.app_version(APP) is None and not channels.connected(APP)
