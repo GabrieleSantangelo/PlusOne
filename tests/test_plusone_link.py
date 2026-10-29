@@ -240,3 +240,39 @@ def test_a_descriptor_with_the_answer_to_a_stream_is_closed(daemon):
         os.close(fd)
     given.close()
     other.close()
+
+
+def in_time(call, seconds):
+    """What call raised (None: nothing), on a thread of its own: it must end within seconds."""
+    outcome = []
+
+    def run():
+        try:
+            call()
+        except Exception as e:  # noqa: BLE001
+            outcome.append(e)
+        else:
+            outcome.append(None)
+    threading.Thread(target=run, daemon=True).start()
+    deadline = time.monotonic() + seconds
+    while not outcome and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert outcome, f"still waiting after {seconds} s"
+    return outcome[0]
+
+
+def test_a_request_plus_one_link_does_not_answer_fails_in_time(daemon, monkeypatch):
+    monkeypatch.setattr(plusone_link, "ANSWER_WAIT", 0.2)
+    link = Link("fake")
+    error = in_time(link.devices, 3)
+    assert isinstance(error, LinkError) and "in time" in str(error)
+    # Its answer, coming late, is not taken for the next request's: that connection is over.
+    assert plusone_link._connect("fake").fileno() == -1
+    with pytest.raises(LinkError):
+        link.devices()
+
+
+def test_events_plus_one_link_does_not_answer_fail_in_time(daemon, monkeypatch):
+    monkeypatch.setattr(plusone_link, "ANSWER_WAIT", 0.2)
+    error = in_time(lambda: plusone_link._Events("fake", {"op": "watch"}, lambda event, fd: None, "test-watch"), 3)
+    assert isinstance(error, OSError) and plusone_link._connect("fake").fileno() == -1

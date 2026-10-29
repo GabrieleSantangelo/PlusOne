@@ -28,6 +28,12 @@
   switch to another user's session that program could still click in
   theirs. The pen helper now takes it away as soon as its session is no
   longer the one in front, and gives none to a session that is not.
+- **No more waiting for ever on a tablet that stopped reading**: a PDF to
+  sign or the app's update, sent over the link to an app that no longer
+  took anything, waited as long as the session lasted; it fails after two
+  minutes now, as over the link of before. And a plus-one-link that stops
+  answering no longer freezes Plus One: a request to it gives up after a
+  few seconds.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

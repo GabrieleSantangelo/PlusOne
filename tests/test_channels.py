@@ -108,3 +108,19 @@ def test_what_the_channels_send_a_tablet_is_measured(monkeypatch):
     assert channels.sending_kbps("another") == 0
     now[0] += 2  # silence: nothing sent
     assert channels.sending_kbps("tab-measured") == 0
+
+
+def test_a_payload_the_app_does_not_read_fails_in_time(ends):
+    link, _theirs = ends  # the app reads nothing more
+    link.settimeout(0.3)
+    outcome = []
+
+    def send():
+        try:
+            link.send({"type": "sign", "job": "j"}, bytes(16 << 20))
+        except OSError as e:
+            outcome.append(e)
+    sending = threading.Thread(target=send, daemon=True)
+    sending.start()
+    sending.join(5)
+    assert not sending.is_alive() and isinstance(outcome[0], TimeoutError)

@@ -26,6 +26,12 @@ import threading
 
 CONTROL, INPUT, REALTIME = "control", "input", "realtime"
 REQUEST = 64 << 10
+# Seconds plus-one-link has to answer a request, besides what the request
+# waits for itself (a connect's timeout, a browse's wait); and what open()
+# and stream() may wait for: a session made (the tablet reached anew where
+# it was and wherever mDNS finds it, one at a time) and the tablet's answer.
+ANSWER_WAIT = 5.0
+SESSION_WAIT = 15.0
 # A channel's largest message: control's (the system caps a message
 # socket's), and input's or realtime's (a datagram on any network, QUIC's
 # too: plus-one-link's session.rs MAX_DATAGRAM).
@@ -115,12 +121,14 @@ class _Events:
     def __init__(self, path, request, on_event, name):
         self.sock = _connect(path)
         try:
+            self.sock.settimeout(ANSWER_WAIT)
             self.sock.send(json.dumps(request).encode())
             reply, fd = _receive(self.sock)
             if fd is not None:
                 os.close(fd)
             if not reply.get("ok"):
                 raise LinkError(reply.get("error", "refused"))
+            self.sock.settimeout(None)  # the events: whenever they come
             self._on_event = on_event
             self.thread = threading.Thread(target=self._run, name=name, daemon=True)
             self.thread.start()
@@ -156,21 +164,30 @@ class Link:
     def stream(self, kind, sock):
         """A path on a stream socket made here (a Bluetooth one BlueZ gave:
         kind "bt"); the device whose session goes on it."""
-        reply, fd = self._request({"op": "stream", "kind": kind}, given=sock.fileno())
+        reply, fd = self._request({"op": "stream", "kind": kind}, given=sock.fileno(), wait=SESSION_WAIT)
         if fd is not None:
             os.close(fd)
         return reply["device"]
 
-    def _request(self, message, given=None):
+    def _request(self, message, given=None, wait=0.0):
         """plus-one-link's answer to message (with given, a descriptor of
-        ours, if any): (reply, descriptor or None); LinkError if it said no."""
+        ours, if any) within ANSWER_WAIT and wait: (reply, descriptor or
+        None); LinkError if it said no, or did not answer in time."""
         data = json.dumps(message).encode()
         with self._lock:
-            if given is None:
-                self._sock.send(data)
-            else:
-                self._sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [given]))])
-            reply, fd = _receive(self._sock)
+            if self._sock.fileno() < 0:
+                raise LinkError("no longer connected to plus-one-link")
+            self._sock.settimeout(ANSWER_WAIT + wait)
+            try:
+                if given is None:
+                    self._sock.send(data)
+                else:
+                    self._sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [given]))])
+                reply, fd = _receive(self._sock)
+            except TimeoutError:
+                # Its answer may come yet, and be taken for the next one's.
+                self._sock.close()
+                raise LinkError(f"plus-one-link did not answer in time ({message['op']})") from None
         if not reply.get("ok"):
             if fd is not None:
                 os.close(fd)
@@ -187,7 +204,7 @@ class Link:
         (its id) wherever it is: its id. open() makes one when needed."""
         request = {"op": "connect", "timeout": timeout}
         request.update({"address": address} if address else {"device": device})
-        return self._request(request)[0]["device"]
+        return self._request(request, wait=timeout)[0]["device"]
 
     def disconnect(self, device):
         """The session with the tablet over (its channels with it)."""
@@ -196,7 +213,7 @@ class Link:
     def browse(self, wait=1.5):
         """The tablets announcing the link nearby (mDNS): [{"id" (its start),
         "name", "version", "address"}]."""
-        return self._request({"op": "browse", "wait": wait})[0]["tablets"]
+        return self._request({"op": "browse", "wait": wait}, wait=wait)[0]["tablets"]
 
     def use_usb(self, on=True):
         """Whether an Android tablet plugged in is asked to be Plus One's
@@ -214,7 +231,7 @@ class Link:
         session made first if there is none."""
         device = device["id"] if isinstance(device, dict) else device
         reply, fd = self._request({"op": "open", "device": device, "feature": feature, "channel": name,
-                                   "class": kind})
+                                   "class": kind}, wait=SESSION_WAIT)
         if fd is None:
             raise LinkError("no channel came with the answer")
         return Channel(fd, device, feature, name, kind, reply.get("id"))

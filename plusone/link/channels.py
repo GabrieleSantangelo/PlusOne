@@ -17,7 +17,7 @@ import threading
 import time
 
 from .. import log
-from .link import Refused
+from .link import IO_TIMEOUT, Refused
 from .wire import MAX_HEADER
 
 try:
@@ -147,25 +147,42 @@ class ChannelLink:
         self.name = name
         self._channels = []
         self._sending = threading.Lock()  # a payload's pieces together, whatever else is sent meanwhile
+        self._timeout = IO_TIMEOUT
 
     def send(self, header, payload=None):
-        """header, then payload's bytes if any (its "size" says how many)."""
+        """header, then payload's bytes if any (its "size" says how many),
+        within settimeout()'s seconds all told."""
         if payload is not None:
             header = dict(header, size=len(payload))
         data = json.dumps(header).encode()
         with self._sending:
+            deadline = None if self._timeout is None else time.monotonic() + self._timeout
             if len(data) > CHUNK:
-                self.control.send(json.dumps({"type": "long", "size": len(data)}).encode())
-                self._pieces(data)
+                self._put(json.dumps({"type": "long", "size": len(data)}).encode(), deadline)
+                self._pieces(data, deadline)
             else:
-                self.control.send(data)
+                self._put(data, deadline)
             if payload:
-                self._pieces(payload)
+                self._pieces(payload, deadline)
 
-    def _pieces(self, data):
+    def _pieces(self, data, deadline):
         view = memoryview(data)
         for start in range(0, len(view), CHUNK):
-            self.control.send(view[start:start + CHUNK])
+            self._put(view[start:start + CHUNK], deadline)
+
+    def _put(self, data, deadline):
+        """One message, once the link has room for it, before deadline."""
+        if deadline is None:
+            self.control.send(data)
+            return
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"{self.feature}: the app took nothing more in time")
+        self.control.sock.settimeout(left)
+        try:
+            self.control.send(data)
+        finally:
+            self.control.sock.settimeout(None)
 
     def _next(self, timeout):
         data = self.control.recv(timeout=timeout)
@@ -194,9 +211,12 @@ class ChannelLink:
         """Whether a message came within timeout (seconds)."""
         return bool(select.select([self.control.sock], [], [], timeout)[0])
 
-    def settimeout(self, _timeout):
-        """As the link of before's: here sending waits for the link (its
-        backlog), and the link's own liveness says when the tablet is gone."""
+    def settimeout(self, timeout):
+        """As the link of before's: how long a send() may take, all told
+        (seconds; None: as long as the link's backlog lasts). A tablet that
+        stops reading fails it then (TimeoutError); one that is gone, the
+        link's own liveness ends sooner."""
+        self._timeout = timeout
 
     def request(self, header, payload=None, limit=MAX_HEADER, timeout=ANSWER_WAIT):
         """header (and its payload) to the app, and its answer (at most
