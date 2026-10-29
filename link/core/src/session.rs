@@ -127,6 +127,13 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+/// The channel a message of the other side's names: a u16, or an error
+/// (a bigger number must not wrap round onto a channel that is one).
+fn channel_id(message: &Value) -> Result<u16, String> {
+    let id = &message["id"];
+    id.as_u64().and_then(|id| u16::try_from(id).ok()).ok_or_else(|| format!("no channel's id: {id}"))
+}
+
 /// How good a path is: a better one takes over from a worse.
 fn rank(kind: &str) -> u8 {
     match kind {
@@ -918,13 +925,14 @@ impl Session {
 
     /// The other side opens one: taken if a feature of ours serves it.
     fn incoming(self: &Arc<Self>, message: &Value) {
-        let id = message["id"].as_u64().unwrap_or(0) as u16;
         let feature = message["feature"].as_str().unwrap_or("").to_owned();
         let name = message["channel"].as_str().unwrap_or("").to_owned();
         let handler = self.node.upgrade().and_then(|node| node.handler(&feature));
-        let refuse = |reason: &str| self.send_message(json!({"t": "refuse", "id": id, "reason": reason}));
+        // With its id as it came, whatever it is.
+        let refuse = |reason: &str| self.send_message(json!({"t": "refuse", "id": message["id"], "reason": reason}));
         let Some(class) = message["class"].as_str().and_then(Class::parse) else { return refuse("unknown class") };
         let Some(handler) = handler else { return refuse("not served") };
+        let Ok(id) = channel_id(message) else { return refuse("bad id") };
         if id == DATAGRAM_PATH || id % 2 == self.next_id.load(Ordering::Relaxed) % 2
             || self.channels.lock().unwrap().contains_key(&id) {
             return refuse("bad id");
@@ -1528,8 +1536,15 @@ impl Session {
     }
 
     fn message(self: &Arc<Self>, message: &Value) {
-        let id = message["id"].as_u64().unwrap_or(0) as u16;
-        match message["t"].as_str().unwrap_or("") {
+        let kind = message["t"].as_str().unwrap_or("");
+        let id = match kind {
+            "accept" | "refuse" | "close" | "credit" => match channel_id(message) {
+                Ok(id) => id,
+                Err(e) => return log!("{}: a {kind:?} for {e}: dropped", self.label()),
+            },
+            _ => DATAGRAM_PATH,  // none
+        };
+        match kind {
             "open" => self.incoming(message),
             "accept" | "refuse" => {
                 if let Some(waiting) = self.pending.lock().unwrap().remove(&id) {
@@ -1928,6 +1943,36 @@ mod tests {
         let (again, _fake) = devices.by_cable(true, Some(session.id.clone()));
         assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
         until("on the new path", Duration::from_millis(100), || session.path().is_some());
+        devices.pc.close();
+    }
+
+    #[test]
+    fn an_open_with_an_id_no_channel_can_have_is_refused() {
+        // 65538 is no u16: refused as it came, not taken for channel 2.
+        let _one = one_at_a_time();
+        let devices = devices();
+        devices.pc.serve("echo", 1, |_| {});
+        let (session, mut fake) = devices.by_cable(false, None);
+        fake.say(json!({"t": "open", "id": 65538, "feature": "echo", "channel": "x", "class": "control"}));
+        let answer = fake.heard(&["accept", "refuse"]);
+        assert_eq!((&answer["t"], &answer["id"], &answer["reason"]), (&json!("refuse"), &json!(65538), &json!("bad id")));
+        assert_eq!(session.channels(), 0);
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_message_with_an_id_no_channel_can_have_touches_none() {
+        // A close for 65537 (no u16) is no close of channel 1.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, mut fake) = devices.by_cable(false, None);
+        let channel = fake.accept(&session, "sink");
+        assert_eq!(channel.id, 1);
+        fake.say(json!({"t": "close", "id": 65537}));
+        fake.reliable(frame::MESSAGE, 1, b"still");
+        let mut buf = [0u8; 64];
+        assert_eq!(channel.recv(&mut buf, Some(Duration::from_secs(5))).unwrap(), Some(5), "the channel closed");
+        assert_eq!(session.channels(), 1);
         devices.pc.close();
     }
 }
