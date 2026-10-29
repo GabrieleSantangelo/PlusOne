@@ -26,15 +26,24 @@ KEEP_REMOVED = 500  # removed ids remembered
 
 
 MAX_POINTS = 20000  # samples in a signature: a long one has a few thousand
+# Its coordinates, of a signature 1 wide: initials far taller than wide are
+# a few; past this a number scaled onto a page was no longer one (inf).
+MAX_COORDINATE = 1000.0
 
 
 def _number(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+def _point(pt):
+    """(x, y, pressure): coordinates within MAX_COORDINATE, pressure 0..1."""
+    return (isinstance(pt, list) and len(pt) == 3 and all(_number(v) for v in pt)
+            and abs(pt[0]) <= MAX_COORDINATE and abs(pt[1]) <= MAX_COORDINATE and 0 <= pt[2] <= 1)
+
+
 def valid(signature):
-    """Whether signature is a normalized signature with an id: finite
-    numbers, points of three, no empty stroke, of a sane size."""
+    """Whether signature is a normalized signature with an id: points of
+    three sane numbers (_point), no empty stroke, of a sane size."""
     try:
         strokes = signature["strokes"]
         width = signature.get("width", 1.0)
@@ -42,9 +51,7 @@ def valid(signature):
                 and _number(width) and width > 0
                 and isinstance(strokes, list) and 0 < len(strokes)
                 and sum(len(s) for s in strokes) <= MAX_POINTS
-                and all(isinstance(s, list) and s and all(
-                    isinstance(pt, list) and len(pt) == 3 and all(_number(v) for v in pt) for pt in s)
-                    for s in strokes))
+                and all(isinstance(s, list) and s and all(_point(pt) for pt in s) for s in strokes))
     except (KeyError, TypeError, AttributeError):
         return False
 

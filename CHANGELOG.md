@@ -107,6 +107,11 @@
   ("contract-signed.pdf"), made the saving try that name again and again,
   for ever. The next name is taken now ("contract-signed-2.pdf"), the
   link left as it is.
+- **A garbled saved signature no longer breaks the signing window**: a
+  signature shared by the tablet with a point far past any page (and a
+  pressure past full) was kept as any other, and once placed on a page
+  the signing window failed at each picture it took of it. Such a
+  signature is left out now, as one that is no signature.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

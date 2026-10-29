@@ -50,3 +50,16 @@ def test_merging_with_the_tablet():
     assert [s["id"] for s in found] == [ours["id"], "tablet-new"]
     assert set(removed) == {gone["id"], removed_there["id"]}
     assert signatures.message() == {"signatures": found, "removed": removed}
+
+
+def test_a_signature_whose_numbers_are_past_any_page_is_not_kept():
+    # Finite, and yet inf once scaled onto a page (1e307 times its width):
+    # the signing window's snapshot failed on it each time.
+    import math
+    from plusone.ink import bounds, place
+    huge = dict(drawn(), id="huge", strokes=[[[0.0, 0.0, 0.5], [1e307, 0.0, 0.5]]])
+    pressed = dict(drawn(), id="pressed", strokes=[[[0.0, 0.0, 0.5], [1.0, 0.2, 7.0]]])
+    signatures.merge({"signatures": [huge, pressed, dict(drawn(), id="fine")], "removed": []})
+    found, _removed = signatures.load()
+    assert [s["id"] for s in found] == ["fine"]
+    assert all(math.isfinite(v) for v in bounds(place(found[0], 100, 100)[0]))
