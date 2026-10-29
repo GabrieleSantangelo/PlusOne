@@ -10,9 +10,16 @@ import android.os.Bundle
 class UsbActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory::class.java)?.let { accessory ->
-            CompanionService.cable(this, accessory)
-        }
+        // Exported: what another app sends here starts nothing.
+        intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory::class.java)
+            ?.takeIf { ours(intent.action, it.manufacturer, it.model) }
+            ?.let { accessory -> CompanionService.cable(this, accessory) }
         finish()
+    }
+
+    companion object {
+        /** Plus One's accessory just plugged in, as res/xml/accessory_filter.xml has it. */
+        fun ours(action: String?, manufacturer: String?, model: String?): Boolean =
+            action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED && manufacturer == "Plus One" && model == "Plus One"
     }
 }

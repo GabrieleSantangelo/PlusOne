@@ -163,6 +163,9 @@
   app; only that connection fails now.
 - Fixed: at the app's very first start, two of its parts asking for the
   tablet's key at once could each make one; it is made once.
+- Security: the app's cable entry, which Android leaves open to other
+  apps, goes on only for Plus One's accessory just plugged in; anything
+  else sent there starts nothing.
 
 ## 0.10.0
 
