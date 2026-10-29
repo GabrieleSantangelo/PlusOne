@@ -52,7 +52,9 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
             }
         } catch (e: java.io.IOException) {
             // The PC closed it, or the session is over.
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // Errors too: a PC's deeply nested JSON overflows the parser's
+            // stack, and an Error left uncaught ends the process.
             Log.w(CompanionService.TAG, "link: ${channel.feature}: $e")
         } finally {
             handler.closed(link)

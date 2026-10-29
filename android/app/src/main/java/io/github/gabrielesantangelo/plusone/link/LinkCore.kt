@@ -100,7 +100,7 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
                 if (handler == null) { channel.close(); continue }
                 // The handler's from then on: it closes it (or keeps it, for another to use).
                 Thread({
-                    try { handler(channel) } catch (e: Exception) {
+                    try { handler(channel) } catch (e: Throwable) {  // an Error too: the process goes on
                         Log.w(TAG, "link: ${channel.feature}: $e")
                         channel.close()
                     }

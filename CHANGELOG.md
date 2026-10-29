@@ -157,6 +157,8 @@
 - Fixed: a desktop packet cut short closed the tablet's app, and the
   frames that never came whole were all kept, until it ran out of memory;
   such packets are dropped now, and four frames at most wait to be whole.
+- Fixed: a message nested thousands of levels deep, from a PC over the
+  link, closed the tablet's app; only its channel closes now.
 
 ## 0.10.0
 
