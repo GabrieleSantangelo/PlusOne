@@ -176,12 +176,14 @@ class Feed:
         tablet = receiver = None
         try:
             where = self.where()
-            if not where or not where[0]:
-                self.on_problem("away")
-                return RETRY
             # Over the link (plus-one-link) when it runs and the app serves
-            # this there; else the link of before.
-            tablet = self._link = channels.connect(where[1], kind) or link.connect(where[0], where[1])
+            # this there (by cable too, with no address); else the link of before.
+            tablet = self._link = channels.connect(where[1], kind) if where else None
+            if tablet is None:
+                if not where or not where[0]:
+                    self.on_problem("away")
+                    return RETRY
+                tablet = self._link = link.connect(where[0], where[1])
             if not self._wanted.is_set():
                 return None  # stopped while it connected: stop() had no link to close
             receiver = self.receiver()
@@ -1167,10 +1169,12 @@ class Devices:
         active = self.app.tablets.active()
         fingerprint = active.fingerprint if active is not None else None
         changed, self.tablet = fingerprint != self.tablet, fingerprint
-        # The speakers only while the tablet's app is on the network: away, the
-        # output goes, and the PC's sound back to its own (a camera or
+        # The speakers only while the tablet's app is on the network, or
+        # plus-one-link has a session with it (by cable, the Wi-Fi off): away,
+        # the output goes, and the PC's sound back to its own (a camera or
         # microphone a program picked stays, and says the tablet is away).
-        here = active is not None and bool(self.app.tablets.addresses(active))
+        here = active is not None and (bool(self.app.tablets.addresses(active))
+                                       or self.app.paths.path(active.fingerprint) is not None)
         for device, on in ((self.camera, settings.camera), (self.microphone, settings.microphone),
                            (self.speakers, settings.speakers and here)):
             if on and active is not None:

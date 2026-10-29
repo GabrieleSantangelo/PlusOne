@@ -71,6 +71,11 @@
   few seconds, held the PC's connecting to the tablet for ever (each
   byte came in time, and nothing limited the whole); the PC now gives
   up on it after 8 s, as the tablet does on a PC, and tries elsewhere.
+- **The tablet's speakers by cable alone**: the PC took the tablet for
+  there only while its app was on the network, so with the Wi-Fi off and
+  the cable plugged in, the tablet's speakers never came. A session with
+  the tablet over the link counts too now, the cable's as the Wi-Fi's:
+  the speakers come with it and go with it.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

@@ -272,6 +272,7 @@ class PlusOneApp(Adw.Application):
         self.self_update = SelfUpdate(self)
         self._device_states = {}  # the camera's, the microphone's and the speakers', as last notified
         self.devices = Devices(self)
+        self.started = False  # do_startup ran: the Plus One running, not a second one of a moment
 
     # -- GApplication ------------------------------------------------------
     def do_startup(self):
@@ -292,6 +293,7 @@ class PlusOneApp(Adw.Application):
         # not as Devices are made: a second Plus One of a moment (Sign with
         # Plus One) makes them too, and turned it on under the speakers.
         BluetoothAudio.restore()
+        self.started = True
         self.devices.apply()
         # The desktop locked or another user's in front: the tablet's input
         # reaches nothing, its camera and microphone pause (SEC-22).
@@ -464,6 +466,11 @@ class PlusOneApp(Adw.Application):
             threading.Thread(target=tell, daemon=True).start()
 
     def _path_changed(self):
+        # The speakers come and go with the tablet's session too (the cable's);
+        # not from a second Plus One of a moment (Sign with Plus One): the
+        # first's are the speakers.
+        if self.started:
+            self.devices.apply()
         self._emit_properties()
         for listener in list(self.listeners):
             listener()

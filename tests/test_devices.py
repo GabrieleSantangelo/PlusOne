@@ -296,6 +296,22 @@ def test_a_refusal_is_said_and_asked_again_later(monkeypatch):
     assert problems[0] == "permission"
 
 
+def test_by_cable_alone_the_feed_goes_over_the_link(monkeypatch):
+    # No address for the tablet (never on the network, the Wi-Fi off): its
+    # session with plus-one-link is what reaches it.
+    wire = FakeWire({"type": "answer", "sdp": "v=0 answer"})
+    monkeypatch.setattr(devices.channels, "connect", lambda app_id, kind: app_id == "a1b2" and fake_link(wire))
+    monkeypatch.setattr(link, "connect", lambda targets, expect: (_ for _ in ()).throw(AssertionError("no address")))
+    ready, problems = [], []
+    feed = devices.Feed({"type": "speakers"}, lambda: ([], "a1b2"), FakeReceiver, lambda: ready.append(1),
+                        problems.append)
+    feed.start()
+    assert spin(lambda: ready or problems)
+    feed.stop()
+    feed._thread.join(5)
+    assert ready and problems == [] and wire.sent[0]["type"] == "speakers"
+
+
 def test_no_tablet_on_the_network(monkeypatch):
     monkeypatch.setattr(devices, "RETRY", 0.05)
     problems = []
@@ -385,7 +401,8 @@ def test_the_voice_chain_parses():
 def test_switched_on_only_with_a_tablet(monkeypatch):
     calls = []
     app = types.SimpleNamespace(settings=types.SimpleNamespace(camera=True, microphone=False, speakers=False),
-                                tablets=types.SimpleNamespace(active=lambda: None, addresses=lambda t: []))
+                                tablets=types.SimpleNamespace(active=lambda: None, addresses=lambda t: []),
+                                paths=types.SimpleNamespace(path=lambda device: None))
     manager = devices.Devices.__new__(devices.Devices)
     manager.app, manager.tablet = app, None
     manager.camera = types.SimpleNamespace(enable=lambda: calls.append("camera on"),
@@ -408,6 +425,47 @@ def test_switched_on_only_with_a_tablet(monkeypatch):
     calls.clear()
     manager.apply()
     assert calls == ["camera on", "camera renewed", "mic off"]
+
+
+def test_the_speakers_by_cable_alone(monkeypatch):
+    # Not on the network (the Wi-Fi off), but plus-one-link has a session
+    # with the tablet: the speakers are there; with neither, they go.
+    tablet = types.SimpleNamespace(fingerprint="aa" * 32)
+    sessions = {}
+    app = types.SimpleNamespace(settings=types.SimpleNamespace(camera=False, microphone=False, speakers=True),
+                                tablets=types.SimpleNamespace(active=lambda: tablet, addresses=lambda t: []),
+                                paths=types.SimpleNamespace(path=lambda device: sessions.get(device)))
+    manager = devices.Devices.__new__(devices.Devices)
+    manager.app, manager.tablet = app, None
+    calls = []
+    manager.camera = manager.microphone = types.SimpleNamespace(disable=lambda: None)
+    manager.speakers = types.SimpleNamespace(enable=lambda: calls.append("on"), disable=lambda: calls.append("off"),
+                                             renew=lambda: None)
+    manager.apply()
+    assert calls == ["off"]
+    sessions[tablet.fingerprint] = "cable"
+    manager.apply()
+    sessions[tablet.fingerprint] = "reconnecting…"  # its session waits for another path: a moment
+    manager.apply()
+    assert calls == ["off", "on", "on"]
+    del sessions[tablet.fingerprint]
+    manager.apply()
+    assert calls[-1] == "off"
+
+
+def test_the_speakers_follow_the_tablets_session(monkeypatch):
+    # A session coming or going (the cable plugged in, say) is applied as
+    # the network's comings and goings are; not by a second Plus One of a
+    # moment (Sign with Plus One).
+    from plusone import app
+    applied = []
+    fake = types.SimpleNamespace(started=True, devices=types.SimpleNamespace(apply=lambda: applied.append(1)),
+                                 _emit_properties=lambda: None, listeners=[])
+    app.PlusOneApp._path_changed(fake)
+    assert applied == [1]
+    fake.started = False
+    app.PlusOneApp._path_changed(fake)
+    assert applied == [1]
 
 
 def test_a_dropped_session_shows_black_not_the_last_picture(monkeypatch):
