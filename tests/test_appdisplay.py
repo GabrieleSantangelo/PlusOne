@@ -1,4 +1,5 @@
 """The app display's packets: their layout, sealed both ways, replays refused."""
+import json
 import socket
 import struct
 import threading
@@ -496,3 +497,66 @@ def test_keyframes_asked_again_wait_for_the_last_to_come(monkeypatch):
         clock[0] = t
         appdisplay.AppStreamer.force_keyframe(streamer)
     assert asked[2:] == [101.0, 101.3]
+
+
+APP = "abcd" * 4
+
+
+class FakeChannel:
+    def __init__(self, answer=b""):
+        self.answer, self.closed = answer, False
+
+    def send(self, data):
+        pass
+
+    def recv(self, timeout=None):
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+    def close(self):
+        self.closed = True
+
+
+class FakeConnection:
+    """plus-one-link with the paired tablet, whose app answers "display" with answer."""
+
+    def __init__(self, answer):
+        self.answer, self.opened, self.closed = answer, [], False
+
+    def devices(self):
+        return [{"id": APP + "0" * 48, "connected": True}]
+
+    def open(self, device, feature, name, kind):
+        self.opened.append(FakeChannel(self.answer if name == "control" else b""))
+        return self.opened[-1]
+
+    def close(self):
+        self.closed = True
+
+
+def over_the_link(monkeypatch, answer):
+    import plusone_link
+    connection = FakeConnection(answer)
+    monkeypatch.setattr(appdisplay, "plusone_link", types.SimpleNamespace(
+        Link=lambda: connection, LinkError=plusone_link.LinkError, CONTROL="control", REALTIME="realtime",
+        INPUT="input", MAX_DATAGRAM=plusone_link.MAX_DATAGRAM))
+    return appdisplay.AppDisplay([("10.0.0.2", 1)], APP, (None, None, 60), 20000, "x264"), connection
+
+
+@pytest.mark.parametrize("answer", [b"not json", b"[]", BrokenPipeError()])
+def test_a_garbled_answer_over_the_link_leaves_nothing_open(monkeypatch, answer):
+    display, connection = over_the_link(monkeypatch, answer)
+    with pytest.raises((ValueError, OSError)):
+        display._over_the_link()
+    assert [channel.closed for channel in connection.opened] == [True, True, True] and connection.closed
+
+
+def test_the_app_refusing_over_the_link_says_why(monkeypatch):
+    from plusone import engine, link
+    display, _connection = over_the_link(monkeypatch, json.dumps({"type": "refused", "reason": "background"}).encode())
+    packets, reply = display._over_the_link()
+    with pytest.raises(link.Refused) as refused:
+        display._run_over_the_link(packets, reply)
+    assert engine.why_not(refused.value, "Tab") == ("On {name}, let Plus One display over other apps, or open it",
+                                                    {"name": "Tab"})

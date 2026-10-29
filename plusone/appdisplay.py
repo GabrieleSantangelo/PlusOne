@@ -923,16 +923,20 @@ class AppDisplay:
             for name, kind in (("control", plusone_link.CONTROL), ("media", plusone_link.REALTIME),
                                ("input", plusone_link.INPUT)):
                 channels.append(connection.open(device, "display", name, kind))
-        except plusone_link.LinkError as e:
-            log("app display: not over the link:", e)
+            packets = LinkPackets(connection, device, *channels)
+            packets.control.send(json.dumps({"type": "display"}).encode())
+            answer = packets.control.recv(timeout=10)
+            reply = json.loads(answer) if answer else {}
+            if not isinstance(reply, dict):
+                raise ValueError(f"the app answered {answer[:80]!r}")
+        except Exception as e:  # noqa: BLE001 - whatever it was, nothing left open
             for channel in channels:
                 channel.close()
             connection.close()
+            if not isinstance(e, plusone_link.LinkError):
+                raise
+            log("app display: not over the link:", e)
             return None
-        packets = LinkPackets(connection, device, *channels)
-        packets.control.send(json.dumps({"type": "display"}).encode())
-        answer = packets.control.recv(timeout=10)
-        reply = json.loads(answer) if answer else {}
         return packets, reply
 
     def _run(self):
@@ -983,6 +987,8 @@ class AppDisplay:
         self.channel = packets
         if self._stopped.is_set():
             return
+        if reply.get("type") == "refused":
+            raise link.Refused(str(reply.get("reason", "")))  # why_not's guidance, as over the link of before
         if reply.get("type") != "display-ready":
             raise ValueError(f"the app answered {reply.get('type') or reply.get('reason')!r}")
         self.tablet_size = (int(reply["width"]), int(reply["height"]))
