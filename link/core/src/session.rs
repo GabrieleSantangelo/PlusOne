@@ -1328,9 +1328,13 @@ impl Session {
             // All out, and more queued meanwhile (its wake taken already, while
             // the stream was full): round again at once, after a look at what
             // came, not at the next ping (a transfer went a burst a second).
+            // Not for reliable frames that may not go: paced, or as much
+            // unacknowledged as may be (the acknowledgement comes on the
+            // stream, and wakes the poll).
+            let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
             let more = !blocked && {
                 let outbox = self.outbox.lock().unwrap();
-                !outbox.urgent.is_empty() || (outbox.reliable_bytes > 0 && paced.is_none())
+                !outbox.urgent.is_empty() || (outbox.reliable_bytes > 0 && paced.is_none() && room)
             };
             let now = Instant::now();
             let silent = path.us().saturating_sub(path.heard_us.load(Ordering::Relaxed));
@@ -1566,5 +1570,218 @@ impl Session {
                 self.pace.lock().unwrap().sample(now.saturating_sub(sent), path.realtime_going(), Instant::now());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A PC's session with a tablet faked by hand: the frames a broken or
+    //! hostile one may send, or not. The session's threads are counted by
+    //! their names: one test at a time.
+
+    use super::*;
+    use crate::identity::{Identity, Paired};
+    use crate::Node;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn identity() -> (Identity, String) {
+        let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
+        let identity = Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap();
+        let fingerprint = identity.fingerprint();
+        (identity, fingerprint)
+    }
+
+    fn trusting(fingerprint: &str) -> Paired {
+        let fingerprint = fingerprint.to_owned();
+        Arc::new(move |seen: &str| seen == fingerprint)
+    }
+
+    /// The tablet's end of a session, by hand: its TLS, its stream, its
+    /// reliable frames numbered here.
+    struct Fake {
+        conn: rustls::Connection,
+        stream: Box<dyn Stream>,
+        decoder: Decoder,
+        /// Its UDP socket, if the stream has IP under it: open, never read.
+        _udp: Option<UdpSocket>,
+        next: u64,
+    }
+
+    impl Fake {
+        /// The TLS handshake and the hellos on the tablet's side of the
+        /// connection stream makes, on a thread (the PC's side waits for
+        /// them): flow controlled or not, a path for the session resumes
+        /// names (None: a new one).
+        fn start(tablet: &Identity, pc: &str, flow: bool, resumes: Option<String>,
+                 stream: impl FnOnce() -> Box<dyn Stream> + Send + 'static) -> std::thread::JoinHandle<Fake> {
+            let server = tablet.server_config(trusting(pc)).unwrap();
+            let mut hello = json!({"t": "hello", "name": "tablet", "features": {"sink": 1}});
+            if flow {
+                hello["flow"] = json!(1);
+            }
+            std::thread::spawn(move || {
+                let conn = rustls::ServerConnection::new(server).unwrap();
+                let ours = move |_: &str| resumes.clone().map(|id| (id, true));
+                let established = establish(conn.into(), stream(), false, hello, "usb", &ours).unwrap();
+                Fake { conn: established.conn, stream: established.stream, decoder: established.decoder,
+                       _udp: established.udp, next: 1 }
+            })
+        }
+
+        fn send(&mut self, kind: u8, channel: u16, body: &[u8]) {
+            let mut bytes = Vec::new();
+            frame::encode(kind, channel, body, &mut bytes);
+            self.conn.writer().write_all(&bytes).unwrap();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut self.stream).unwrap();
+            }
+        }
+
+        /// A reliable frame, numbered (its hello was 0).
+        fn reliable(&mut self, kind: u8, channel: u16, body: &[u8]) {
+            let mut numbered = self.next.to_be_bytes().to_vec();
+            numbered.extend_from_slice(body);
+            self.next += 1;
+            self.send(kind, channel, &numbered);
+        }
+
+        fn say(&mut self, message: Value) {
+            self.reliable(frame::SESSION, 0, message.to_string().as_bytes());
+        }
+
+        /// The PC's next message of one of these types (the others passed over).
+        fn heard(&mut self, types: &[&str]) -> Value {
+            loop {
+                let Some((kind, _, body)) = read_frame(&mut self.conn, &mut self.stream, &mut self.decoder).unwrap()
+                else { continue };
+                if kind != frame::SESSION {
+                    continue;
+                }
+                let message: Value = serde_json::from_slice(&body[8..]).unwrap();
+                if types.iter().any(|t| message["t"] == *t) {
+                    return message;
+                }
+            }
+        }
+
+        /// A control channel the PC opens for feature, taken here.
+        fn accept(&mut self, session: &Arc<Session>, feature: &str) -> Channel {
+            let opening = {
+                let (session, feature) = (session.clone(), feature.to_owned());
+                std::thread::spawn(move || session.open(&feature, "c", Class::Control))
+            };
+            let open = self.heard(&["open"]);
+            self.say(json!({"t": "accept", "id": open["id"]}));
+            opening.join().unwrap().unwrap()
+        }
+    }
+
+    /// A PC, and the tablet it is paired with (faked).
+    struct Devices {
+        pc: Node,
+        tablet: Identity,
+        pc_fingerprint: String,
+    }
+
+    fn devices() -> Devices {
+        let (pc_id, pc_fingerprint) = identity();
+        let (tablet, tablet_fingerprint) = identity();
+        let pc = Node::new("pc", &pc_id, trusting(&tablet_fingerprint)).unwrap();
+        Devices { pc, tablet, pc_fingerprint }
+    }
+
+    impl Devices {
+        /// A session (or a path for the one resumes names) on a cable: no
+        /// UDP.
+        fn by_cable(&self, flow: bool, resumes: Option<String>) -> (Arc<Session>, Fake) {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let faking = Fake::start(&self.tablet, &self.pc_fingerprint, flow, resumes, move || Box::new(theirs));
+            let session = self.pc.connect_stream(Box::new(ours), "usb").unwrap();
+            (session, faking.join().unwrap())
+        }
+    }
+
+    /// This process's threads named so, each one's directory in /proc.
+    fn threads(name: &str) -> Vec<PathBuf> {
+        std::fs::read_dir("/proc/self/task").unwrap().flatten().map(|task| task.path())
+            .filter(|task| std::fs::read_to_string(task.join("comm")).is_ok_and(|comm| comm.trim_end() == name))
+            .collect()
+    }
+
+    /// The CPU time the threads named so took so far.
+    fn cpu(name: &str) -> Duration {
+        let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let ticks: u64 = threads(name).iter().map(|task| {
+            let stat = std::fs::read_to_string(task.join("stat")).unwrap_or_default();
+            // After the name: the state first, utime and stime 12th and 13th.
+            let fields: Vec<&str> = stat.rsplit_once(')').map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+            fields.get(11..13).map_or(0, |times| times.iter().filter_map(|t| t.parse::<u64>().ok()).sum::<u64>())
+        }).sum();
+        Duration::from_millis(ticks * 1000 / tick)
+    }
+
+    #[test]
+    fn a_session_waiting_for_acknowledgements_waits_not_spins() {
+        // A tablet that takes every byte and acknowledges none (its pings say
+        // 0): past UNACKED_MOST no reliable frame goes, and meanwhile the
+        // session's thread sleeps (it went round with no wait, a core at
+        // 100 %); acknowledged, the rest goes at once.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, mut fake) = devices.by_cable(false, None);
+        let channel = fake.accept(&session, "sink");
+        // What comes from now on taken unread.
+        let mut drain = fake.stream.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                match drain.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let feeding = std::thread::spawn(move || {
+            let chunk = vec![7u8; 200 << 10];
+            for _ in 0..400 {  // 80 MB, more than UNACKED_MOST
+                if channel.send(&chunk).is_err() {
+                    break;
+                }
+            }
+            channel
+        });
+        // Until the window is full: what waits to go stays as it is.
+        let started = Instant::now();
+        let mut seen = VecDeque::new();
+        while seen.len() < 3 || seen.iter().any(|queued| *queued != seen[0]) || seen[0] == 0 {
+            assert!(started.elapsed() < Duration::from_secs(10), "the window never full: {:?}", seen);
+            std::thread::sleep(Duration::from_millis(100));
+            seen.push_back(session.queued());
+            if seen.len() > 3 {
+                seen.pop_front();
+            }
+        }
+        fake.send(frame::PING, 0, &0u64.to_be_bytes());  // heard: the path stays
+        let before = cpu("link-session");
+        std::thread::sleep(Duration::from_secs(1));
+        let spent = cpu("link-session").saturating_sub(before);
+        assert!(spent < Duration::from_millis(300), "{spent:?} of CPU in a second, waiting for an acknowledgement");
+        fake.send(frame::PING, 0, &u64::MAX.to_be_bytes());
+        drop(feeding.join().unwrap());
+        let started = Instant::now();
+        while session.queued() > 0 {
+            assert!(started.elapsed() < Duration::from_secs(2), "{} bytes still waiting once acknowledged", session.queued());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        devices.pc.close();
     }
 }
