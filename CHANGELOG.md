@@ -62,7 +62,10 @@
   meanwhile, on the PC and on the tablet; and with 64 MB of a transfer
   sent and not yet confirmed by the other side, the link went round at
   100 % of a core until it was. Both now sleep until what they wait for
-  comes, and go on at once.
+  comes, and go on at once. And a connection doing nothing woke twice a
+  second beside its pings, on each side, and twice a second while it
+  waited for the network to come back; now it wakes for its pings alone,
+  and not at all while it waits.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

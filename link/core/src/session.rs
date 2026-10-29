@@ -383,12 +383,16 @@ struct Path {
     ended: AtomicBool,
 }
 
-/// A path's end: its stream shut down, its QUIC connection closed.
+/// A path's end: its stream shut down, its QUIC connection closed, its
+/// UDP socket shut down (its thread, asleep in a read, wakes to it).
 fn end_path(path: &Path) {
     path.ended.store(true, Ordering::SeqCst);
     path.stream.shutdown();
     if let Some(quic) = &path.quic {
         quic.close();
+    }
+    if let Some(udp) = &path.udp {
+        sys::shutdown(udp.as_raw_fd());
     }
 }
 
@@ -600,9 +604,6 @@ fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
     established.stream.set_timeouts(None)?;
     established.stream.set_nonblocking(true)?;
     let udp = established.udp.take();
-    if let Some(udp) = &udp {
-        udp.set_read_timeout(Some(Duration::from_millis(500)))?;
-    }
     let quic = established.quic.take();
     // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
     let transport = if quic.is_some() { "quic" } else { established.stream.transport() };
@@ -1152,7 +1153,8 @@ impl Session {
                     self.end(&format!("no path for {} s", wait.as_secs()));
                     return;
                 }
-                let _ = sys::readable(self.wake.fd(), Some(left.min(Duration::from_millis(500))));
+                // Woken by a path coming (adopt) or the session's end.
+                let _ = sys::readable(self.wake.fd(), Some(left));
                 self.wake.clear();
             }
             if let Some((established, _)) = &next {
@@ -1560,11 +1562,12 @@ impl Session {
         let mut buf = vec![0u8; 2048];
         let mut sealed = Vec::with_capacity(64);
         // Until the path ends, not when it is left: a handover's old path is
-        // read as its QUIC datagrams are (retire()).
+        // read as its QUIC datagrams are (retire()). Asleep in the read
+        // until a datagram comes or end_path shuts the socket down.
         while !self.is_closed() && !path.ended.load(Ordering::SeqCst) {
             let (length, from) = match udp.recv_from(&mut buf) {
                 Ok(got) => got,
-                Err(_) => continue,  // the timeout: look at closed again
+                Err(_) => continue,  // shut down (no address): look at ended again
             };
             self.datagram_in(&path, &mut buf[..length], Some(from), &mut sealed);
         }
@@ -1737,6 +1740,17 @@ mod tests {
             let session = self.pc.connect_stream(Box::new(ours), "usb").unwrap();
             (session, faking.join().unwrap())
         }
+
+        /// A session over TCP on loopback: UDP too, to a socket of the
+        /// tablet's that sends nothing.
+        fn by_tcp(&self) -> (Arc<Session>, Fake) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let faking = Fake::start(&self.tablet, &self.pc_fingerprint, true, None,
+                                     move || Box::new(listener.accept().unwrap().0));
+            let session = self.pc.connect(address, Duration::from_secs(2)).unwrap();
+            (session, faking.join().unwrap())
+        }
     }
 
     /// This process's threads named so, each one's directory in /proc.
@@ -1744,6 +1758,24 @@ mod tests {
         std::fs::read_dir("/proc/self/task").unwrap().flatten().map(|task| task.path())
             .filter(|task| std::fs::read_to_string(task.join("comm")).is_ok_and(|comm| comm.trim_end() == name))
             .collect()
+    }
+
+    /// How many times the threads named so went to sleep, all told.
+    fn sleeps(name: &str) -> u64 {
+        threads(name).iter().map(|task| {
+            let status = std::fs::read_to_string(task.join("status")).unwrap_or_default();
+            status.lines().find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .and_then(|count| count.trim().parse::<u64>().ok()).unwrap_or(0)
+        }).sum()
+    }
+
+    /// Until done, or panics past within.
+    fn until(what: &str, within: Duration, done: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < within, "{what}: not in {within:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// The CPU time the threads named so took so far.
@@ -1813,6 +1845,47 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(2), "{} bytes still waiting once acknowledged", session.queued());
             std::thread::sleep(Duration::from_millis(10));
         }
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_paths_datagrams_sleep_until_one_comes() {
+        // UDP to a tablet that sends nothing on it: the thread reading the
+        // path's datagrams never wakes (it woke each 500 ms to see whether
+        // the path was over), and ends with the path all the same.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, fake) = devices.by_tcp();
+        until("the datagrams' thread", Duration::from_secs(1), || threads("link-datagrams").len() == 1);
+        std::thread::sleep(Duration::from_millis(300));
+        let before = sleeps("link-datagrams");
+        std::thread::sleep(Duration::from_secs(2));
+        let woke = sleeps("link-datagrams") - before;
+        assert!(woke <= 1, "the datagrams' thread woke {woke} times in 2 s, with none coming");
+        drop(fake);
+        until("the path lost", Duration::from_secs(2), || session.path().is_none());
+        until("the datagrams' thread over", Duration::from_millis(500), || threads("link-datagrams").is_empty());
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_session_away_sleeps_until_a_path_comes() {
+        // Its path lost, a session waits RESUME_WAIT for another: asleep
+        // meanwhile (it woke each 500 ms), and on the next as soon as it
+        // comes.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, fake) = devices.by_cable(true, None);
+        drop(fake);
+        until("the path lost", Duration::from_secs(2), || session.path().is_none());
+        std::thread::sleep(Duration::from_millis(100));
+        let before = sleeps("link-session");
+        std::thread::sleep(Duration::from_secs(2));
+        let woke = sleeps("link-session") - before;
+        assert!(woke <= 1, "the session's thread woke {woke} times in 2 s, waiting for a path");
+        let (again, _fake) = devices.by_cable(true, Some(session.id.clone()));
+        assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
+        until("on the new path", Duration::from_millis(100), || session.path().is_some());
         devices.pc.close();
     }
 }
