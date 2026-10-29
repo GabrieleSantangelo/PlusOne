@@ -6,6 +6,7 @@ signed copy comes back next to the original, with a notification. When
 the app cannot be reached, the notification says so and offers signing on
 this PC (sign.py's window) instead.
 """
+import collections
 import os
 import shutil
 import tempfile
@@ -33,6 +34,10 @@ class Signing:
         self.in_app = {}           # paths the tablet's app is signing -> that request's token
         self.tablet = None         # its name
         self.signed = []           # signed in a row (several PDFs sent at once): one notification
+        self.reading = 0           # PDFs being read (_read): Plus One stays, busy, meanwhile
+        self._reads = collections.deque()  # (work, then) still to do, in the order asked
+        self._reader = False       # the thread that does them, running
+        self._reads_lock = threading.Lock()
         for name, callback in (("sign-here", self._sign_here), ("open-file", self._open_file),
                                ("show-file", self._show_file)):
             action = Gio.SimpleAction.new(name, GLib.VariantType("s"))
@@ -40,11 +45,15 @@ class Signing:
             app.add_action(action)
 
     def request(self, path):
-        """Sign the PDF at path on the tablet in use, in its app."""
+        """Sign the PDF at path on the tablet in use, in its app (once read,
+        off the main loop)."""
         path = os.path.abspath(path)
         log("signing", path)
         from .pdf import problem
-        wrong = problem(path)
+        self._read(lambda: problem(path), lambda wrong: self._checked(path, wrong))
+
+    def _checked(self, path, wrong):
+        """request()'s, once the PDF is read: wrong, pdf.problem()'s."""
         if wrong:
             # Not a PDF, too big, locked: said now, not after signing it.
             template, args = wrong
@@ -149,6 +158,41 @@ class Signing:
         # No address, but over the link (the cable): it goes there.
         reached = bool(where) or (tablet is not None and channels.connected(tablet.app_id))
         return (where, tablet.name, tablet.app_id) if reached else None
+
+    def _read(self, work, then):
+        """work() on a thread of its own, the PDFs read one after the other
+        in the order asked; then(its result, None if it failed) on the main
+        loop after. Reading one (up to pdf.MAX_SIZE, parsed) took seconds,
+        the window and D-Bus frozen meanwhile."""
+        self.reading += 1
+        self.app.hold()
+        with self._reads_lock:
+            self._reads.append((work, then))
+            if self._reader:
+                return
+            self._reader = True
+        threading.Thread(target=self._read_all, name="plusone-pdf", daemon=True).start()
+
+    def _read_all(self):
+        while True:
+            with self._reads_lock:
+                if not self._reads:
+                    self._reader = False
+                    return
+                work, then = self._reads.popleft()
+            try:
+                result = work()
+            except Exception as e:  # noqa: BLE001 - not known, as for a PDF pypdf cannot read
+                log("signing: not read:", repr(e))
+                result = None
+            GLib.idle_add(once(self._read_done, then, result))
+
+    def _read_done(self, then, result):
+        self.reading -= 1
+        try:
+            then(result)
+        finally:
+            self.app.release()
 
     def _locate_app(self, app_id):
         """Where the app the PDF went to is now (its port changes when it
@@ -307,7 +351,7 @@ class Signing:
             self.windows.remove(window)
         if result:
             from .pdf import digitally_signed
-            self._signed(result, digitally_signed(path))
+            self._read(lambda: digitally_signed(path), lambda certified: self._signed(result, bool(certified)))
 
     def _signed(self, result, certified=False):
         """One notification for the PDFs signed in a row. certified: the

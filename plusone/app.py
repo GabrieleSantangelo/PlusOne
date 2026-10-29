@@ -488,7 +488,7 @@ class PlusOneApp(Adw.Application):
         """Whether something is in use: a connection, a PDF being signed, the
         tablet's camera, microphone or speakers used by a program here."""
         signing = self.signing
-        return bool(self.controller.running or signing.windows or signing.in_app
+        return bool(self.controller.running or signing.windows or signing.in_app or signing.reading
                     or any(getattr(self.devices, kind).state == "in use"
                            for kind in ("camera", "microphone", "speakers")))
 

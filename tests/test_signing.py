@@ -117,6 +117,7 @@ def test_asked_again_while_on_the_tablet_is_one_request(monkeypatch, tmp_path):
     path = str(tmp_path / "form.pdf")
     for _ in range(3):
         signing.request(path)
+    assert spin(lambda: not signing.reading)
     assert sent == [path]
 
 
@@ -126,6 +127,7 @@ def test_a_window_here_is_brought_up_not_opened_again(monkeypatch, tmp_path):
     window = FakeWindow(path)
     signing.windows.append(window)
     signing.request(path)
+    assert spin(lambda: not signing.reading)
     assert window.presented == 1 and opened == []
 
 
@@ -133,7 +135,8 @@ def test_without_the_app_on_the_network_signing_here_is_offered(monkeypatch, tmp
     app, signing, opened, notes = make(monkeypatch)
     path = str(tmp_path / "form.pdf")
     signing.request(path)
-    assert notes and notes[-1][0] == path and "Galaxy Tab" in notes[-1][1]
+    assert spin(lambda: notes)
+    assert notes[-1][0] == path and "Galaxy Tab" in notes[-1][1]
     assert app.controller.starts == 0  # nothing else is tried: no Second Screen
     from gi.repository import GLib as G
     signing._sign_here(None, G.Variant("s", path))
@@ -207,6 +210,7 @@ def test_only_the_tablet_in_use_signs(monkeypatch, tmp_path):
     app.discovery.app_on = ("10.0.0.7", 40000, "Someone's Tab", "ffff" + "0" * 12)
     monkeypatch.setattr(sign_jobs, "sign", lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
     signing.request(str(tmp_path / "form.pdf"))
+    assert spin(lambda: not signing.reading)
     assert not signing.in_app
 
 
@@ -215,6 +219,7 @@ def test_nothing_is_sent_without_a_paired_tablet(monkeypatch, tmp_path):
     app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
     monkeypatch.setattr(sign_jobs, "sign", lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
     signing.request(str(tmp_path / "form.pdf"))
+    assert spin(lambda: not signing.reading)
     assert app.notes == ["sign"] and app.controller.starts == 0 and not signing.in_app
 
 
@@ -259,6 +264,52 @@ def test_signed_on_the_tablet_is_never_lost_for_a_folder_that_takes_nothing(monk
     signing.request(path)
     assert spin(lambda: results)
     assert results == [str(documents / "form-signed.pdf")]
+
+
+def test_a_pdf_is_read_off_the_main_loop(monkeypatch, tmp_path):
+    # Up to 256 MB parsed: the window and D-Bus go on meanwhile, and Plus
+    # One stays, busy, until it is read.
+    import threading
+    import plusone.pdf
+    app, signing, _, notes = make(monkeypatch)
+    read, go = [], threading.Event()
+    monkeypatch.setattr(plusone.pdf, "problem", lambda path: read.append(threading.current_thread()) or go.wait(1)
+                        and None)
+    path = str(tmp_path / "form.pdf")
+    signing.request(path)
+    assert spin(lambda: read) and read[0] is not threading.main_thread()
+    assert signing.reading == 1 and app.held == 1 and not notes
+    go.set()
+    assert spin(lambda: notes) and notes[-1][0] == path
+    assert signing.reading == 0 and app.held == 0
+
+
+def test_pdfs_read_go_to_the_tablet_in_the_order_asked(monkeypatch, tmp_path):
+    import time
+    import plusone.pdf
+    app, signing, _, _ = make(monkeypatch)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    first, second = str(tmp_path / "form.pdf"), str(tmp_path / "other.pdf")
+    monkeypatch.setattr(plusone.pdf, "problem", lambda path: time.sleep(0.2 if path == first else 0))
+    sent = []
+    monkeypatch.setattr(signing, "_sign_in_app", lambda path, target: sent.append(path))
+    signing.request(first)
+    signing.request(second)
+    assert spin(lambda: len(sent) == 2) and sent == [first, second]
+
+
+def test_a_pdf_signed_here_is_read_off_the_main_loop(monkeypatch, tmp_path):
+    import threading
+    import plusone.pdf
+    app, signing, _, _ = make(monkeypatch)
+    read, results = [], []
+    monkeypatch.setattr(plusone.pdf, "digitally_signed", lambda src: read.append(threading.current_thread()) or True)
+    monkeypatch.setattr(signing, "_signed", lambda result, certified=False: results.append((result, certified)))
+    window, path = FakeWindow(str(tmp_path / "form.pdf")), str(tmp_path / "form.pdf")
+    signing.windows.append(window)
+    signing._done(window, path, str(tmp_path / "form-signed.pdf"))
+    assert spin(lambda: results) and results == [(str(tmp_path / "form-signed.pdf"), True)]
+    assert read[0] is not threading.main_thread() and app.held == 0
 
 
 def test_what_is_not_a_pdf_is_said_before_it_goes():

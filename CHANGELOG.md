@@ -82,6 +82,12 @@
   moment and up to 25 s at worst, the fingers, the picture's repairs and
   the measures of the network waited. The pen is made as the desktop
   comes up now, beside them, and again as it shows after a pause.
+- **No freeze while a big PDF is read**: a PDF to sign (up to 256 MB)
+  was read where Plus One does everything else, before it went to the
+  tablet and after it was signed on the PC: meanwhile the window stood
+  still, and Quick Settings and Files had no answer from Plus One. It is
+  read aside now, the PDFs one after the other in the order asked, and
+  Plus One answers meanwhile.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and
