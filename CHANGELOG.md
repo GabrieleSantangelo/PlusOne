@@ -88,6 +88,12 @@
   still, and Quick Settings and Files had no answer from Plus One. It is
   read aside now, the PDFs one after the other in the order asked, and
   Plus One answers meanwhile.
+- **What carries the tablet, shown all along**: when plus-one-link hung up
+  on Plus One's listening for the tablet's news (it does on one it could
+  not tell), the window and Quick Settings showed no path for up to 15 s,
+  the session going on all the while. Plus One listens again at once now
+  while plus-one-link answers, at most once a second, the path shown
+  meanwhile; and what changed in between is shown as it is.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

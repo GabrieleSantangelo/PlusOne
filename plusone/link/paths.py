@@ -4,6 +4,7 @@ its session waits for another path. Told to the window and to GNOME's
 Quick Settings (the app's Title and Detail).
 """
 import threading
+import time
 
 from gi.repository import GLib
 
@@ -19,6 +20,7 @@ NAMES = {"usb": "cable", "lan": "Wi-Fi", "p2p": "Wi-Fi Direct", "wifi-direct": "
          "bt": "Bluetooth", "bluetooth": "Bluetooth", "relay": "the internet"}
 RECONNECTING = "reconnecting…"
 AGAIN = 15.0  # seconds before looking for plus-one-link again, while it is not there
+REWATCH = 1.0  # seconds from one watch to the next at least, while it answers: one hung up at once is no busy loop
 
 
 class Paths:
@@ -31,6 +33,8 @@ class Paths:
         self.on_change = on_change
         self.on_link = on_link or (lambda link: None)  # plus-one-link there (again): told our settings
         self._paths = {}  # device id -> kind, or None (waiting)
+        self._heard = set()  # the devices an event told of since the watch was made
+        self._lock = threading.Lock()  # the events' thread and the watch's: one change at a time
         self._watcher = None
         self._stopped = threading.Event()
         if plusone_link is not None:
@@ -46,6 +50,7 @@ class Paths:
         return None
 
     def _set(self, device, kind, gone=False):
+        """Under _lock."""
         before = dict(self._paths)
         paths = dict(before)
         if gone:
@@ -63,30 +68,57 @@ class Paths:
     def _event(self, event):
         kind = event.get("event")
         device = event.get("device")
-        if not device:
+        if not device or kind not in ("up", "moved", "detached", "gone"):
             return
-        if kind in ("up", "moved"):
-            self._set(device, event.get("path"))
-        elif kind == "detached":
-            self._set(device, None)
-        elif kind == "gone":
-            self._set(device, None, gone=True)
+        with self._lock:
+            self._heard.add(device)
+            if kind in ("up", "moved"):
+                self._set(device, event.get("path"))
+            elif kind == "detached":
+                self._set(device, None)
+            else:
+                self._set(device, None, gone=True)
+
+    def _found(self, devices):
+        """plus-one-link's devices(), asked once the watch was made: the
+        sessions there are now, but for a device an event told of since
+        (the events tell it as it is from then on, whichever came first)."""
+        connected = {device["id"]: device.get("path") for device in devices if device.get("connected")}
+        with self._lock:
+            for device in set(self._paths) | set(connected):
+                if device not in self._heard:
+                    self._set(device, connected.get(device), gone=device not in connected)
+
+    def _answers(self):
+        """Whether plus-one-link is there, and answers (devices())."""
+        try:
+            with plusone_link.Link() as link:
+                link.devices()
+            return True
+        except (OSError, ValueError, plusone_link.LinkError):
+            return False
 
     def _run(self):
-        # While plus-one-link is not there: looked for again now and then
-        # (it may start later, socket-activated or by hand).
+        # Each watch until it ends, no waking meanwhile. plus-one-link still
+        # answering (it shuts a watch it cannot tell an event): watched again
+        # at once, REWATCH after the last at the soonest, the paths shown as
+        # they were meanwhile. Gone, or any failure: no path, and looked for
+        # again each AGAIN (it may start later, socket-activated or by hand).
         while not self._stopped.is_set():
+            since = time.monotonic()
             link = None
+            answers = False
             try:
                 link = plusone_link.Link()
                 self.on_link(link)
+                with self._lock:
+                    self._heard = set()
                 self._watcher = link.watch(self._event)
-                for device in link.devices():
-                    if device.get("connected"):
-                        self._set(device["id"], device.get("path"))
+                self._found(link.devices())
                 link.close()
-                # Until plus-one-link goes (its events' connection ends): no waking meanwhile.
+                # Until plus-one-link hangs up or goes (its events' connection ends).
                 self._watcher.thread.join()
+                answers = not self._stopped.is_set() and self._answers()
             except (OSError, ValueError, plusone_link.LinkError):
                 pass
             except Exception as e:  # noqa: BLE001 - looked for again all the same
@@ -97,9 +129,11 @@ class Paths:
                 if self._watcher is not None:
                     self._watcher.close()
                     self._watcher = None
-                for device in list(self._paths):
-                    self._set(device, None, gone=True)
-            self._stopped.wait(AGAIN)
+                if not answers:
+                    with self._lock:
+                        for device in list(self._paths):
+                            self._set(device, None, gone=True)
+            self._stopped.wait(max(0.0, since + REWATCH - time.monotonic()) if answers else AGAIN)
 
     def stop(self):
         self._stopped.set()
