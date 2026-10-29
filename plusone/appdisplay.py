@@ -165,8 +165,13 @@ class Input:
     def __init__(self, monitor, size, make_pen, clock=time.monotonic):
         self.monitor, self.size, self.make_pen, self.clock = monitor, size, make_pen, clock
         self.scale = scale_for(size)  # the monitor's pixels per desktop pixel
-        self.pen = None
+        self.pen = None       # the pen's device once made (prepare()); False: none to be had
         self.pen_last = None  # the last report, while the pen is in range
+        # The pen made on a thread of its own, let go of on the listening one:
+        # one on its way (its turn: close() makes it an older one's, closed
+        # as it comes), and none made again after close(last=True).
+        self._pen_lock = threading.Lock()
+        self._making, self._turn, self._last = False, 0, False
         self.heard = clock()
         self.gesture = None
         self.fling = None     # [vx, vy, at]: a scroll going on by itself, monitor pixels a second
@@ -214,16 +219,20 @@ class Input:
         if self.pen_last is not None and now - self.heard >= INPUT_SILENCE:
             self._pen(self.pen_last[:1] + b"\x00" + self.pen_last[2:])
 
-    def close(self):
+    def close(self, last=False):
+        """Whatever touches let go of, and the pen's device with it (made
+        again as the pen comes near, or prepare()); last: never again."""
         if self.gesture is not None:
             self._touch({}, lost=True)
         if self.fling is not None:
             self._stop_fling()
         if self.pen_last is not None:
             self._pen(self.pen_last[:1] + b"\x00" + self.pen_last[2:])
-        if self.pen:
-            self.pen.close()
-        self.pen = None
+        with self._pen_lock:
+            device, self.pen = self.pen, None
+            self._making, self._turn, self._last = False, self._turn + 1, self._last or last
+        if device:
+            device.close()
 
     # -- fingers ---------------------------------------------------------------
     def _touch(self, fingers, lost=False):
@@ -375,15 +384,37 @@ class Input:
             self.monitor.keysym(key, False)
 
     # -- the pen ---------------------------------------------------------------
+    def prepare(self):
+        """The pen's device made now, on a thread of its own, unless it is
+        there or on its way: making it takes D-Bus calls and the helper's
+        polkit (up to 25 s), which on the listening thread, at the first
+        stroke, held the fingers, the keyframes and the stats meanwhile."""
+        with self._pen_lock:
+            if self.pen is not None or self._making or self._last:
+                return
+            self._making = True
+            turn = self._turn
+        threading.Thread(target=self._make_pen, args=(turn,), name="plusone-pen", daemon=True).start()
+
+    def _make_pen(self, turn):
+        try:
+            made = self.make_pen()
+        except Exception as e:  # noqa: BLE001 - no pen, the fingers still work
+            log("app display: no pen:", repr(e))
+            made = False
+        with self._pen_lock:
+            if turn == self._turn:
+                self.pen, self._making = made, False
+                return
+        if made:
+            made.close()  # let go of meanwhile (close()): not left open
+
     def _pen(self, report):
-        if self.pen is None:
-            try:
-                self.pen = self.make_pen()
-            except Exception as e:  # noqa: BLE001 - no pen, the fingers still work
-                log("app display: no pen:", repr(e))
-                self.pen = False
-        if self.pen:
-            self.pen.report(report)
+        device = self.pen
+        if device:
+            device.report(report)
+        elif device is None and report[1] & pen.IN_RANGE:
+            self.prepare()  # let go of since (hidden, the seat's): made again, not waited for
         pen.feed.publish(report)  # the signing window draws with them as they come
         self.pen_last = report if report[1] & pen.IN_RANGE else None
 
@@ -701,7 +732,7 @@ class AppStreamer:
         self._running = False
         self._feedback.join(timeout=2)
         if self.input:
-            self.input.close()
+            self.input.close(last=True)
         self.pipeline.set_state(Gst.State.NULL)
         self._sink.disconnect(self._handler)
         bus = self.pipeline.get_bus()
@@ -752,6 +783,10 @@ class AppStreamer:
         payload = getattr(self.channel, "payload", PAYLOAD)
         count = -(-len(data) // payload)
         number = self._frame = self._frame + 1
+        if number == 1 and self.input is not None:
+            # The monitor is Mutter's now (the pen is mapped onto it): the
+            # pen made ahead of the first stroke, not on the listening thread.
+            self.input.prepare()
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
             self.channel.send(header + data[index * payload:(index + 1) * payload])
@@ -814,6 +849,8 @@ class AppStreamer:
         if not shown and self.input:
             self.input.close()  # nothing left touching
         if shown:
+            if self.input and self._frame:
+                self.input.prepare()  # the pen let go of with the rest: ready again before it comes
             self.force_keyframe()
         self.on_visible(shown)
 
@@ -822,7 +859,9 @@ class AppStreamer:
         dropped, not queued, and the listening thread lets go of whatever
         touches; inactive (another user's session in front), nothing is
         captured either."""
-        self.gated = closed
+        was, self.gated = self.gated, closed
+        if was and not closed and self.input and self._frame:
+            self.input.prepare()  # the pen let go of with the rest: ready again before it comes
         with self._state_lock:
             if active == self.active:
                 return

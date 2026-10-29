@@ -76,6 +76,12 @@
   the cable plugged in, the tablet's speakers never came. A session with
   the tablet over the link counts too now, the cable's as the Wi-Fi's:
   the speakers come with it and go with it.
+- **The pen's first stroke no longer holds the desktop up**: the PC made
+  the tablet's pen (a pen tablet with pressure, through the pen helper)
+  at its first stroke, on the thread that takes the fingers: meanwhile, a
+  moment and up to 25 s at worst, the fingers, the picture's repairs and
+  the measures of the network waited. The pen is made as the desktop
+  comes up now, beside them, and again as it shows after a pause.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

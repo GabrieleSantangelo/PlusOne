@@ -1,8 +1,10 @@
 """The app display's packets: their layout, sealed both ways, replays refused."""
+import collections
 import json
 import socket
 import struct
 import threading
+import time
 import types
 
 import pytest
@@ -286,6 +288,77 @@ def test_the_listener_looks_often_only_while_something_touches():
     assert touch.busy()  # a tap, a drag or a hold: time tells
     touch.packet(fingers())
     assert not touch.busy()
+
+
+def soon(condition, timeout=5):
+    end = time.monotonic() + timeout
+    while not condition() and time.monotonic() < end:
+        time.sleep(0.005)
+    return condition()
+
+
+def pen_near(bits=appdisplay.pen.IN_RANGE):
+    """An INPUT packet with no finger and one sample of the pen."""
+    return bytes([appdisplay.INPUT, 0, 1, bits]) + struct.pack("<HHHbb", 16000, 16000, 0, 0, 0)
+
+
+def test_the_pen_is_made_off_the_listening_thread():
+    # Making the pen (D-Bus, the helper's polkit) takes up to 25 s: the
+    # listening thread, which carries the fingers, keyframes and stats,
+    # never waits for it; the pen's reports reach it once it is there.
+    makers, go, reports = [], threading.Event(), []
+    device = types.SimpleNamespace(report=reports.append, close=lambda: None)
+    touch = appdisplay.Input(FakeMonitor(), (1000, 1000),
+                             lambda: makers.append(threading.current_thread()) or go.wait(5) and device)
+    listening = threading.Thread(target=lambda: (touch.packet(pen_near()), touch.packet(fingers((0, 0.5, 0.5)))))
+    listening.start()
+    listening.join(1)
+    held = listening.is_alive()
+    go.set()
+    listening.join(5)
+    assert not held and makers and makers[0] is not listening
+    assert soon(lambda: touch.pen is device)
+    touch.packet(pen_near(appdisplay.pen.IN_RANGE | appdisplay.pen.TIP))
+    assert len(reports) == 1
+
+
+def test_the_pen_is_made_as_the_desktop_comes_up():
+    # Ahead of the first stroke: as the first frame goes (the monitor is
+    # Mutter's then, to map the pen onto), and as the desktop is shown or
+    # may be touched again (the pen let go of with the rest meanwhile).
+    prepared = []
+    buffer = types.SimpleNamespace(get_size=lambda: 3, extract_dup=lambda at, size: b"abc",
+                                   has_flags=lambda flags: False)
+    sink = types.SimpleNamespace(emit=lambda signal: types.SimpleNamespace(get_buffer=lambda: buffer))
+    streamer = types.SimpleNamespace(_captured=collections.deque(), channel=types.SimpleNamespace(send=lambda d: None),
+                                     _frame=0, _encoded=[], _state_lock=threading.Lock(), shown=True, active=True,
+                                     gated=False, _capture=lambda: None, force_keyframe=lambda: None,
+                                     on_visible=lambda shown: None,
+                                     input=types.SimpleNamespace(prepare=lambda: prepared.append(1),
+                                                                 close=lambda: None))
+    for _ in range(3):
+        appdisplay.AppStreamer._send(streamer, sink)
+    assert prepared == [1]
+    appdisplay.AppStreamer.visible(streamer, False)
+    appdisplay.AppStreamer.visible(streamer, True)
+    assert prepared == [1, 1]
+    appdisplay.AppStreamer.gate(streamer, True)
+    appdisplay.AppStreamer.gate(streamer, False)
+    assert prepared == [1, 1, 1]
+
+
+def test_a_pen_made_once_the_desktop_ended_is_closed():
+    go, made, closed = threading.Event(), [], []
+    device = types.SimpleNamespace(report=lambda report: None, close=lambda: closed.append(1))
+    touch = appdisplay.Input(FakeMonitor(), (1000, 1000), lambda: made.append(1) or go.wait(5) and device)
+    touch.prepare()
+    touch.close(last=True)  # the desktop ended while it was made
+    go.set()
+    assert soon(lambda: closed == [1])
+    touch.prepare()
+    touch.packet(pen_near())  # none made again
+    time.sleep(0.05)
+    assert made == [1] and touch.pen is None
 
 
 def test_sizes_keep_the_tablet_s_proportions():
