@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import types
 
@@ -173,6 +174,82 @@ def test_locked_the_tablet_s_input_is_dropped_and_what_touches_let_go():
     listen(streamer, [touch])
     assert streamer.input.packets == [touch, touch]
 
+
+
+class FakePipeline:
+    """The states asked of it, in order; one thread's set_state held, if told."""
+
+    def __init__(self):
+        self.states, self.hold = [], None
+
+    def set_state(self, state):
+        if self.hold and threading.current_thread().name == self.hold[0]:
+            _name, reached, go = self.hold
+            reached.set()
+            go.wait(5)
+        self.states.append(state)
+
+
+class WatchedLock:
+    """A lock that says which threads asked for it."""
+
+    def __init__(self):
+        self.lock, self.asked = threading.Lock(), []
+
+    def __enter__(self):
+        self.asked.append(threading.current_thread().name)
+        self.lock.acquire()
+
+    def __exit__(self, *exc):
+        self.lock.release()
+
+
+def streamer_of(pipeline, shown=True):
+    streamer = appdisplay.AppStreamer.__new__(appdisplay.AppStreamer)
+    streamer.pipeline, streamer.shown, streamer.input = pipeline, shown, None
+    streamer.gated, streamer.active, streamer._let_go = False, True, False
+    streamer._state_lock = WatchedLock()
+    streamer.on_visible = streamer.force_keyframe = lambda *args: None
+    return streamer
+
+
+def test_the_desktop_shown_again_as_another_user_comes_in_front_is_not_captured():
+    # The app shows the desktop again (listening thread) as the seat goes
+    # to another user's session (main loop): visible() read the seat still
+    # active, gate() paused, then visible()'s PLAYING came after it.
+    pipeline = FakePipeline()
+    streamer = streamer_of(pipeline, shown=False)
+    reached, go, gated = threading.Event(), threading.Event(), threading.Event()
+    pipeline.hold = ("listening", reached, go)
+    shown = threading.Thread(target=streamer.visible, args=(True,), name="listening")
+    shown.start()
+    assert reached.wait(5)  # PLAYING decided, the seat active
+    seat = threading.Thread(target=lambda: (streamer.gate(True, active=False), gated.set()), name="main")
+    seat.start()
+    deadline = time.monotonic() + 5
+    while not (gated.is_set() or "main" in streamer._state_lock.asked):  # done, or waiting its turn
+        assert time.monotonic() < deadline, "never"
+        time.sleep(0.005)
+    go.set()
+    shown.join(5)
+    seat.join(5)
+    assert streamer.shown and not streamer.active
+    assert pipeline.states[-1] == appdisplay.Gst.State.PAUSED
+
+
+def test_a_stream_started_with_another_user_in_front_captures_nothing():
+    pipeline = FakePipeline()
+    streamer = streamer_of(pipeline)
+    streamer._feedback, streamer.channel = types.SimpleNamespace(start=lambda: None), types.SimpleNamespace()
+    streamer.gate(True, active=False)  # AppDisplay._stream: the seat's say, then start()
+    streamer.start()
+    assert pipeline.states[-1] == appdisplay.Gst.State.PAUSED
+    streamer.gate(False, active=True)
+    assert pipeline.states[-1] == appdisplay.Gst.State.PLAYING
+    streamer.visible(False)
+    streamer.gate(True, active=False)
+    streamer.gate(False, active=True)  # the seat back, the app still elsewhere
+    assert pipeline.states[-1] == appdisplay.Gst.State.PAUSED
 
 class FakeDevice(devices.Device):
     def __init__(self):

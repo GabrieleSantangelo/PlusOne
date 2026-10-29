@@ -17,6 +17,12 @@
   and once Bluetooth went off the PC found no Plus One on the tablet until
   the app started again; it now listens each time Bluetooth comes back on,
   and as soon as the app is allowed Bluetooth.
+- **No capture while another user is at the PC**: the desktop is
+  captured for the tablet only while your session is the one in front.
+  If the tablet came back to the desktop just as the PC switched to
+  another user's session, or the desktop started on the tablet while
+  another user's was in front, the capture went on; it now stays paused,
+  whichever comes first.
 - **The pen stops when the PC switches user**: the tablet's pen, once
   given, lasted as long as the program that asked for it, and after a
   switch to another user's session that program could still click in

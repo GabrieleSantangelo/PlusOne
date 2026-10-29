@@ -615,6 +615,9 @@ class AppStreamer:
         # seat.py: closed, the app's input reaches nothing (and what touches
         # is let go); inactive, nothing is captured either.
         self.gated, self.active, self._let_go = False, True, False
+        # visible() on the listening thread, gate() on the main loop: each
+        # one's flag, read by the other, and the state they make together.
+        self._state_lock = threading.Lock()
         if source == "test":
             video = (f"videotestsrc is-live=true pattern=ball ! "
                      f"video/x-raw,format={media.CAPTURE_FORMAT},width={width},height={height},"
@@ -672,7 +675,8 @@ class AppStreamer:
         log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {to}")
 
     def start(self):
-        self.pipeline.set_state(Gst.State.PLAYING)
+        with self._state_lock:
+            self._capture()  # gate() may have come first: another user's session in front
         self._feedback.start()
         if hasattr(self.channel, "watch_budget"):
             self.channel.watch_budget(self._budget)
@@ -802,12 +806,13 @@ class AppStreamer:
     def visible(self, shown):
         """The app shows the desktop, or not: nothing is captured or encoded
         while it does not (Mutter's monitor stays, windows and all)."""
-        if shown == self.shown:
-            return
-        self.shown = shown
+        with self._state_lock:
+            if shown == self.shown:
+                return
+            self.shown = shown
+            self._capture()
         if not shown and self.input:
             self.input.close()  # nothing left touching
-        self.pipeline.set_state(Gst.State.PLAYING if shown and self.active else Gst.State.PAUSED)
         if shown:
             self.force_keyframe()
         self.on_visible(shown)
@@ -818,11 +823,19 @@ class AppStreamer:
         touches; inactive (another user's session in front), nothing is
         captured either."""
         self.gated = closed
-        if active != self.active:
+        with self._state_lock:
+            if active == self.active:
+                return
             self.active = active
-            self.pipeline.set_state(Gst.State.PLAYING if self.shown and active else Gst.State.PAUSED)
-            if active and self.shown:
-                self.force_keyframe()
+            self._capture()
+            resumed = active and self.shown
+        if resumed:
+            self.force_keyframe()
+
+    def _capture(self):
+        """Under _state_lock: captured only while the app shows the desktop
+        and the seat is ours, whichever of the two changed last."""
+        self.pipeline.set_state(Gst.State.PLAYING if self.shown and self.active else Gst.State.PAUSED)
 
     def force_keyframe(self):
         # Not again before the last one can have come: a round trip, and its
