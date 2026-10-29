@@ -16,29 +16,33 @@ import io.github.gabrielesantangelo.plusone.link.Packets
  * the link's budget is low the same packets come in Opus (OpusDecoder),
  * decoded as they come: from there on all is the same.
  *
- * PREFILL packets wait before it starts, against the Wi-Fi's unevenness. The
+ * PREFILL_MS of sound waits before it starts, against the Wi-Fi's unevenness. The
  * two clocks drift apart (the PC's and the tablet's sound chip, tens of parts
  * per million): the playback rate follows by at most RATE_TRIM, which no ear
  * hears, so the wait neither grows nor runs dry. A packet that does not come
  * is the last one backwards, fading out (one, then silence), keeping time;
- * more than MAX_HOLE missing, the sound is taken up where it is now.
+ * more than MAX_HOLE_MS missing, the sound is taken up where it is now.
  *
  * No gap heard is worth more than a few ms less. The Wi-Fi stalling, then
  * handing over what it held at once, grew the wait by as much, every time
  * (up to a second behind, measured on a weak 2.4 GHz network). Now a stall
  * makes the wait a cushion as long as what it held back, and a little more
- * (target, up to MAX_TARGET), so the next one like it is bridged (measured:
+ * (target, up to MAX_TARGET_MS), so the next one like it is bridged (measured:
  * a 150 ms stall after a 200 ms one, no gap); only what came later than
  * that is left out, as the sound starts again (the track ran dry: the gap
  * was heard already, nothing more is). After a gap the sound starts again
  * with the wait full, not with the first packet back. Once the Wi-Fi is calm the wait
- * goes back to PREFILL where nobody hears it: a packet nearly silent left
- * out (a silence 5 ms shorter), the rate up to RATE_FAST. Only far over the
+ * goes back to PREFILL_MS where nobody hears it: a packet nearly silent left
+ * out (a silence a packet shorter), the rate up to RATE_FAST. Only far over the
  * cushion for a whole second is the excess skipped, faded out and in. After
  * any gap (the track played out, a packet lost) the sound fades in: no click.
+ *
+ * Its thresholds are lengths of sound, counted in the session's packets
+ * (Counts): 5 ms of PCM each now, an Opus packet's may be 20 ms.
  */
 class PcmPlayback(private val datagrams: Packets, private val rate: Int, private val frames: Int) {
     private val bytes = frames * CHANNELS * 2
+    private val counts = Counts(rate, frames)
     private val packets = HashMap<Int, ByteArray>()  // by number, under the lock
     private val lock = Object()
     @Volatile private var running = true
@@ -53,10 +57,10 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
     private var burstAt = 0L
     private var burst = 0
     private var underrunsSeen = 0  // the track's underruns the player knows of
-    private var held = PREFILL.toDouble()  // packets waiting, smoothed
+    private var held = counts.prefill.toDouble()  // packets waiting, smoothed
     // The player's thread's: the cushion a stall asked for, and what the wait is brought to.
-    private var target = PREFILL
-    private var aim = PREFILL
+    private var target = counts.prefill
+    private var aim = counts.prefill
     private var underrunsBefore = 0  // the track's count at the last report
     private var lastStall = -CALM_MS  // uptime ms of the last stall that held packets back
     private val track = AudioTrack.Builder()
@@ -141,7 +145,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
             }
             // Full (the Wi-Fi held back more than a second): the oldest
             // go, they are the most out of date.
-            if (packets.size >= MAX_HELD) {
+            if (packets.size >= counts.maxHeld) {
                 packets.remove(oldest())
                 late++
             }
@@ -168,8 +172,8 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
         while (running) {
             val data: ByteArray = synchronized(lock) {
                 if (!started) {
-                    // The first packets: wait for PREFILL of them, from the oldest.
-                    while (running && packets.size < PREFILL) lock.wait()  // stop() wakes it too
+                    // The first packets: wait for the prefill of them, from the oldest.
+                    while (running && packets.size < counts.prefill) lock.wait()  // stop() wakes it too
                     if (!running) return
                     next = oldest()
                     held = packets.size.toDouble()
@@ -225,7 +229,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
                     // so the wait stays as it is), unless so many are missing
                     // that the sound is better taken up where it is now.
                     val first = oldest()
-                    if (first - next > MAX_HOLE) {
+                    if (first - next > counts.maxHole) {
                         missed += first - next
                         next = first
                         got = packets.remove(next)
@@ -233,9 +237,9 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
                     }
                 }
                 next++
-                held = held * 0.99 + packets.size * 0.01
-                over = if (packets.size > minOf(target + OVER, MAX_TARGET + SLACK)) over + 1 else 0
-                if (got != null && (skip || over >= OVER_FOR)) {
+                held = held * (1 - counts.smoothing) + packets.size * counts.smoothing
+                over = if (packets.size > minOf(target + counts.over, counts.maxTarget + counts.slack)) over + 1 else 0
+                if (got != null && (skip || over >= counts.overFor)) {
                     // What the Wi-Fi held back is late (or far over the cushion
                     // for a second, no stall seen): back to the cushion now,
                     // this packet faded out, the next faded in.
@@ -246,7 +250,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
                     concealed = true  // faded out to silence: a packet lost next stays silent
                     return@synchronized fadeOut(got)
                 }
-                if (got != null && held > aim + SLACK && packets.size > aim && quiet(got)) {
+                if (got != null && held > aim + counts.slack && packets.size > aim && quiet(got)) {
                     dropped++
                     return@synchronized null  // the wait too long: a silence a packet shorter
                 }
@@ -260,7 +264,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
             last = data
             track.write(data, 0, data.size)
             written += frames
-            if (++played % TRIM_EVERY == 0) trim()
+            if (++played % counts.trimEvery == 0) trim()
         }
     }
 
@@ -271,12 +275,12 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
      * stall was as long as it held back. The cushion grows to bridge the
      * next one like it; whether more waits than that, which is late now. */
     private fun stalled(): Boolean {
-        if (burst <= BURST_PACKETS || SystemClock.uptimeMillis() - burstAt <= BURST_MS) return false
-        target = maxOf(target, minOf(MAX_TARGET, burst + SLACK))
+        if (burst <= counts.burst || SystemClock.uptimeMillis() - burstAt <= BURST_MS) return false
+        target = maxOf(target, minOf(counts.maxTarget, burst + counts.slack))
         aim = target
         lastStall = SystemClock.uptimeMillis()
         burst = 0
-        return packets.size > target + SLACK
+        return packets.size > target + counts.slack
     }
 
     /** The oldest packets left out (counted late), but the newest n (under the lock). */
@@ -291,12 +295,12 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
     }
 
     /** The playback rate, a hair faster while more than the aim waits,
-     * slower while less. Once the Wi-Fi is calm the aim is PREFILL again,
+     * slower while less. Once the Wi-Fi is calm the aim is the prefill again,
      * and the cushion follows the wait down as it gets there. */
     private fun trim() {
         if (SystemClock.uptimeMillis() - lastStall > CALM_MS) {
-            target = maxOf(PREFILL, minOf(target, kotlin.math.ceil(held).toInt()))
-            aim = PREFILL
+            target = maxOf(counts.prefill, minOf(target, kotlin.math.ceil(held).toInt()))
+            aim = counts.prefill
         } else {
             aim = target
         }
@@ -373,27 +377,49 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
         return out
     }
 
+    /** The thresholds, in packets of frames at rate: as much sound whatever
+     * a packet's length, one packet at least. */
+    class Counts(rate: Int, frames: Int) {
+        private val packetMs = frames * 1000.0 / rate
+
+        private fun packets(ms: Int) = maxOf(1, kotlin.math.round(ms / packetMs).toInt())
+
+        val prefill = packets(PREFILL_MS)
+        val maxHeld = packets(MAX_HELD_MS)
+        val burst = packets(BURST_SOUND_MS)
+        val maxHole = packets(MAX_HOLE_MS)
+        val trimEvery = packets(TRIM_EVERY_MS)
+        val slack = packets(SLACK_MS)
+        val maxTarget = packets(MAX_TARGET_MS)
+        val over = packets(OVER_MS)
+        val overFor = packets(OVER_FOR_MS)
+        /** The weight of each packet in the smoothed wait. */
+        val smoothing = minOf(1.0, packetMs / HELD_SMOOTHING_MS)
+    }
+
     companion object {
         const val PCM: Byte = 7
         const val OPUS: Byte = 8
         const val STATS: Byte = 5
         const val CHANNELS = 2
-        const val PREFILL = 8         // packets of 5 ms: 40 ms
-        const val MAX_HELD = 200      // a second: more is a stuck clock, not jitter
+        // Lengths of sound (ms), counted in packets as they come (Counts).
+        const val PREFILL_MS = 40
+        const val MAX_HELD_MS = 1000     // more is a stuck clock, not jitter
         const val WAIT_MS = 30L
-        const val STALL_MS = 30L      // nothing came for this long, then...
-        const val BURST_MS = 20L      // ...in this long...
-        const val BURST_PACKETS = 12  // ...far more than come in it anyway (the PC sends a few at a time): held back
-        const val MAX_HOLE = 40       // packets missing that are stood in for (200 ms); more: a jump
-        const val STOPPED_MS = 300L   // nothing for this long more: the PC stopped
-        const val TRIM_EVERY = 200    // packets: once a second
-        const val RATE_TRIM = 0.002   // at most 0.2 %
-        const val RATE_FAST = 0.01    // far over the aim (twice it): 1 %, for seconds
-        const val SLACK = 4           // packets over the aim before quiet ones are left out
-        const val MAX_TARGET = 40     // packets: the longest cushion, 200 ms
-        const val CALM_MS = 10_000L   // no stall for this long: the wait comes back down
-        const val OVER = 20           // packets over the cushion that are far over it...
-        const val OVER_FOR = 200      // ...for this many packets (a second): skipped
-        const val QUIET = 330         // of 32767: -40 dBFS
+        const val STALL_MS = 30L         // nothing came for this long, then...
+        const val BURST_MS = 20L         // ...in this long...
+        const val BURST_SOUND_MS = 60    // ...far more than comes in it anyway (the PC sends a few at a time): held back
+        const val MAX_HOLE_MS = 200      // missing, stood in for; more: a jump
+        const val STOPPED_MS = 300L      // nothing for this long more: the PC stopped
+        const val TRIM_EVERY_MS = 1000
+        const val RATE_TRIM = 0.002      // at most 0.2 %
+        const val RATE_FAST = 0.01       // far over the aim (twice it): 1 %, for seconds
+        const val SLACK_MS = 20          // over the aim before quiet packets are left out
+        const val MAX_TARGET_MS = 200    // the longest cushion
+        const val CALM_MS = 10_000L      // no stall for this long: the wait comes back down
+        const val OVER_MS = 100          // over the cushion: far over it...
+        const val OVER_FOR_MS = 1000     // ...for this long: skipped
+        const val HELD_SMOOTHING_MS = 500.0  // the wait smoothed over about this long
+        const val QUIET = 330            // of 32767: -40 dBFS
     }
 }
