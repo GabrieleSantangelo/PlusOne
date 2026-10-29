@@ -848,6 +848,121 @@ fn a_session_by_quic_alone() {
     assert!(rate > 0);
 }
 
+/// A UDP relay to the tablet's QUIC port that passes each packet on with
+/// its traffic class byte (DSCP and ECN) as it came, and notes it: (from
+/// the PC, the byte). Its address, and the notes.
+fn tos_relay(tablet: SocketAddr) -> (SocketAddr, Arc<std::sync::Mutex<Vec<(bool, u8)>>>) {
+    use std::os::fd::AsRawFd;
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    assert!(plusone_link::sys::set_int(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_RECVTOS, 1));
+    socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let address = socket.local_addr().unwrap();
+    let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let noting = Arc::downgrade(&notes);
+    std::thread::spawn(move || {
+        let (mut buf, mut control) = (vec![0u8; 65536], [0u64; 16]);
+        let (mut pc, mut sending) = (None, -1);
+        while let Some(notes) = noting.upgrade() {
+            let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut from as *mut libc::sockaddr_in as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
+            let length = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
+            if length < 0 {
+                continue;  // the timeout: the test over?
+            }
+            let mut tos = None;
+            let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+            while !cmsg.is_null() {
+                if unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) } == (libc::IPPROTO_IP, libc::IP_TOS) {
+                    tos = Some(unsafe { *libc::CMSG_DATA(cmsg) });
+                }
+                cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+            }
+            let tos = tos.expect("no traffic class told");
+            let from = SocketAddr::from((u32::from_be(from.sin_addr.s_addr).to_be_bytes(), u16::from_be(from.sin_port)));
+            let from_pc = from != tablet;
+            if from_pc {
+                pc = Some(from);
+            }
+            let Some(to) = (if from_pc { Some(tablet) } else { pc }) else { continue };
+            notes.lock().unwrap().push((from_pc, tos));
+            if sending != tos as libc::c_int {
+                sending = tos as libc::c_int;
+                plusone_link::sys::set_int(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS, sending);
+            }
+            let _ = socket.send_to(&buf[..length as usize], to);
+        }
+    });
+    (address, notes)
+}
+
+#[test]
+fn realtime_on_quic_goes_as_video_the_rest_not() {
+    // AF41 (DSCP 34) once realtime goes, either way: the PC's packets and
+    // the tablet's, QUIC's ECN bits kept; before it, DSCP 0. (All went DSCP
+    // 0: quinn-udp's ECN alone overrode the socket's.)
+    let (pc, tablet, _address) = pair();
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (relay, notes) = tos_relay(quic);
+    let session = pc.connect_quic(relay, Duration::from_secs(2), "lan").unwrap();
+    let control = session.open("echo", "c", Class::Control).unwrap();
+    let mut buf = vec![0u8; 1 << 17];
+    let mut control_both_ways = || {
+        for _ in 0..20 {
+            control.send(&[1u8; 4000]).unwrap();
+            assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(4000));
+        }
+    };
+    control_both_ways();
+    let not_video = |what: &str| {
+        let notes = std::mem::take(&mut *notes.lock().unwrap());
+        assert!(notes.len() > 20, "{what}: {} packets", notes.len());
+        assert!(notes.iter().all(|&(_, tos)| tos >> 2 == 0), "{what}: {notes:?}");
+    };
+    not_video("before realtime");
+
+    let realtime = session.open("echo", "video", Class::Realtime).unwrap();
+    let started = Instant::now();
+    while session.rtt().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(5), "datagrams never proven");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut buf = vec![0u8; 2048];
+    for i in 0..300u32 {
+        let mut packet = vec![0u8; 1000];
+        packet[..4].copy_from_slice(&i.to_be_bytes());
+        realtime.send(&packet).unwrap();
+        let _ = realtime.recv(&mut buf, Some(Duration::from_millis(200))).unwrap();
+    }
+    let notes_now = std::mem::take(&mut *notes.lock().unwrap());
+    for from_pc in [true, false] {
+        let video = notes_now.iter().filter(|&&(pc, tos)| pc == from_pc && tos >> 2 == 34).count();
+        let ect0 = notes_now.iter().filter(|&&(pc, tos)| pc == from_pc && tos == 34 << 2 | 0b10).count();
+        assert!(video >= 250, "from the PC {from_pc}: {video} of {} packets AF41", notes_now.len());
+        assert!(ect0 > 0, "from the PC {from_pc}: AF41 never with ECT(0)");
+    }
+    assert!(notes_now.iter().all(|&(_, tos)| [0, 34].contains(&(tos >> 2))), "{notes_now:?}");
+
+    // A pause in realtime (a second, as between pen strokes): still AF41
+    // both ways, nothing switched back and forth (dscp.rs MARKED_FOR, 10 s;
+    // the switch off is its unit tests').
+    std::thread::sleep(Duration::from_millis(1000));
+    notes.lock().unwrap().clear();
+    control_both_ways();
+    let notes = std::mem::take(&mut *notes.lock().unwrap());
+    assert!(notes.len() > 20, "after a pause: {} packets", notes.len());
+    for from_pc in [true, false] {
+        assert!(notes.iter().any(|&(pc, _)| pc == from_pc), "after a pause: none from the PC {from_pc}");
+    }
+    assert!(notes.iter().all(|&(_, tos)| tos >> 2 == 34), "after a pause: {notes:?}");
+}
+
 /// A stream at about 100 KB/s, as Bluetooth goes: the PC's end and the
 /// session on it.
 fn slow_session() -> (Node, Node, Arc<plusone_link::Session>) {

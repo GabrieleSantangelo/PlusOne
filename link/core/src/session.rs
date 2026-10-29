@@ -91,8 +91,6 @@ const DRAIN_LEAST: f64 = 1000.0;
 /// Reliable frames handed to TLS at a time: an urgent frame (input,
 /// realtime, a ping) queued meanwhile waits behind no more than this.
 const WRITE_SLICE: usize = 16 << 10;
-/// The datagrams' DSCP, AF41 (34), as the IP header's byte.
-const REALTIME_TOS: libc::c_int = 34 << 2;
 /// Room in the UDP socket, each way: a keyframe's packets at once.
 const UDP_BUFFER: libc::c_int = 4 << 20;
 /// Room in a channel's socket, each way (the system caps it: a control
@@ -804,10 +802,11 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
             // Input and realtime ahead of the stream's bulk on the air: DSCP
             // AF41, which Wi-Fi puts in its video queue (WMM AC_VI, RFC
             // 8325); the stream stays best effort.
+            let tos = crate::dscp::REALTIME_TOS.into();
             if local.is_ipv4() {
-                sys::set_int(udp.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS, REALTIME_TOS);
+                sys::set_int(udp.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS, tos);
             } else {
-                sys::set_int(udp.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS, REALTIME_TOS);
+                sys::set_int(udp.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS, tos);
             }
             // As much as the system allows (net.core.wmem_max, rmem_max).
             sys::set_int(udp.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, UDP_BUFFER);
@@ -1858,6 +1857,9 @@ impl Session {
         let current = self.current();
         if let Some(path) = &current {
             path.realtime_us.store(path.us().max(1), Ordering::Relaxed);
+            if let Some(quic) = &path.quic {
+                quic.realtime();
+            }
         }
         match current {
             Some(path) if path.udp_works() => self.send_datagram_now(&path, channel, body, sealed),
@@ -1923,6 +1925,11 @@ impl Session {
             }
         }
         if channel != DATAGRAM_PATH {
+            // Realtime coming: what goes back (QUIC's acknowledgements, which
+            // the other side's controller times) as video too.
+            if let Some(quic) = &path.quic {
+                quic.realtime();
+            }
             self.deliver(channel, body, false, Some(count));
         } else if body.len() == 9 && body[0] == PING {
             let mut pong = body.to_vec();

@@ -55,7 +55,7 @@ pub(crate) struct NodeInner {
     /// Who may start a handshake, by TCP or QUIC (gate.rs).
     gate: Arc<crate::gate::Gate>,
     /// QUIC's endpoint: the listening one, or one to dial from.
-    quic: Mutex<Option<quinn::Endpoint>>,
+    quic: Mutex<Option<crate::quic::Endpoint>>,
     /// Where we take QUIC (0: we do not), said in our hello.
     quic_port: std::sync::atomic::AtomicU16,
     /// Our TCP paths to a device that takes QUIC move to it (upgrade_to_quic).
@@ -169,7 +169,7 @@ impl NodeInner {
     }
 
     /// The endpoint QUIC dials from: the listening one, else one of its own.
-    fn quic_endpoint(&self) -> std::io::Result<quinn::Endpoint> {
+    fn quic_endpoint(&self) -> std::io::Result<crate::quic::Endpoint> {
         let mut quic = self.quic.lock().unwrap();
         if let Some(endpoint) = quic.as_ref() {
             return Ok(endpoint.clone());
@@ -411,7 +411,7 @@ impl Node {
             crate::sys::shutdown(listener.as_raw_fd());
         }
         if let Some(endpoint) = self.0.quic.lock().unwrap().take() {
-            endpoint.close(0u32.into(), b"closed");
+            endpoint.close();
         }
         let sessions: Vec<Arc<Session>> = self.0.sessions.lock().unwrap().values().cloned().collect();
         for session in sessions {

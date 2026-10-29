@@ -9,12 +9,15 @@
 //! dropped, not queued. The identities are the TCP path's (the same rustls
 //! configs, pinned both ways). For now the session's own TLS still runs
 //! inside the stream (sealed twice); a later step leaves it to QUIC's.
+//! The endpoint's socket is ours (dscp.rs): its packets go as video
+//! (AF41) while realtime goes, either way.
 
 use crate::log;
 use bytes::Bytes;
-use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, ServerConfig,
+use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, EndpointConfig, ServerConfig,
             TransportConfig};
 use crate::cc::{Budget, GccConfig};
+use crate::dscp::Marking;
 use crate::gate::Gate;
 use std::io;
 use std::net::SocketAddr;
@@ -111,6 +114,8 @@ pub struct Quic {
     /// bytes aside, and 32 a datagram waiting; empty, it read 32 bytes still
     /// to send, and the desktop's wait for none never ended.
     idle: usize,
+    /// Its endpoint's (dscp.rs).
+    marking: Arc<Marking>,
 }
 
 impl Quic {
@@ -129,6 +134,12 @@ impl Quic {
             self.realtime.fetch_add(sealed.len() as u64, Ordering::Relaxed);
         }
         sent
+    }
+
+    /// Realtime went on it now, either way (input too): the endpoint's
+    /// packets go as video (AF41) for a while (dscp.rs).
+    pub(crate) fn realtime(&self) {
+        self.marking.realtime();
     }
 
     /// The datagrams handed to quinn and not sent yet (bytes).
@@ -187,6 +198,23 @@ fn server_config(crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>) -> (Serv
     (config, cc)
 }
 
+/// A QUIC endpoint: quinn's, on our socket, and that socket's marking.
+#[derive(Clone)]
+pub(crate) struct Endpoint {
+    quinn: quinn::Endpoint,
+    marking: Arc<Marking>,
+}
+
+impl Endpoint {
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.quinn.local_addr()
+    }
+
+    pub(crate) fn close(&self) {
+        self.quinn.close(0u32.into(), b"closed");
+    }
+}
+
 /// An endpoint bound to address (port 0: any): it dials, and with server
 /// configs it is dialed too.
 pub(crate) fn endpoint(address: SocketAddr, server: Option<&Arc<rustls::ServerConfig>>) -> io::Result<Endpoint> {
@@ -200,7 +228,10 @@ pub(crate) fn endpoint(address: SocketAddr, server: Option<&Arc<rustls::ServerCo
     let mut config = EndpointConfig::default();
     config.cid_generator(move || Box::new(MacCids(key.clone())));
     let _entered = runtime().enter();
-    Endpoint::new(config, server, socket, Arc::new(quinn::TokioRuntime))
+    let marking = Arc::new(Marking::new());
+    let socket = Arc::new(crate::dscp::Socket::new(socket, marking.clone())?);
+    let quinn = quinn::Endpoint::new_with_abstract_socket(config, server, socket, Arc::new(quinn::TokioRuntime))?;
+    Ok(Endpoint { quinn, marking })
 }
 
 /// Connection IDs that carry a MAC under a key of the endpoint's
@@ -253,7 +284,7 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
                    -> Result<(UnixStream, Quic), String> {
     let (config, cc) = client_config(client)?;
     runtime().block_on(async {
-        let connecting = endpoint.connect_with(config, address, "plus-one.invalid").map_err(|e| e.to_string())?;
+        let connecting = endpoint.quinn.connect_with(config, address, "plus-one.invalid").map_err(|e| e.to_string())?;
         let conn = tokio::time::timeout(timeout, connecting).await.map_err(|_| "no answer".to_owned())?
             .map_err(|e| e.to_string())?;
         // The other side sees the stream once something goes on it: the
@@ -262,7 +293,7 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
         let realtime: Arc<AtomicU64> = Arc::default();
         let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
         let idle = conn.datagram_send_buffer_space();
-        Ok((stream, Quic { conn, cc, realtime, idle }))
+        Ok((stream, Quic { conn, cc, realtime, idle, marking: endpoint.marking.clone() }))
     })
 }
 
@@ -278,7 +309,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
         Err(e) => return log!("QUIC: {e}"),
     };
     runtime().spawn(async move {
-        while let Some(incoming) = endpoint.accept().await {
+        while let Some(incoming) = endpoint.quinn.accept().await {
             if gate.running() >= RETRY_OVER && !incoming.remote_address_validated() && incoming.may_retry() {
                 let _ = incoming.retry();
                 continue;
@@ -289,6 +320,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
             };
             let (config, cc) = server_config(&crypto);
             let on = on.clone();
+            let marking = endpoint.marking.clone();
             tokio::spawn(async move {
                 let from = incoming.remote_address();
                 let accepted = async {
@@ -298,7 +330,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                     let realtime: Arc<AtomicU64> = Arc::default();
                     let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
                     let idle = conn.datagram_send_buffer_space();
-                    Ok::<_, String>((stream, Quic { conn, cc, realtime, idle }))
+                    Ok::<_, String>((stream, Quic { conn, cc, realtime, idle, marking }))
                 };
                 match tokio::time::timeout(whole, accepted).await {
                     Ok(Ok((stream, quic))) => {

@@ -146,6 +146,11 @@
   Opus on it at once, as on a weak Wi-Fi. The desktop, if it is shown
   over Bluetooth, goes down to its least bitrate within a second, not
   by the frames it loses.
+- **On QUIC too, the desktop and the sound go as video on Wi-Fi** (DSCP
+  AF41, WMM's video queue): the link's QUIC sent every packet unmarked,
+  behind the other traffic on the air. Its packets are marked now from
+  the first realtime packet, either way, until 10 s without any (not
+  switched at each pen stroke: a switch on can look like losses).
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

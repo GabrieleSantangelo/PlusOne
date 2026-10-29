@@ -54,7 +54,7 @@ pub fn send_to(fd: RawFd, data: &[u8], to: &std::net::SocketAddr) -> io::Result<
     if sent < 0 { Err(io::Error::last_os_error()) } else { Ok(sent as usize) }
 }
 
-fn sockaddr(address: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+pub(crate) fn sockaddr(address: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let length = match address {
         std::net::SocketAddr::V4(a) => {
