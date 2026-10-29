@@ -78,6 +78,8 @@ struct Daemon {
     ours: String,
     /// Where each tablet was last reached: {id: "IP:PORT"}.
     state: PathBuf,
+    /// Held while state is read, changed and written again.
+    changing: Mutex<()>,
     finding: Mutex<()>,
     usb: usb::Watcher,
     /// The USB serial of the device last asked to be an accessory: its
@@ -102,7 +104,7 @@ fn paired_name(entry: &Value) -> &str {
 
 impl Daemon {
     fn new(node: Node, config: PathBuf, ours: String, state: PathBuf) -> Daemon {
-        Daemon { node, config, ours, state, finding: Mutex::default(), usb: usb::Watcher::new(),
+        Daemon { node, config, ours, state, changing: Mutex::default(), finding: Mutex::default(), usb: usb::Watcher::new(),
                  switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(), serial: AtomicU64::new(0) }
     }
 
@@ -167,12 +169,14 @@ impl Daemon {
     }
 
     fn reached(&self, device: &str, address: std::net::SocketAddr) {
-        let mut state = self.remembered();
-        if state.get(device).and_then(Value::as_str) == Some(&address.to_string()) {
-            return;
-        }
-        state.insert(device.to_owned(), json!(address.to_string()));
-        self.save(state);
+        let address = address.to_string();
+        self.change(|state| {
+            if state.get(device).and_then(Value::as_str) == Some(address.as_str()) {
+                return false;
+            }
+            state.insert(device.to_owned(), json!(address));
+            true
+        });
     }
 
     /// The session with a paired tablet: the one up, or a new one where it
@@ -283,23 +287,34 @@ impl Daemon {
     }
 
     fn remember_usb(&self, serial: &str) {
-        let mut state = self.remembered();
-        let mut serials: Vec<Value> = state.get("usb").and_then(Value::as_array).cloned().unwrap_or_default();
-        if serials.iter().any(|s| s.as_str() == Some(serial)) {
-            return;
-        }
-        serials.push(json!(serial));
-        state.insert("usb".into(), Value::Array(serials));
-        self.save(state);
+        self.change(|state| {
+            let mut serials: Vec<Value> = state.get("usb").and_then(Value::as_array).cloned().unwrap_or_default();
+            if serials.iter().any(|s| s.as_str() == Some(serial)) {
+                return false;
+            }
+            serials.push(json!(serial));
+            state.insert("usb".into(), Value::Array(serials));
+            true
+        });
     }
 
-    fn save(&self, state: serde_json::Map<String, Value>) {
+    /// The state as change leaves it (it says whether it changed it), one
+    /// change at a time.
+    fn change(&self, change: impl FnOnce(&mut serde_json::Map<String, Value>) -> bool) {
+        let _one_at_a_time = self.changing.lock().unwrap();
+        let mut state = self.remembered();
+        if !change(&mut state) {
+            return;
+        }
         if let Some(parent) = self.state.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let part = self.state.with_extension("part");
-        if std::fs::write(&part, Value::Object(state).to_string()).is_ok() {
-            let _ = std::fs::rename(&part, &self.state);
+        // A file of each save's own (another plus-one-link may save too),
+        // in its place whole.
+        static SAVES: AtomicU64 = AtomicU64::new(0);
+        let part = self.state.with_extension(format!("{}.{}.part", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
+        if std::fs::write(&part, Value::Object(state).to_string()).is_err() || std::fs::rename(&part, &self.state).is_err() {
+            let _ = std::fs::remove_file(&part);
         }
     }
 
@@ -716,5 +731,27 @@ mod tests {
         assert!(!daemon.usb.asked.load(Ordering::Relaxed));
         assert_eq!(ask(&app, json!({"op": "usb"}))["ok"], true);
         assert!(daemon.usb.asked.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn every_tablet_reached_at_once_remembered() {
+        let daemon = daemon("state");
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let daemon = &daemon;
+                scope.spawn(move || {
+                    for i in 0..25 {
+                        daemon.reached(&format!("tablet-{thread}-{i}"), format!("10.0.{thread}.{i}:47101").parse().unwrap());
+                    }
+                });
+            }
+        });
+        daemon.remember_usb("R52X");
+        let state = daemon.remembered();
+        assert_eq!(state.len(), 8 * 25 + 1);
+        assert_eq!(state["tablet-7-24"], "10.0.7.24:47101");
+        assert_eq!(state["usb"], json!(["R52X"]));
+        let folder = daemon.state.parent().unwrap();
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1, "the temporary files left");
     }
 }
