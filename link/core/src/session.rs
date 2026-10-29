@@ -694,14 +694,19 @@ impl Session {
     }
 
     /// Bytes sent and not yet on the air (the UDP socket's, the queue's,
-    /// the Wi-Fi driver's: each packet counts until it is transmitted) and
-    /// the stream's backlog: how far behind the network is.
+    /// the Wi-Fi driver's: each packet counts until it is transmitted; on
+    /// QUIC, the datagrams quinn holds for the window) and the stream's
+    /// backlog: how far behind the network is. (Without quinn's, the
+    /// desktop never saw the realtime wait on QUIC: never a frame left out
+    /// before it was encoded, and then packets dropped late, frames broken.)
     pub fn queued(&self) -> usize {
+        let path = self.current();
         let mut queued: libc::c_int = 0;
-        if let Some(udp) = self.current().as_ref().and_then(|path| path.udp.as_ref()) {
+        if let Some(udp) = path.as_ref().and_then(|path| path.udp.as_ref()) {
             unsafe { libc::ioctl(udp.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
         }
-        queued.max(0) as usize + self.outbox.lock().unwrap().len()
+        let quic = path.as_ref().and_then(|path| path.quic.as_ref()).map_or(0, |quic| quic.queued());
+        queued.max(0) as usize + quic + self.outbox.lock().unwrap().len()
     }
 
     /// The channels open now.

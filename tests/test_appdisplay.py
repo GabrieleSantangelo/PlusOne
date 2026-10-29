@@ -322,11 +322,24 @@ def test_the_bitrate_follows_the_network():
 
 def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
     rate = appdisplay.RateControl(20000)
-    assert rate.report(60, 0, 30, 20, budget=10000) == 8500  # a share of it
-    assert rate.report(55, 3, 30, 20, budget=10000) is None  # a frame lost: no cut
-    assert rate.report(60, 0, 30, 20, budget=10300) is None  # a few percent: no change
-    assert rate.report(60, 0, 30, 20, budget=40000) == 20000  # never past the one set
-    assert rate.report(60, 0, 30, 20, budget=500) == appdisplay.MIN_KBPS  # nor below the least
+    assert rate.report(60, 0, 30, 20, budget=10000, now=0) == 8500  # a share of it
+    assert rate.report(55, 3, 30, 20, budget=10000, now=1) is None  # a frame lost: no cut
+    assert rate.report(60, 0, 30, 20, budget=10300, now=9) is None  # a few percent: no change
+    assert rate.report(60, 0, 30, 20, budget=40000, now=9) == 20000  # never past the one set
+    assert rate.report(60, 0, 30, 20, budget=500, now=9) == appdisplay.MIN_KBPS  # nor below the least
+
+
+def test_each_change_is_a_keyframe_so_the_bitrate_changes_seldom():
+    rate = appdisplay.RateControl(20000)
+    assert rate.budget(10000, now=0) == 8500
+    assert rate.budget(9000, now=0.1) is None  # a cut it still fits in: no keyframe for it
+    assert rate.budget(8000, now=0.2) == 6800  # past it: down at once, whenever the last change
+    assert rate.budget(9000, now=3) is None  # up by less than UP: not worth a keyframe
+    assert rate.budget(10000, now=3) == 8500  # by UP and more...
+    assert rate.budget(14000, now=4) is None  # ...but UP_AFTER after the last change
+    assert rate.budget(14000, now=5) == 11900
+    rate.kbps, rate.changed_at = 18500, 0
+    assert rate.budget(40000, now=9) == 20000  # the last few percent to the most
     rate.kbps = 9000
     assert rate.report(55, 3, 30, 20) == 6000  # no budget (a TCP path): a frame lost cuts, as before
 
@@ -379,6 +392,22 @@ def test_the_links_budget_is_followed_as_it_changes():
     streamer._running = False
     appdisplay.AppStreamer._budget(streamer, 4000)
     assert bitrates == [8500, 6800]
+
+
+def test_on_quic_a_frame_is_left_out_before_the_link_would_drop_it():
+    # A 10 Mbit/s budget: QUEUE_MS of it is 75 KB; the link drops realtime
+    # past 100 ms of it (125 KB). Of the bitrate (20 Mbit/s), it was 225 KB.
+    queued = [90 << 10]
+    streamer = types.SimpleNamespace(channel=types.SimpleNamespace(queued=lambda: queued[0]), skipped=0,
+                                     rate=appdisplay.RateControl(20000), _budget_kbps=10000)
+    assert appdisplay.AppStreamer._frame_in(streamer, None, None) == appdisplay.Gst.PadProbeReturn.DROP
+    assert streamer.skipped == 1
+    streamer._budget_kbps = None  # no budget (TCP): the bitrate's, the kernel's bytes as before
+    queued[0] = 200 << 10
+    streamer._captured = []
+    pad = types.SimpleNamespace(get_sticky_event=lambda *_: None)
+    info = types.SimpleNamespace(get_buffer=lambda: types.SimpleNamespace(pts=0))
+    assert appdisplay.AppStreamer._frame_in(streamer, pad, info) == appdisplay.Gst.PadProbeReturn.OK
 
 
 def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():

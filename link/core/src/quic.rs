@@ -124,6 +124,11 @@ impl Quic {
         sent
     }
 
+    /// The datagrams handed to quinn and not sent yet (bytes).
+    pub(crate) fn queued(&self) -> usize {
+        DATAGRAM_SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space())
+    }
+
     /// What the controller allows now (bytes a second).
     pub fn rate(&self) -> u64 {
         self.cc.rate.load(Ordering::Relaxed)

@@ -6,8 +6,9 @@
 //! soon each was acknowledged; at a fixed bitrate, or following the
 //! session's rate (a QUIC path's controller), and at a fixed 4 Mbit/s on
 //! both transports; input (285 states a second) and sound (a packet each
-//! 5 ms: its gaps) under a transfer; channels opened while one runs (how
-//! long, how many never were). One line a test, key=value.
+//! 5 ms: its gaps) under a transfer, and beside the video; channels opened
+//! while a transfer runs (how long, how many never were). One line a test,
+//! key=value.
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
 //!             [--quic] [--seconds S] [--video KBPS] [--opens N]
 
@@ -19,6 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// The sound beside the video: PCM's 960 bytes each 5 ms, and what they
+/// take on the network (seal, number, QUIC, UDP, IP), bytes a second.
+const SOUND: u64 = (960 + 94) * 200;
 
 fn now_ns() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
@@ -166,8 +171,9 @@ fn transfer(session: &Arc<Session>, feature: &str, seconds: f64) -> f64 {
     sent.saturating_sub(1 << 20) as f64 / elapsed / 1e6
 }
 
-/// A video for seconds at kbps, or (None) at 0.85 of the session's rate.
-fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>) -> String {
+/// A video for seconds at kbps, or (None) at 0.85 of the session's rate
+/// less leave (bytes a second: the others' share, as the desktop leaves it).
+fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) -> String {
     let channel = session.open("frames", "v", Class::Realtime).unwrap();
     let reader = channel.try_clone().unwrap();
     let sent_at: Arc<Mutex<HashMap<u32, u64>>> = Arc::default();
@@ -194,7 +200,8 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>) -> String {
         std::thread::sleep(due.saturating_duration_since(Instant::now()));
         let rate = match kbps {
             Some(kbps) => kbps * 1000 / 8,
-            None => session.rate().map(|r| r * 85 / 100).unwrap_or(250_000).clamp(12_500, 2_500_000),
+            None => session.rate().map(|r| (r * 85 / 100).saturating_sub(leave)).unwrap_or(250_000)
+                .clamp(12_500, 2_500_000),
         };
         rates.push(rate);
         let average = (rate / 60) as usize;
@@ -265,17 +272,17 @@ fn main() {
     let rt = realtime(&session, seconds);
     println!("test=rt_both {rt} mbs={:.2}", both.join().unwrap());
     settle(&session);
-    println!("test=video {}", video(&session, seconds, video_kbps));
+    println!("test=video {}", video(&session, seconds, video_kbps, 0));
     settle(&session);
     let up = {
         let session = session.clone();
         std::thread::spawn(move || transfer(&session, "sink", seconds))
     };
-    let v = video(&session, seconds, video_kbps);
+    let v = video(&session, seconds, video_kbps, 0);
     println!("test=video_up {v} mbs={:.2}", up.join().unwrap());
     settle(&session);
     // The same 4 Mbit/s on both transports: the path alone compared.
-    println!("test=video4 {}", video(&session, seconds, Some(4000)));
+    println!("test=video4 {}", video(&session, seconds, Some(4000), 0));
     settle(&session);
     let both = {
         let session = session.clone();
@@ -291,6 +298,17 @@ fn main() {
     let (rtts, sent, gap) = flow(&session, Class::Realtime, 200, Duration::from_millis(5), seconds);
     println!("test=audio_up back={} sent={sent} gap={gap} {} mbs={:.2}", rtts.len(), quantiles(rtts), up.join().unwrap());
     settle(&session);
+    // The desktop and its sound together, as the tablet takes them (PCM's
+    // 960 bytes each 5 ms): the sound must not wait behind the frames.
+    let sound = {
+        let session = session.clone();
+        std::thread::spawn(move || flow(&session, Class::Realtime, 960, Duration::from_millis(5), seconds))
+    };
+    let v = video(&session, seconds, video_kbps, SOUND);
+    let (rtts, sent, gap) = sound.join().unwrap();
+    println!("test=av_audio back={} sent={sent} gap={gap} {}", rtts.len(), quantiles(rtts));
+    println!("test=av_video {v}");
+    settle(&session);
     let up = {
         let session = session.clone();
         std::thread::spawn(move || transfer(&session, "sink", 2.0 * seconds))
@@ -298,5 +316,6 @@ fn main() {
     std::thread::sleep(Duration::from_millis(500));
     let (times, failed) = opens(&session, opened);
     println!("test=opens_up ok={} failed={failed} {} mbs={:.2}", times.len(), quantiles(times), up.join().unwrap());
-    println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
+    println!("test=end dropped={} rate_kbps={:?}", session.dropped(),
+             session.rate().map(|r| r * 8 / 1000));
 }

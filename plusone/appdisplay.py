@@ -409,10 +409,24 @@ class RateControl:
     first-packet-to-decoded (decoding, which does not change with the
     network), against the least of the last seconds; only from a second
     with enough frames: a still desktop's one or two say little (Wi-Fi's
-    own jitter), and it went down for nothing."""
+    own jitter), and it went down for nothing.
+
+    Each change of the encoder's bitrate is a keyframe (Intel's VA
+    encoders start a new sequence on it: measured, vah264lpenc and
+    vaapih264enc alike), a burst of up to VBV_FRAMES frames just when the
+    network took less: the picture stuttered at each of the controller's
+    cuts, and at each of its steps up. Following a budget, the bitrate
+    goes down only once it no longer FITS in it (its share leaves 15 %: a
+    smaller cut costs nothing), and up only by UP at least, UP_AFTER after
+    its last change."""
 
     SHARE = 0.85    # of a path's budget (its congestion controller's), the video's
-    STEADY = 0.05   # a change of the budget under this much: none for the encoder
+    STEADY = 0.05   # up to the most: by this much at least
+    FITS = 0.95     # of the budget (less the others'): over it, down to the share
+    UP = 1.15       # the share over the bitrate by this much: up to it (the controller
+                    # goes 1.5 times what goes through at most: 1.25 held at 9.5 Mbit/s
+                    # for 90 s on a hotspot taking 50)...
+    UP_AFTER = 2.0  # ...this long (s) after the last change at least
     GROWN_MS = 25   # over the least: a queue
     CLEAN = 3       # reports in a row without loss nor queue before going up
     HISTORY = 10    # reports the least is taken over
@@ -430,8 +444,9 @@ class RateControl:
         self.ceiling = None  # where a queue last showed
         self.ceiling_age = 0  # reports since
         self.delays = collections.deque(maxlen=self.HISTORY)
+        self.changed_at = -math.inf  # the bitrate's last change for a budget (time.monotonic())
 
-    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None, others=0):
+    def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None, others=0, now=None):
         """A report, and the frames not encoded since the last; the new
         bitrate if it changed, else None. budget: what the path's congestion
         controller allows (kbit/s), if it has one (QUIC's GCC): the bitrate
@@ -441,7 +456,7 @@ class RateControl:
         and took 50 s to come back). others: what else of ours goes to the
         tablet now (kbit/s), out of the budget's share."""
         if budget:
-            return self.budget(budget, others)
+            return self.budget(budget, others, now)
         delay = capture_to_decoded - first_to_decoded if shown >= self.FRAMES else None
         if delay is not None:
             self.delays.append(delay)
@@ -476,16 +491,24 @@ class RateControl:
             return self._set(max(up, self.kbps + 1))
         return None
 
-    def budget(self, budget, others=0):
+    def budget(self, budget, others=0, now=None):
         """The path's congestion controller's budget (kbit/s), now (also as
         plus-one-link tells it changed, between reports), and what else of
         ours goes to the tablet (the speakers): the new bitrate if it
         changed, else None."""
+        now = time.monotonic() if now is None else now
         self.clean, self.ceiling = 0, None
         target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE - others)))
-        if abs(target - self.kbps) < self.kbps * self.STEADY:
+        if target < self.kbps:
+            if self.kbps <= (budget - others) * self.FITS:
+                return None
+        elif (target < self.kbps * self.UP and (target < self.most or target < self.kbps * (1 + self.STEADY))
+              or now - self.changed_at < self.UP_AFTER):
             return None
-        return self._set(target)
+        kbps = self._set(target)
+        if kbps is not None:
+            self.changed_at = now
+        return kbps
 
     def _set(self, kbps):
         kbps = max(MIN_KBPS, min(self.most, kbps))
@@ -625,6 +648,9 @@ class AppStreamer:
         self.rate = RateControl(bitrate)
         self._rate_lock = threading.Lock()  # the stats' thread and the link's budget events
         self.skipped = 0  # frames not encoded: the network behind
+        # The path's budget (kbit/s), if its controller is its own (QUIC's):
+        # what waits counts against it, and in bytes as they are.
+        self._budget_kbps = channel.budget_kbps() if hasattr(channel, "budget_kbps") else None
         # When each frame going into the encoder was captured, in order: one
         # comes out per one in (no B frames), and a flush drops those held.
         # (Its output timestamps could not be traced back after a flush.)
@@ -654,6 +680,7 @@ class AppStreamer:
     def _budget(self, kbps):
         """plus-one-link says the path's budget changed: followed at once,
         not at the next report (a second later: the queue filled meanwhile)."""
+        self._budget_kbps = kbps
         if not kbps or not self._running:
             return
         others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
@@ -688,8 +715,14 @@ class AppStreamer:
         # The network behind (more waiting to go out than QUEUE_MS of the
         # bitrate): this frame is not encoded, rather than queued after the
         # others (the delay would grow, and grow). A frame that never went
-        # in breaks nothing; the next one is encoded against the last.
-        if self.channel.queued() > max(64 << 10, self.rate.kbps * QUEUE_MS // 8 * TRUESIZE):
+        # in breaks nothing; the next one is encoded against the last. On a
+        # path with a budget, QUEUE_MS of it, under what the link holds
+        # realtime for (quic.rs LATE, 100 ms of the same rate): past it the
+        # link drops a frame's packets, and the frames after are broken.
+        budget = self._budget_kbps
+        most = (min(self.rate.kbps, budget) * QUEUE_MS // 8 if budget
+                else self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
+        if self.channel.queued() > max(64 << 10, most):
             self.skipped += 1
             return Gst.PadProbeReturn.DROP
         # pipewiresrc and a live test source stamp buffers with the running

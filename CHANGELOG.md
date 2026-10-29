@@ -2,6 +2,15 @@
 
 ## Unreleased (1.0)
 
+- **Fewer stutters when the network slows down**: each change of the
+  desktop's bitrate made Intel's hardware encoder start over with a
+  keyframe, a burst four frames big, just when the network took less, and
+  again at each small step back up. The bitrate now changes only when it
+  must: down once the picture no longer fits in what the network takes,
+  up by 15 % at least, two seconds apart. And on QUIC the PC now sees the
+  picture waiting in the link: it leaves a frame out before encoding it,
+  rather than the link dropping a frame's packets halfway (each frame
+  after a broken one is broken too, until the next keyframe).
 - **The tablet's speakers no longer fall silent in the middle of a video**:
   Chrome makes a new stream after a pause or an ad and closes the old one
   a moment later, both with the same name. Plus One took the old one going

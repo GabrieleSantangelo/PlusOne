@@ -245,7 +245,8 @@ on all of them).
 | Acknowledgements asked | every 2 packets, within 2 ms | chosen (QUIC's default is 25 ms) |
 | TCP bulk pace (`pace.rs`) | 8 ms of queue, 32 KiB/s at least | measured on a hotspot; the floor lowered on an emulated 3 Mbit/s Wi-Fi |
 | Budget told (`cc.rs` `PUBLISH_CHANGE`, `PUBLISH_EVERY`) | past 10 % of the last told; going up at most every 100 ms, a cut at once; `{"event": "budget"}` to the apps, null on a path with no controller of its own | the design's (architecture §3.11); a condition variable, not a poll: nothing wakes while it holds |
-| Screen's bitrate on QUIC (`appdisplay.py`) | 0.85 of the controller's rate, changed past 5 %, as the budget is told (it read it once a second) | chosen; a frame lost asks for a keyframe, it no longer cuts the bitrate (a third each, 20 to 4 Mbit/s in 4 s on a hotspot taking 36) |
+| Screen's bitrate on QUIC (`appdisplay.py`) | 0.85 of the controller's rate, as the budget is told (it read it once a second); down only once it no longer fits in 95 % of the budget (less the others'), up by 15 % at least and 2 s after its last change | chosen; a frame lost asks for a keyframe, it no longer cuts the bitrate (a third each, 20 to 4 Mbit/s in 4 s on a hotspot taking 36); measured: each change of the bitrate is a keyframe (Intel's VA encoders, vah264lpenc and vaapih264enc, start a new sequence), at each cut and at each step up of 5 % before |
+| A frame left out before it is encoded (`appdisplay.py` `QUEUE_MS`) | past 60 ms of the budget waiting (on QUIC, in quinn too) | chosen: under the link's 100 ms (`LATE`), past which it drops a frame's packets and the frames after are broken; quinn's were not counted before, and on a hotspot every cut broke frames |
 
 `PLUSONE_LINK_CC_TRACE=1` puts what the controller does in the log four
 times a second (rate, what is acknowledged, trend and threshold, state,
