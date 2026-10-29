@@ -339,11 +339,15 @@ impl Daemon {
         Ok((json!({"ok": true, "id": channel.id}), channel.into_fd()))
     }
 
-    fn serve(self: &Arc<Self>, request: &Value, client: Arc<OwnedFd>) -> Result<String, String> {
+    /// The feature, and the serial it is served under for this app.
+    fn serve(self: &Arc<Self>, request: &Value, client: Arc<OwnedFd>) -> Result<(String, u64), String> {
         let feature = request["feature"].as_str().filter(|f| !f.is_empty()).ok_or("no feature")?.to_owned();
-        let version = request["version"].as_u64().unwrap_or(1) as u32;
+        let version = request.get("version").map_or(Some(1), |v| v.as_u64().and_then(|v| u32::try_from(v).ok()))
+            .ok_or("the version: a whole number under 2^32")?;
+        // The serial and the node's handler of the same app, whoever comes last.
+        let mut serving = self.serving.lock().unwrap();
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-        self.serving.lock().unwrap().insert(feature.clone(), serial);
+        serving.insert(feature.clone(), serial);
         self.node.serve(&feature, version, move |incoming| {
             let channel = incoming.channel;
             let event = json!({"event": "incoming", "device": incoming.session.peer, "feature": channel.feature,
@@ -351,7 +355,7 @@ impl Daemon {
             // The app gone meanwhile: the channel closes with ours.
             let _ = api::send(client.as_raw_fd(), &event, Some(channel.into_fd()));
         });
-        Ok(feature)
+        Ok((feature, serial))
     }
 
     fn event(self: &Arc<Self>, event: Event) {
@@ -434,10 +438,13 @@ impl Daemon {
                 "stream" => (self.stream(&request, given), None),
                 "browse" => (self.browse(&request), None),
                 "queued" => (self.queued(&request), None),
-                "usb" => {
-                    self.usb.asked.store(request["use"].as_bool().unwrap_or(true), Ordering::Relaxed);
-                    (Ok(json!({"ok": true})), None)
-                }
+                "usb" => match request.get("use").map_or(Some(true), Value::as_bool) {
+                    Some(on) => {
+                        self.usb.asked.store(on, Ordering::Relaxed);
+                        (Ok(json!({"ok": true})), None)
+                    }
+                    None => (Err("use: true or false".into()), None),
+                },
                 "close" => {
                     if let Some(session) = request["device"].as_str().and_then(|d| self.node.session(d)) {
                         session.close();
@@ -449,9 +456,8 @@ impl Daemon {
                     Err(e) => (Err(e), None),
                 },
                 "serve" => match self.serve(&request, client.clone()) {
-                    Ok(feature) => {
-                        let serial = self.serving.lock().unwrap()[&feature];
-                        served.push((feature, serial));
+                    Ok(serving) => {
+                        served.push(serving);
                         (Ok(json!({"ok": true})), None)
                     }
                     Err(e) => (Err(e), None),
@@ -652,5 +658,63 @@ mod tests {
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"], "too many descriptors");
         assert_eq!(ask(&app, json!({"op": "devices"}))["ok"], true);
+    }
+
+    #[test]
+    fn each_app_serving_a_feature_leaves_it_once() {
+        let daemon = daemon("serving");
+        let start = std::sync::Barrier::new(2);
+        for _ in 0..300 {
+            let apps = [app(&daemon), app(&daemon)];
+            std::thread::scope(|scope| {
+                for (app, _) in &apps {
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        assert_eq!(ask(app, json!({"op": "serve", "feature": "x"}))["ok"], true);
+                    });
+                }
+            });
+            // Each app's leaving, the feature served as the last one asked
+            // before it: the last one takes it away, the other not.
+            let last = daemon.serving.lock().unwrap()["x"];
+            let mut taken = 0;
+            for (app, served) in apps {
+                daemon.serving.lock().unwrap().insert("x".into(), last);
+                drop(app);
+                served.join().unwrap();
+                taken += usize::from(!daemon.serving.lock().unwrap().contains_key("x"));
+            }
+            assert_eq!(taken, 1);
+            daemon.serving.lock().unwrap().clear();
+        }
+    }
+
+    #[test]
+    fn a_version_that_is_no_u32_refused() {
+        let daemon = daemon("version");
+        let (app, _served) = app(&daemon);
+        for version in [json!(1u64 << 32), json!(-1), json!("2"), json!(1.5)] {
+            let reply = ask(&app, json!({"op": "serve", "feature": "x", "version": version}));
+            assert_eq!(reply["ok"], false, "{version}");
+        }
+        assert!(daemon.serving.lock().unwrap().is_empty());
+        assert_eq!(ask(&app, json!({"op": "serve", "feature": "x", "version": 3}))["ok"], true);
+    }
+
+    #[test]
+    fn usb_use_only_true_or_false() {
+        let daemon = daemon("usb");
+        let (app, _served) = app(&daemon);
+        for given in [json!("false"), json!(0), json!(null)] {
+            assert_eq!(ask(&app, json!({"op": "usb", "use": given}))["ok"], false, "{given}");
+            assert!(!daemon.usb.asked.load(Ordering::Relaxed), "{given}");
+        }
+        assert_eq!(ask(&app, json!({"op": "usb", "use": true}))["ok"], true);
+        assert!(daemon.usb.asked.load(Ordering::Relaxed));
+        assert_eq!(ask(&app, json!({"op": "usb", "use": false}))["ok"], true);
+        assert!(!daemon.usb.asked.load(Ordering::Relaxed));
+        assert_eq!(ask(&app, json!({"op": "usb"}))["ok"], true);
+        assert!(daemon.usb.asked.load(Ordering::Relaxed));
     }
 }
