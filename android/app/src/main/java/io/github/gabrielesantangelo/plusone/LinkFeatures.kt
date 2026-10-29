@@ -3,11 +3,12 @@ package io.github.gabrielesantangelo.plusone
 import android.util.Log
 import io.github.gabrielesantangelo.plusone.link.ChannelLink
 import io.github.gabrielesantangelo.plusone.link.Handler
+import io.github.gabrielesantangelo.plusone.link.Link
 import io.github.gabrielesantangelo.plusone.link.LinkChannel
 import io.github.gabrielesantangelo.plusone.link.LinkCore
 import io.github.gabrielesantangelo.plusone.link.LinkServer
 import io.github.gabrielesantangelo.plusone.link.Paired
-import org.json.JSONObject
+import io.github.gabrielesantangelo.plusone.link.Requests
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -41,19 +42,7 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
             ?: core.devices().firstOrNull { it.optString("id") == channel.device }?.optString("name").orEmpty())
         val link = ChannelLink(channel, pc) { name -> take(channel.device, channel.feature, name) }
         try {
-            while (true) {
-                val message = link.receive()
-                when (message.optString("type")) {
-                    "ping" -> { link.send(JSONObject().put("type", "pong")); continue }
-                    "bye" -> break
-                }
-                val type = message.optString("type")
-                if (type !in handler.types) continue
-                // A payload only where one goes: else it would be read as the next message.
-                val size = message.optLong("size", 0)
-                require(size == 0L || size in 1..handler.maxPayload(type)) { "unexpected payload" }
-                if (!handler.handle(link, message, size)) break
-            }
+            serve(link, handler)
         } catch (e: java.io.IOException) {
             // The PC closed it, or the session is over.
         } catch (e: Throwable) {
@@ -61,7 +50,6 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
             // stack, and an Error left uncaught ends the process.
             Log.w(CompanionService.TAG, "link: ${channel.feature}: $e")
         } finally {
-            handler.closed(link)
             channel.close()
         }
     }
@@ -84,5 +72,12 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
 
     companion object {
         const val WAIT = 5_000L  // ms for each channel
+
+        /** The PC's requests on a feature's control channel, to its handler
+         * as on the link of before (Requests: ping answered, a payload's size
+         * checked before anything is passed over, so that no payload is read
+         * as the next message), until the PC says bye, the handler takes the
+         * link, or it goes. */
+        internal fun serve(link: Link, handler: Handler) = Requests(listOf(handler)).serve(link, otherVersion = false)
     }
 }
