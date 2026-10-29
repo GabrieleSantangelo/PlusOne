@@ -27,6 +27,24 @@ PEN = os.path.join(GLib.get_user_config_dir(), "plus-one", "pen.json")
 SENT = os.path.join(GLib.get_user_cache_dir(), "plus-one", "signing")
 
 
+def copy_of(path):
+    """A copy of path as it is now, in SENT (this user's alone): what is
+    signed, whatever becomes of path meanwhile (moved, deleted, replaced).
+    OSError if it cannot be made, and nothing left behind."""
+    os.makedirs(SENT, mode=0o700, exist_ok=True)
+    fd, copy = tempfile.mkstemp(suffix=".pdf", dir=SENT)
+    try:
+        with os.fdopen(fd, "wb") as f, open(path, "rb") as original:
+            shutil.copyfileobj(original, f)
+    except BaseException:
+        try:
+            os.unlink(copy)  # half a copy: not left behind
+        except OSError:
+            pass
+        raise
+    return copy
+
+
 class Signing:
     def __init__(self, app):
         self.app = app
@@ -104,21 +122,11 @@ class Signing:
 
     @staticmethod
     def _copy(path):
-        """A copy of path as it is now, in SENT: its name, or the OSError."""
-        sent = None
+        """copy_of(path): its name, or the OSError."""
         try:
-            os.makedirs(SENT, mode=0o700, exist_ok=True)
-            fd, sent = tempfile.mkstemp(suffix=".pdf", dir=SENT)
-            with os.fdopen(fd, "wb") as f, open(path, "rb") as original:
-                shutil.copyfileobj(original, f)
+            return copy_of(path)
         except OSError as e:
-            if sent is not None:
-                try:
-                    os.unlink(sent)  # half a copy: not left behind
-                except OSError:
-                    pass
             return e
-        return sent
 
     def _copied(self, path, token, target, sent):
         """_sign_in_app's, once the copy that goes is made (sent: its name,

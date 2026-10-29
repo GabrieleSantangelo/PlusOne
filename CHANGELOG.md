@@ -112,6 +112,13 @@
   pressure past full) was kept as any other, and once placed on a page
   the signing window failed at each picture it took of it. Such a
   signature is left out now, as one that is no signature.
+- **What is signed on the PC is the PDF shown**: the signing window
+  showed the PDF as it was when it opened, and read it again to save:
+  moved or deleted meanwhile, the signature was lost (Plus One asked
+  where to save, as for a folder that takes nothing, and could not);
+  replaced by another document of its name, the marks went on that one.
+  The window signs a copy taken as it opens now, as the tablet does; the
+  signed copy still goes next to the original.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

@@ -285,6 +285,13 @@ def date_text(day):
     return day.strftime("%x") if language and language not in ("C", "POSIX") else day.isoformat()
 
 
+def _forget(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def open_document(path):
     """A Poppler document, or raise GLib.Error (missing, damaged, password)."""
     doc = Poppler.Document.new_from_file(Gio.File.new_for_path(path).get_uri(), None)
@@ -1008,13 +1015,25 @@ class SignWindow(Adw.ApplicationWindow):
         """on_done(signed path or None) runs once, when the window closes.
         Raises GLib.Error for a PDF it cannot open, before it is a window
         (one made would hold the application)."""
-        doc = open_document(path)
+        from .signing import copy_of
+        # What is shown is what is signed: a copy of the PDF as it is now,
+        # whatever becomes of path meanwhile (moved, deleted, replaced by
+        # another document); the signed copy still goes next to path.
+        try:
+            copy = copy_of(path)
+        except OSError as e:
+            raise GLib.Error(e.strerror or str(e)) from None
+        try:
+            doc = open_document(copy)
+        except BaseException:
+            _forget(copy)
+            raise
         super().__init__(application=app, title=os.path.basename(path),
                          default_width=1000, default_height=820)
         if not SignWindow._css_loaded:
             load_css()
             SignWindow._css_loaded = True
-        self.path = path
+        self.path, self.copy = path, copy
         self.on_done = on_done
         self.doc = doc
         self.index = 0
@@ -1501,7 +1520,7 @@ class SignWindow(Adw.ApplicationWindow):
 
         def work():
             try:
-                result = save_signed(self.path, marks, dst)
+                result = save_signed(self.copy, marks, dst, like=self.path)
             except Exception as e:  # noqa: BLE001 - shown to the user
                 log("signing: could not save:", repr(e))
                 result = e
@@ -1594,4 +1613,5 @@ class SignWindow(Adw.ApplicationWindow):
         callback, self.on_done = self.on_done, None
         if callback:
             callback(self.result)
+        _forget(self.copy)
         return False

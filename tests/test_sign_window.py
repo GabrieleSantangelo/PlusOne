@@ -15,6 +15,7 @@ if not os.environ.get("PLUSONE_GUI_TESTS"):
 
 pypdf = pytest.importorskip("pypdf")
 
+import cairo  # noqa: E402
 import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
@@ -23,7 +24,7 @@ from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 
 from test_pdf import make_pdf  # noqa: E402
 
-from plusone import sign  # noqa: E402
+from plusone import sign, signing  # noqa: E402
 from plusone.ink import load_pen  # noqa: E402
 from plusone.pen import feed  # noqa: E402
 from plusone.pdf import Stroke, Text  # noqa: E402
@@ -45,6 +46,7 @@ def spin(until, timeout=5):
 @pytest.fixture
 def window(tmp_path, monkeypatch):
     monkeypatch.setattr(sign, "PEN", str(tmp_path / "pen.json"))
+    monkeypatch.setattr(signing, "SENT", str(tmp_path / "sent"))  # the copy the window signs
     src = tmp_path / "contract.pdf"
     make_pdf(src)
     app = Adw.Application(application_id="io.github.gabrielesantangelo.PlusOne.Test")
@@ -124,6 +126,34 @@ def test_date_and_save(window):
     text = pypdf.PdfReader(out).pages[0].extract_text()
     import datetime
     assert sign.date_text(datetime.date.today()) in text and "Original text page 1" in text
+
+
+def test_what_is_signed_is_the_pdf_shown(window, tmp_path):
+    # The original replaced by another document while the window is open:
+    # the marks go on the one shown, the signed copy next to the original.
+    win, results, src = window
+    other = tmp_path / "other.pdf"
+    surface = cairo.PDFSurface(str(other), 595, 842)
+    context = cairo.Context(surface)
+    context.move_to(72, 72)
+    context.show_text("Another document")
+    surface.finish()
+    os.replace(other, src)
+    win.add_mark(Stroke([(200, 600, 0.9), (260, 640, 0.9)]))
+    win._save()
+    assert spin(lambda: results, timeout=10)
+    assert results == [str(src).replace(".pdf", "-signed.pdf")]
+    assert "Original text page 1" in pypdf.PdfReader(results[0]).pages[0].extract_text()
+    assert not os.path.exists(win.copy)  # closed: its copy gone
+
+
+def test_the_pdf_shown_is_signed_after_the_original_went(window):
+    win, results, src = window
+    os.unlink(src)  # moved, or deleted, while the window is open
+    win.add_mark(Stroke([(200, 600, 0.9), (260, 640, 0.9)]))
+    win._save()
+    assert spin(lambda: results, timeout=10)
+    assert results == [str(src).replace(".pdf", "-signed.pdf")]
 
 
 def test_no_way_out_while_saving(window):
