@@ -25,6 +25,7 @@ try:
 except ImportError:  # a Plus One without the link: the link of before only
     plusone_link = None
 
+AGAIN = 15.0  # seconds from one watch of the link's budget to the next, at least (as paths.AGAIN)
 ANSWER_WAIT = 10.0  # seconds for the app's answer to a request
 CHUNK = 64 << 10   # bytes of a payload or a long message per channel message
 SENDING_OVER = 1.0  # seconds what the channels send a tablet is measured over
@@ -55,37 +56,102 @@ def _forget(sent, now):
 
 class Budget:
     """What the path to device's congestion controller allows (kbit/s):
-    plus-one-link's word on it, asked once (kbps()), then as it tells it
-    moved (watch(): past 10 %, a cut at once; architecture §3.11). None on
+    plus-one-link's word on it, asked (kbps()) until it tells it moved
+    (watch(): past 10 %, a cut at once; architecture §3.11). None on
     a path with no controller of its own (TCP, a cable)."""
 
     def __init__(self, connection, device):
         self.connection, self.device = connection, device
-        self._told = None  # the last told: kbit/s, 0 for none
+        self._told = None  # the last told since the watch was made: kbit/s, 0 for none
+        self._said = None  # the last on_budget heard: kbit/s, 0 for none
         self._watch = None
+        self._thread = None
+        self._lock = threading.Lock()  # a watch made, and close(): none left open after it
+        self._telling = threading.Lock()  # on_budget told one at a time, the newest last
+        self._closed = threading.Event()
 
     def kbps(self):
         if self._told is not None:
             return self._told or None
         try:
-            return next((d for d in self.connection.devices() if d["id"] == self.device), {}).get("rate_kbps") or None
+            return self._asked()
         except (OSError, ValueError, plusone_link.LinkError):
             return None
 
+    def _asked(self):
+        return next((d for d in self.connection.devices() if d["id"] == self.device), {}).get("rate_kbps") or None
+
     def watch(self, on_budget):
-        """on_budget(kbit/s or None) as it moves, on the events' thread, until close()."""
+        """on_budget(kbit/s or None) as it moves, until close(), on the
+        events' thread (the budget's own, once watched again): plus-one-link
+        hanging up, or gone and back, is no end; watched again, what moved
+        meanwhile is told then."""
         def event(event):
             if event.get("event") == "budget" and event.get("device") == self.device:
-                self._told = int(event.get("kbps") or 0)
-                on_budget(self._told or None)
+                with self._telling:
+                    self._told = self._said = int(event.get("kbps") or 0)
+                    on_budget(self._told or None)
+        self._watched(event)
+        self._thread = threading.Thread(target=self._run, args=(event, on_budget), name="link-budget", daemon=True)
+        self._thread.start()
+
+    def _watched(self, event):
+        """Whether plus-one-link watches for event() now (not there, or
+        close() came meanwhile: no)."""
         try:
-            self._watch = self.connection.watch(event)
+            watcher = self.connection.watch(event)
         except (OSError, ValueError, plusone_link.LinkError) as e:
             log("the link's budget not watched:", e)
+            return False
+        with self._lock:
+            if not self._closed.is_set():
+                self._watch = watcher
+                return True
+        watcher.close()  # close() came while it was made: not left open
+        return False
+
+    def _run(self, event, on_budget):
+        # Until close(): each watch's end waited on (plus-one-link hung up,
+        # or went), no waking meanwhile; then watched again, AGAIN after the
+        # last at the soonest: one shut at once is not made again and again.
+        since = time.monotonic()
+        while True:
+            watcher = self._watch
+            if watcher is not None:
+                watcher.thread.join()
+                with self._lock:
+                    watcher, self._watch = self._watch, None  # None: close() closed it
+                if watcher is not None:
+                    watcher.close()
+                    log("the link's budget: plus-one-link hung up")
+                self._told = None  # asked (kbps()) until it tells again
+            if self._closed.wait(max(0, since + AGAIN - time.monotonic())):
+                return
+            since = time.monotonic()
+            if self._watched(event):
+                try:
+                    self._caught_up(on_budget)
+                except Exception as e:  # noqa: BLE001 - watched all the same
+                    log("the link's budget:", repr(e))
+
+    def _caught_up(self, on_budget):
+        """Watched again: on_budget told what plus-one-link says now, if it
+        moved while nothing watched and no event told it since."""
+        try:
+            kbps = int(self._asked() or 0)
+        except (OSError, ValueError, plusone_link.LinkError):
+            return
+        with self._telling:
+            if self._told is None and kbps != self._said and not self._closed.is_set():
+                self._said = kbps
+                on_budget(kbps or None)
 
     def close(self):
-        if self._watch is not None:
-            self._watch.close()
+        with self._lock:
+            self._closed.set()
+            watcher, self._watch = self._watch, None
+        if watcher is not None:
+            watcher.close()
 
 
 def connect(app_id, feature):

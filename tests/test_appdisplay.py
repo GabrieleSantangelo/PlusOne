@@ -353,7 +353,9 @@ class FakeWatchedLink:
 
     def watch(self, on_event):
         self.on_event = on_event
-        return types.SimpleNamespace(close=lambda: setattr(self, "closed", True))
+        ended = threading.Event()  # its connection's end: close()'s here
+        return types.SimpleNamespace(close=lambda: (setattr(self, "closed", True), ended.set()),
+                                     thread=types.SimpleNamespace(join=ended.wait))
 
     def devices(self):
         self.asked += 1
