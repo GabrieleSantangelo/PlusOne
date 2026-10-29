@@ -31,7 +31,7 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
                               io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?) -> Unit = { before, now ->
         val device = mine?.device
         val pc = now ?: before
-        if (device != null && pc?.id == device) pathOverlay.changed(before, now, gone = now == null)
+        if (device != null && pc?.id == device) pathOverlay.changed(before, now)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -96,6 +96,7 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     override fun onStop() {
         super.onStop()
         io.github.gabrielesantangelo.plusone.link.LinkStatus.unlisten(pathChanged)
+        pathOverlay.stop()  // nothing animated or timed while not shown; onStart() shows what is now
         Front.stopped()
         // Another app, the screen off: the PC rests.
         mine?.takeIf { it === DisplaySession.current }?.show(false)

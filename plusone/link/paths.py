@@ -14,7 +14,7 @@ except ImportError:  # a Plus One without the link
 
 # The link's path kinds, as the user calls them.
 NAMES = {"usb": "cable", "lan": "Wi-Fi", "p2p": "Wi-Fi Direct", "wifi-direct": "Wi-Fi Direct", "ap": "Wi-Fi Direct",
-         "bluetooth": "Bluetooth", "relay": "the internet"}
+         "bt": "Bluetooth", "bluetooth": "Bluetooth", "relay": "the internet"}
 RECONNECTING = "reconnecting…"
 AGAIN = 15.0  # seconds before looking for plus-one-link again, while it is not there
 

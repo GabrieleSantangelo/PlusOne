@@ -37,6 +37,31 @@ object PathLabel {
         return string(R.string.path_label).format(string(word), place)
     }
 
+    /** What a change of the desktop's PC (LinkStatus) is to its pill and
+     * its change screen (PathOverlay), which show shownPath, shownTransport. */
+    sealed interface Change {
+        /** The session over: the activity goes. */
+        data object Gone : Change
+        /** Nothing the pill says changed (its name, say). */
+        data object Same : Change
+        /** The path lost: the change screen, waiting for another. */
+        data object Waiting : Change
+        /** On another path, or on one again after a wait: the change screen and the pill. */
+        data class Moved(val path: String, val transport: String?) : Change
+        /** The same path carried otherwise (TCP moved to QUIC): the pill alone. */
+        data class Transport(val path: String, val transport: String?) : Change
+    }
+
+    fun change(shownPath: String?, shownTransport: String?, now: LinkStatus.Pc?): Change {
+        if (now == null) return Change.Gone
+        val path = now.path ?: return Change.Waiting
+        return when {
+            path != shownPath -> Change.Moved(path, now.transport)
+            now.transport != shownTransport -> Change.Transport(path, now.transport)
+            else -> Change.Same
+        }
+    }
+
     /** The pill over the desktop: whose screen it is (SEC-30), and text(). */
     fun marker(path: String?, transport: String?, string: (Int) -> String): String =
         string(R.string.display_marker).format(text(path, transport, string))

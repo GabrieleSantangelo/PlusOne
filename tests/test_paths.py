@@ -17,6 +17,8 @@ def test_events_say_the_path(monkeypatch):
     watched._event({"event": "moved", "device": DEVICE, "path": "lan"})
     assert watched.path(DEVICE[:16]) == "Wi-Fi"
     watched._event({"event": "moved", "device": DEVICE, "path": "lan", "transport": "quic"})  # the same path: not told
+    watched._event({"event": "moved", "device": DEVICE, "path": "bt", "transport": "stream"})
+    assert watched.path(DEVICE[:16]) == "Bluetooth"
     watched._event({"event": "gone", "device": DEVICE})
     assert watched.path(DEVICE) is None
-    assert len(changes) == 4
+    assert len(changes) == 5

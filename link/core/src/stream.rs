@@ -19,6 +19,11 @@ pub trait Stream: Read + Write + AsRawFd + Send + Sync {
     fn addresses(&self) -> Option<(IpAddr, IpAddr)> {
         None
     }
+    /// What it is, as Session::transport says: "tcp", or "stream" (a socket
+    /// bridged to a cable, Bluetooth, a QUIC stream).
+    fn transport(&self) -> &'static str {
+        "stream"
+    }
 }
 
 impl Stream for TcpStream {
@@ -41,6 +46,10 @@ impl Stream for TcpStream {
 
     fn addresses(&self) -> Option<(IpAddr, IpAddr)> {
         Some((self.peer_addr().ok()?.ip(), self.local_addr().ok()?.ip()))
+    }
+
+    fn transport(&self) -> &'static str {
+        "tcp"
     }
 }
 

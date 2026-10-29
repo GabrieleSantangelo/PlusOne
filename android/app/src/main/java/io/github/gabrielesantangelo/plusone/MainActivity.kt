@@ -90,7 +90,10 @@ class MainActivity : AppCompatActivity() {
 
     private val queueChanged: () -> Unit = { refresh() }
     private val pathChanged: (io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?,
-                              io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?) -> Unit = { _, _ -> refresh() }
+                              io.github.gabrielesantangelo.plusone.link.LinkStatus.Pc?) -> Unit = { before, now ->
+        // Its transport alone (TCP moved to QUIC) is not on this screen.
+        if (before?.copy(transport = null) != now?.copy(transport = null)) refresh()
+    }
 
     private fun refresh() {
         // Made again from scratch: where the user had scrolled to stays.

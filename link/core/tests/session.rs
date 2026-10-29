@@ -760,9 +760,69 @@ fn a_move_from_tcp_to_quic_is_told_on_both_sides() {
     }
     assert!(session.by_quic());
     assert_eq!(session.transport(), Some("quic"));
-    // Nothing more: no detach on the way, nor a second move.
-    std::thread::sleep(Duration::from_millis(300));
+    // Nothing more, past the old path's end at the latest (HANDOVER_CAP,
+    // 3 s): no detach when it goes, nor a second move.
+    std::thread::sleep(HANDOVER_CAP_AND_SOME);
     assert!(pc_told.try_recv().is_err() && tablet_told.try_recv().is_err());
+}
+
+/// session.rs's HANDOVER_CAP (3 s) and half a second.
+const HANDOVER_CAP_AND_SOME: Duration = Duration::from_millis(3500);
+
+#[test]
+fn what_goes_across_a_move_to_quic_arrives_once_and_in_order() {
+    // Numbered control messages there and back (echoed) while the TCP
+    // session moves to QUIC (as the PC's upgrade does it, by hand here to
+    // have them on the way): none lost, none twice, in order; the move told
+    // once on each side, and nothing after it.
+    let (pc, tablet, address) = pair();
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (pc_told, tablet_told) = (told(&pc), told(&tablet));
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let control = session.open("echo", "numbered", Class::Control).unwrap();
+    const COUNT: u32 = 2000;
+    let sent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sender = {
+        let (control, sent) = (control.try_clone().unwrap(), sent.clone());
+        std::thread::spawn(move || {
+            for i in 0..COUNT {
+                control.send(&i.to_be_bytes()).unwrap();
+                sent.store(i + 1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        })
+    };
+    let echoed = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        while got.len() < COUNT as usize {
+            match control.recv(&mut buf, WAIT) {
+                Ok(Some(4)) => got.push(u32::from_be_bytes(buf[..4].try_into().unwrap())),
+                other => panic!("after {} back: {other:?}", got.len()),
+            }
+        }
+        got
+    });
+    until("some sent by TCP", || sent.load(std::sync::atomic::Ordering::SeqCst) >= 200);
+    let moving = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
+    assert!(Arc::ptr_eq(&moving, &session), "the same session, another path");
+    let lan = Some("lan".to_owned());
+    for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
+        let next = || told.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("{side}: nothing told"));
+        assert_eq!(next(), ("up", lan.clone(), Some("tcp")), "{side}");
+        assert_eq!(next(), ("moved", lan.clone(), Some("quic")), "{side}");
+    }
+    let at_move = sent.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(at_move < COUNT, "all sent before the move: send more");
+    sender.join().unwrap();
+    let got = echoed.join().unwrap();
+    if let Some(i) = (0..COUNT as usize).find(|&i| got[i] != i as u32) {
+        panic!("message {i} came back as {} ({at_move} sent at the move)", got[i]);
+    }
+    assert_eq!(session.transport(), Some("quic"));
+    std::thread::sleep(HANDOVER_CAP_AND_SOME);
+    assert!(pc_told.try_recv().is_err() && tablet_told.try_recv().is_err(), "told more after the move");
+    assert!(!session.is_closed());
 }
 
 #[test]

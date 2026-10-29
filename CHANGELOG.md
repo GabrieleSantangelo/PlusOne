@@ -8,8 +8,9 @@
   desktop comes up and whenever the link moves (to another path, or from
   TCP to QUIC on the same one), then faint as before. A move to a better
   path no longer shows "Reconnecting…" for a moment: the path left is
-  closed a second after, so the other side takes the new one first. On
-  the tablet the Bluetooth path was named and drawn as Wi-Fi.
+  closed once the other side is heard on the new one, not before. On the
+  tablet the Bluetooth path was named and drawn as Wi-Fi, and on the PC
+  it was "bt".
 
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a

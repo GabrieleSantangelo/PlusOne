@@ -46,8 +46,9 @@ pub const RESUME_WAIT: Duration = Duration::from_secs(15);
 /// The same with a channel open (the desktop, the speakers...): time for
 /// both devices to be moved to another network by hand.
 pub const RESUME_WAIT_IN_USE: Duration = Duration::from_secs(60);
-/// A path a better one took over from: its end this long after (run_path).
-const HANDOVER_LINGER: Duration = Duration::from_secs(1);
+/// A path a better one took over from ends once the other side is heard
+/// on the new one (Session::heard_on), or at the latest this long after.
+const HANDOVER_CAP: Duration = Duration::from_secs(3);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
@@ -363,7 +364,21 @@ struct Path {
     proven_us: AtomicU64,  // a pong's (0: none yet)
     rtt_us: AtomicU64,
     realtime_us: AtomicU64,  // since started: the last realtime or input datagram sent (0: none)
+    /// Not the session's path any more (lost, or a better one took over).
     gone: AtomicBool,
+    /// Shut down (end_path): its datagrams are read until then, after a
+    /// handover too (they are sealed with the session's keys, replays
+    /// dropped by the opener's window).
+    ended: AtomicBool,
+}
+
+/// A path's end: its stream shut down, its QUIC connection closed.
+fn end_path(path: &Path) {
+    path.ended.store(true, Ordering::SeqCst);
+    path.stream.shutdown();
+    if let Some(quic) = &path.quic {
+        quic.close();
+    }
 }
 
 impl Path {
@@ -413,6 +428,9 @@ pub struct Session {
     wake: Wake,
     path: Mutex<Option<Arc<Path>>>,
     arriving: Mutex<Option<Established>>,
+    /// The path a handover left, and when it ends at the latest (retire()).
+    retiring: Mutex<Option<(Arc<Path>, Instant)>>,
+    retiring_any: AtomicBool,
     sealer: Sealer,
     opener: Mutex<Opener>,
     dropped: AtomicU64,
@@ -573,16 +591,12 @@ fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
     }
     let quic = established.quic.take();
     // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
-    let transport = match (&quic, established.stream.addresses()) {
-        (Some(_), _) => "quic",
-        (None, Some(_)) => "tcp",
-        (None, None) => "stream",
-    };
+    let transport = if quic.is_some() { "quic" } else { established.stream.transport() };
     Ok(Arc::new(Path { kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
-                       gone: AtomicBool::new(false) }))
+                       gone: AtomicBool::new(false), ended: AtomicBool::new(false) }))
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
@@ -632,6 +646,8 @@ impl Session {
             wake: Wake::new()?,
             path: Mutex::default(),
             arriving: Mutex::default(),
+            retiring: Mutex::default(),
+            retiring_any: AtomicBool::new(false),
             sealer: std::mem::replace(&mut established.sealer, Sealer::new(&[0; 32], 0)),
             opener: Mutex::new(std::mem::replace(&mut established.opener, Opener::new(&[0; 32], 0))),
             dropped: AtomicU64::new(0),
@@ -767,6 +783,7 @@ impl Session {
         if let Some(arriving) = self.arriving.lock().unwrap().take() {
             arriving.close();
         }
+        self.retire(None);
         self.wake.wake();
         for (_, waiting) in self.pending.lock().unwrap().drain() {
             let _ = waiting.send(Err("the session is over".into()));
@@ -1118,7 +1135,10 @@ impl Session {
     fn run_path(self: &Arc<Self>, mut established: Established, path: Option<Arc<Path>>, resumed: bool) -> String {
         let path = match path.map(Ok).unwrap_or_else(|| prepare(&mut established)) {
             Ok(path) => path,
-            Err(e) => return e.to_string(),
+            Err(e) => {
+                self.retire(None);
+                return e.to_string();
+            }
         };
         let Established { mut conn, mut stream, mut decoder, .. } = established;
         if resumed {
@@ -1145,7 +1165,7 @@ impl Session {
                 me.datagram_in(&here, &mut buf, None, &mut Vec::new());
             });
             // Its budget told as it moves, until the path goes (quic.close();
-            // not after a better one took over: HANDOVER_LINGER).
+            // not after a better one took over: retire()).
             let (me, budget, here) = (Arc::downgrade(self), quic.budget(), path.clone());
             let _ = std::thread::Builder::new().name("link-budget".into()).spawn(move || {
                 let mut told = 0;
@@ -1164,32 +1184,70 @@ impl Session {
         conn.set_buffer_limit(None);
         let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err();
         path.gone.store(true, Ordering::SeqCst);
-        // A better path took over: the other side takes it a moment after us
-        // (its hellos' end is behind ours), and until then would take this
-        // one's end for a path lost: detached, then moved (the tablet's
-        // "Reconnecting…" over the desktop at each move to QUIC, the PC
-        // dialing again). Its end HANDOVER_LINGER later, then: nobody reads
-        // it meanwhile, what the other side still sends on it comes again
-        // on the new one (not acknowledged), and its stream is a clone of
-        // ours (dropped now: no FIN while that one is open).
-        let end = |path: &Path| {
-            path.stream.shutdown();
-            if let Some(quic) = &path.quic {
-                quic.close();
-            }
-        };
+        // A better path took over: this one is retired, not ended (retire()).
         let handed_over = reason.is_none() && !self.is_closed() && self.arriving.lock().unwrap().is_some();
-        let lingering = handed_over && {
-            let old = path.clone();
-            std::thread::Builder::new().name("link-handover".into()).spawn(move || {
-                std::thread::sleep(HANDOVER_LINGER);
-                end(&old);
-            }).is_ok()
-        };
-        if !lingering {
-            end(&path);
+        self.retire(handed_over.then(|| path.clone()));
+        if !handed_over {
+            end_path(&path);
         }
         reason.unwrap_or_else(|| "a better path".into())
+    }
+
+    /// The path a handover left (None: none), and the one it left before,
+    /// if still there, ended now. The other side takes the new path a
+    /// moment after us (its hellos' end is behind ours) and until then would
+    /// take the old one's end for a path lost: detached, then moved (the
+    /// tablet's "Reconnecting…" over the desktop at each move to QUIC, the
+    /// PC dialing again). So the old one ends once something of the other
+    /// side's comes on the new one (heard_on: nothing comes on a path before
+    /// its session takes it), or HANDOVER_CAP after (drive's own wait: no
+    /// timer of its own). Meanwhile nobody reads its stream: what the other
+    /// side still sends there comes again on the new one (not
+    /// acknowledged); its stream is a clone of the session thread's (that
+    /// one dropped: no FIN while this one is open); its datagrams still
+    /// count.
+    fn retire(&self, path: Option<Arc<Path>>) {
+        let until = Instant::now() + HANDOVER_CAP;
+        let mut retiring = self.retiring.lock().unwrap();
+        self.retiring_any.store(path.is_some(), Ordering::SeqCst);
+        let before = std::mem::replace(&mut *retiring, path.map(|path| (path, until)));
+        drop(retiring);
+        if let Some((before, _)) = before {
+            end_path(&before);
+        }
+    }
+
+    /// Something authenticated came on path (its stream's frame, a sealed
+    /// datagram): if it is not the path a handover left, the other side is
+    /// on the new one too, and the old one ends.
+    fn heard_on(&self, path: &Path) {
+        if self.retiring_any.load(Ordering::Relaxed) {
+            self.end_retiring(|old, _| !std::ptr::eq(old, path));
+        }
+    }
+
+    /// When the path a handover left ends at the latest, if there is one;
+    /// ended now if that is past.
+    fn retiring_until(&self, now: Instant) -> Option<Instant> {
+        if !self.retiring_any.load(Ordering::Relaxed) {
+            return None;
+        }
+        if self.end_retiring(|_, until| until <= now) {
+            log!("{}: nothing heard on the new path in {} s: the one before ends", self.label(), HANDOVER_CAP.as_secs());
+            return None;
+        }
+        self.retiring.lock().unwrap().as_ref().map(|(_, until)| *until)
+    }
+
+    /// The path a handover left ended if done(it, until) says so (under the
+    /// lock: a handover meanwhile is not mistaken for it): whether it was.
+    fn end_retiring(&self, done: impl FnOnce(&Path, Instant) -> bool) -> bool {
+        let mut retiring = self.retiring.lock().unwrap();
+        let Some((old, _)) = retiring.take_if(|(old, until)| done(&**old, *until)) else { return false };
+        self.retiring_any.store(false, Ordering::SeqCst);
+        drop(retiring);
+        end_path(&old);
+        true
     }
 
     fn drive(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,
@@ -1202,6 +1260,7 @@ impl Session {
         let mut next_udp_ping = Instant::now();
         // Frames that came with the hello.
         while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
+            self.heard_on(path);
             self.frame(kind, channel, body)?;
         }
         loop {
@@ -1292,7 +1351,11 @@ impl Session {
                 self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
             }
             let datagrams = path.udp.is_some() || path.quic.is_some();
-            let mut wait = if datagrams { next_ping.min(next_udp_ping) } else { next_ping }.saturating_duration_since(now);
+            let mut deadline = if datagrams { next_ping.min(next_udp_ping) } else { next_ping };
+            if let Some(until) = self.retiring_until(now) {
+                deadline = deadline.min(until);  // the path a handover left, at the latest
+            }
+            let mut wait = deadline.saturating_duration_since(now);
             if let Some(paced) = paced.filter(|_| self.outbox.lock().unwrap().reliable_bytes > 0) {
                 wait = wait.min(paced);  // the reliable frames' next turn
             }
@@ -1328,6 +1391,7 @@ impl Session {
             }
             while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
                 path.heard();
+                self.heard_on(path);
                 self.frame(kind, channel, body)?;
             }
         }
@@ -1450,7 +1514,9 @@ impl Session {
         let Some(udp) = &path.udp else { return };
         let mut buf = vec![0u8; 2048];
         let mut sealed = Vec::with_capacity(64);
-        while !self.is_closed() && !path.gone.load(Ordering::SeqCst) {
+        // Until the path ends, not when it is left: a handover's old path is
+        // read as its QUIC datagrams are (retire()).
+        while !self.is_closed() && !path.ended.load(Ordering::SeqCst) {
             let (length, from) = match udp.recv_from(&mut buf) {
                 Ok(got) => got,
                 Err(_) => continue,  // the timeout: look at closed again
@@ -1464,6 +1530,7 @@ impl Session {
     fn datagram_in(&self, path: &Path, buf: &mut [u8], from: Option<SocketAddr>, sealed: &mut Vec<u8>) {
         let Some((count, channel, body)) = self.opener.lock().unwrap().open(buf) else { return };
         path.heard();
+        self.heard_on(path);
         // Where it came from is where the other side is now (its address
         // may change; only a sealed packet can say so).
         if let Some(from) = from {

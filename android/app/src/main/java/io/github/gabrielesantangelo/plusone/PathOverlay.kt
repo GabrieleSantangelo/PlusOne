@@ -54,7 +54,21 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     private val fade = Runnable {
         pill.animate().alpha(FAINT).setInterpolator(AccelerateInterpolator()).setStartDelay(0).setDuration(FADE_MS)
     }
-    private var movedAt = 0L           // uptime ms of the last move, waiting for a frame after it
+    private var movedAt = 0L           // uptime ms of the last move, waiting for a frame after it (0: none)
+    // Steady after a move: a frame decoded after it (or, at worst, STEADY_MS); then the screen goes.
+    private val look = object : Runnable {
+        override fun run() {
+            val since = movedAt
+            if (since == 0L) return
+            val frame = session()?.lastFrameAt ?: 0L
+            if (frame > since || SystemClock.uptimeMillis() - since > STEADY_MS) postDelayed(settle, SETTLE_MS)
+            else postDelayed(this, 100)
+        }
+    }
+    private val settle = Runnable {
+        movedAt = 0
+        hideScrim()
+    }
 
     init {
         // The label, a pill: bottom left, clear of GNOME's bar and of most windows' buttons.
@@ -118,21 +132,47 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     }
 
     /** The path now and its transport, without a change's screen (the
-     * desktop just opened, or is in front again). */
+     * desktop just opened, or is in front again). On a path, the desktop is
+     * live: a change screen left from before (events missed while it was
+     * not shown) goes at once. */
     fun show(path: String?, transport: String?) {
+        if (path != null) clearScrim()
         setPill(path, transport)
     }
 
     /** A change of the PC's path or transport (LinkStatus): before and now. */
-    fun changed(before: LinkStatus.Pc?, now: LinkStatus.Pc?, gone: Boolean) {
-        if (gone) return  // the session over: the activity goes
-        val path = now?.path
-        val transport = now?.transport
-        when {
-            path == null -> waiting(before?.path ?: shown)
-            path != shown -> moved(shown, path, transport)
-            transport != shownTransport -> setPill(path, transport)  // TCP to QUIC: the same path
+    fun changed(before: LinkStatus.Pc?, now: LinkStatus.Pc?) {
+        when (val change = PathLabel.change(shown, shownTransport, now)) {
+            PathLabel.Change.Gone, PathLabel.Change.Same -> {}  // gone: the activity goes
+            PathLabel.Change.Waiting -> waiting(before?.path ?: shown)
+            is PathLabel.Change.Moved -> moved(shown, change.path, change.transport)
+            is PathLabel.Change.Transport -> setPill(change.path, change.transport)
         }
+    }
+
+    /** Nothing going on while the desktop is not shown (the activity
+     * stopped, or this view gone): no timer, no animation, the change
+     * screen down; show() says what is now when it is back. */
+    fun stop() {
+        clearScrim()
+        removeCallbacks(fade)
+        pill.animate().cancel()
+    }
+
+    override fun onDetachedFromWindow() {
+        stop()
+        super.onDetachedFromWindow()
+    }
+
+    private fun clearScrim() {
+        removeCallbacks(look)
+        removeCallbacks(settle)
+        movedAt = 0
+        spin?.cancel()
+        spin = null
+        for (view in listOf(scrim, fromIcon, toIcon)) view.animate().cancel()
+        rings.stop()
+        scrim.visibility = GONE
     }
 
     /** The pill, bright from now for SHOWN_MS, then faint (the system's
@@ -161,9 +201,12 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     }
 
     private fun showScrim() {
-        if (scrim.visibility == VISIBLE) return
-        scrim.alpha = 0f
-        scrim.visibility = VISIBLE
+        // Going already: up again (its fade's end would take it down).
+        scrim.animate().cancel()
+        if (scrim.visibility != VISIBLE) {
+            scrim.alpha = 0f
+            scrim.visibility = VISIBLE
+        }
         scrim.animate().alpha(1f).setDuration(200)
         rings.start()
     }
@@ -178,6 +221,8 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
     /** The path lost: the screen up, the lost path's icon giving way to the arrows. */
     private fun waiting(lost: String?) {
         movedAt = 0
+        removeCallbacks(look)
+        removeCallbacks(settle)
         showScrim()
         title.text = context.getString(R.string.path_reconnecting)
         detail.text = if (lost != null) context.getString(R.string.switch_lost, LinkStatus.name(context, lost, inSentence = true))
@@ -230,19 +275,9 @@ class PathOverlay(context: Context, private val session: () -> DisplaySession?) 
         coming.animate().translationX(0f).alpha(1f).setInterpolator(OvershootInterpolator(2f)).setDuration(500).setStartDelay(150)
         setPill(to, transport)
         movedAt = SystemClock.uptimeMillis()
-        val since = movedAt
-        // Steady: a frame decoded after the move (or, at worst, STEADY_MS).
-        fun look() {
-            if (movedAt != since) return  // another change since
-            val frame = session()?.lastFrameAt ?: 0L
-            val waited = SystemClock.uptimeMillis() - since
-            if (frame > since || waited > STEADY_MS) {
-                postDelayed({ if (movedAt == since) hideScrim() }, SETTLE_MS)
-            } else {
-                postDelayed(::look, 100)
-            }
-        }
-        postDelayed(::look, 300)
+        removeCallbacks(look)
+        removeCallbacks(settle)
+        postDelayed(look, 300)
     }
 
     /** Circles going out from the middle, one after the other. */

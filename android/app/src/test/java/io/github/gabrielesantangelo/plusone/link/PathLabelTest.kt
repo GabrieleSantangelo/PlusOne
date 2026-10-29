@@ -78,19 +78,50 @@ class PathLabelTest {
         assertEquals("Schermo del PC · Riconnessione…", PathLabel.marker(null, null, italian))
     }
 
+    /** An event as Android's org.json reads it: optString gives a JSON null
+     * as "null" (this one, the JVM's, gives the fallback, ""). */
+    private fun onAndroid(text: String) = object : JSONObject(text) {
+        override fun optString(key: String): String = opt(key)?.toString() ?: ""
+    }
+
     @Test
     fun aMoveToQuicOnTheSamePathIsAChange() {
         val pc = "ab".repeat(32)
-        LinkStatus.event(JSONObject("""{"event": "up", "device": "$pc", "name": "PC", "path": "lan", "transport": "tcp"}"""))
+        LinkStatus.event(onAndroid("""{"event": "up", "device": "$pc", "name": "PC", "path": "lan", "transport": "tcp"}"""))
         assertEquals(LinkStatus.Pc(pc, "PC", "lan", "tcp"), LinkStatus.pcs[pc])
-        LinkStatus.event(JSONObject("""{"event": "moved", "device": "$pc", "path": "lan", "transport": "quic"}"""))
+        LinkStatus.event(onAndroid("""{"event": "moved", "device": "$pc", "path": "lan", "transport": "quic"}"""))
         assertEquals(LinkStatus.Pc(pc, "PC", "lan", "quic"), LinkStatus.pcs[pc])
-        LinkStatus.event(JSONObject("""{"event": "detached", "device": "$pc"}"""))
+        LinkStatus.event(onAndroid("""{"event": "detached", "device": "$pc"}"""))
         assertEquals(LinkStatus.Pc(pc, "PC", null, null), LinkStatus.pcs[pc])
-        // An older core's events, with no transport (or a null one): none.
-        LinkStatus.event(JSONObject("""{"event": "moved", "device": "$pc", "path": "usb", "transport": null}"""))
-        assertEquals(LinkStatus.Pc(pc, "PC", "usb", null), LinkStatus.pcs[pc])
-        LinkStatus.event(JSONObject("""{"event": "gone", "device": "$pc"}"""))
+        LinkStatus.event(onAndroid("""{"event": "gone", "device": "$pc"}"""))
         assertNull(LinkStatus.pcs[pc])
+    }
+
+    @Test
+    fun aNullOrMissingTransportIsNone() {
+        val pc = "cd".repeat(32)
+        assertEquals("null", onAndroid("""{"transport": null}""").optString("transport"))  // what the guard is for
+        LinkStatus.event(onAndroid("""{"event": "up", "device": "$pc", "name": "PC", "path": null, "transport": null}"""))
+        assertEquals(LinkStatus.Pc(pc, "PC", null, null), LinkStatus.pcs[pc])
+        // An older core's events: no transport at all.
+        LinkStatus.event(onAndroid("""{"event": "moved", "device": "$pc", "path": "usb"}"""))
+        assertEquals(LinkStatus.Pc(pc, "PC", "usb", null), LinkStatus.pcs[pc])
+        LinkStatus.event(onAndroid("""{"event": "gone", "device": "$pc"}"""))
+    }
+
+    @Test
+    fun whatAChangeIsToTheDesktop() {
+        val pc = LinkStatus.Pc("ef".repeat(32), "PC", "lan", "tcp")
+        assertEquals(PathLabel.Change.Gone, PathLabel.change("lan", "tcp", null))
+        assertEquals(PathLabel.Change.Same, PathLabel.change("lan", "tcp", pc))
+        assertEquals(PathLabel.Change.Same, PathLabel.change("lan", "tcp", pc.copy(name = "Renamed")))
+        assertEquals(PathLabel.Change.Waiting, PathLabel.change("lan", "tcp", pc.copy(path = null, transport = null)))
+        // TCP moved to QUIC: the same path, the pill alone.
+        assertEquals(PathLabel.Change.Transport("lan", "quic"), PathLabel.change("lan", "tcp", pc.copy(transport = "quic")))
+        // Another path, or one again after a wait: the change screen.
+        assertEquals(PathLabel.Change.Moved("usb", "stream"), PathLabel.change("lan", "quic", pc.copy(path = "usb", transport = "stream")))
+        assertEquals(PathLabel.Change.Moved("lan", "quic"), PathLabel.change(null, null, pc.copy(transport = "quic")))
+        // The desktop opened before its PC's session was known.
+        assertEquals(PathLabel.Change.Moved("lan", "tcp"), PathLabel.change(null, null, pc))
     }
 }
