@@ -38,8 +38,13 @@
 //!                                "feature", "channel", "class", "id"} with
 //!                                each one's descriptor; until this
 //!                                connection closes
-//!   {"op": "watch"}              {"event": "up"|"gone", "device", ...} from
-//!                                then on
+//!   {"op": "watch"}              {"event": "up"|"moved"|"detached"|"gone",
+//!                                "device", ...} from then on; and
+//!                                {"event": "budget", "device", "kbps"}: what
+//!                                its path's congestion controller allows,
+//!                                as it moves (past 10 %, a cut at once:
+//!                                architecture §3.11), null on a path with
+//!                                none of its own (TCP, a cable)
 //! A connection that served or watched carries only events after that.
 //!
 //! Sessions are made when an app needs one, where the tablet was last
@@ -340,18 +345,30 @@ impl Daemon {
     }
 
     fn event(self: &Arc<Self>, event: Event) {
-        let message = match event {
-            Event::Up(session) => json!({"event": "up", "device": session.peer, "name": session.name,
-                                         "features": session.features(), "path": session.path()}),
-            Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path()}),
+        // On a path with no controller of its own: no budget (the apps
+        // follow their own way); on QUIC its controller tells it soon.
+        let no_budget = |session: &plusone_link::Session| {
+            (!session.by_quic()).then(|| json!({"event": "budget", "device": session.peer, "kbps": null}))
+        };
+        let (message, also) = match event {
+            Event::Up(session) => (json!({"event": "up", "device": session.peer, "name": session.name,
+                                          "features": session.features(), "path": session.path()}),
+                                   no_budget(&session)),
+            Event::Moved(session) => (json!({"event": "moved", "device": session.peer, "path": session.path()}),
+                                      no_budget(&session)),
+            Event::Budget(session, rate) => {
+                (json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}), None)
+            }
             Event::Detached(session) => {
                 self.come_back(session.clone());
-                json!({"event": "detached", "device": session.peer})
+                (json!({"event": "detached", "device": session.peer}), None)
             }
-            Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),
+            Event::Gone(device, reason) => (json!({"event": "gone", "device": device, "reason": reason}), None),
         };
         // Never waiting on an app: one that does not read loses its events.
-        self.watchers.lock().unwrap().retain(|watcher| api::send_now(watcher.as_raw_fd(), &message).is_ok());
+        for message in std::iter::once(message).chain(also) {
+            self.watchers.lock().unwrap().retain(|watcher| api::send_now(watcher.as_raw_fd(), &message).is_ok());
+        }
     }
 
     /// A session's path lost: another made at once, the network's (the

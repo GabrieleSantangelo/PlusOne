@@ -331,6 +331,7 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
                 message
             }
             Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path()}),
+            Event::Budget(session, rate) => json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}),
             Event::Detached(session) => json!({"event": "detached", "device": session.peer}),
             Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),
         };

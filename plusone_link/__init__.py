@@ -217,8 +217,11 @@ class Link:
                        f"link-serve-{feature}")
 
     def watch(self, on_event):
-        """Tablets coming and going, from now on: on_event({"event": "up" or
-        "gone", "device", ...}). close() the result to stop."""
+        """Tablets coming and going, from now on: on_event({"event": "up",
+        "moved", "detached" or "gone", "device", ...}); and {"event":
+        "budget", "device", "kbps"}: what the path's congestion controller
+        allows as it moves (None: a path with none of its own). close() the
+        result to stop."""
         return _Events(self.path, {"op": "watch"}, lambda event, _fd: on_event(event), "link-watch")
 
     def close(self):

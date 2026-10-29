@@ -49,7 +49,8 @@
   link and on the app's listener.
 - **The desktop keeps its quality on a phone's hotspot**: a lost packet or
   a still screen no longer takes the picture down to a few Mbit/s; on the
-  link's QUIC paths the picture follows the link's congestion controller.
+  link's QUIC paths the picture follows the link's congestion controller,
+  at once as it moves (plus-one-link tells the apps), not once a second.
 - **Post-quantum key exchange**: the link's TLS uses the hybrid
   X25519MLKEM768 between this PC and the app (X25519 with a version from
   before).

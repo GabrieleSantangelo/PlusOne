@@ -724,6 +724,12 @@ fn a_tcp_session_moves_to_quic() {
 #[test]
 fn a_session_by_quic_alone() {
     let (pc, tablet, _address) = pair();
+    let (events, budgets) = mpsc::channel();
+    pc.on_event(move |event| {
+        if let Event::Budget(session, rate) = event {
+            let _ = events.send((session.peer.clone(), rate));
+        }
+    });
     let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
     let session = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
     assert!(session.by_quic());
@@ -731,6 +737,10 @@ fn a_session_by_quic_alone() {
     let mut buf = vec![0u8; 1 << 10];
     control.send(b"hello").unwrap();
     assert_eq!(control.recv(&mut buf, WAIT).unwrap(), Some(5));
+    // Its controller's budget, told as it began (and as it moves).
+    let (peer, rate) = budgets.recv_timeout(Duration::from_secs(5)).expect("no budget told");
+    assert_eq!(peer, session.peer);
+    assert!(rate > 0);
 }
 
 /// A stream at about 100 KB/s, as Bluetooth goes: the PC's end and the

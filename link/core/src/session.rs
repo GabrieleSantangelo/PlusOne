@@ -1120,6 +1120,18 @@ impl Session {
                 let mut buf = datagram.to_vec();
                 me.datagram_in(&path, &mut buf, None, &mut Vec::new());
             });
+            // Its budget told as it moves, until the path goes (quic.close()).
+            let (me, budget) = (Arc::downgrade(self), quic.budget());
+            let _ = std::thread::Builder::new().name("link-budget".into()).spawn(move || {
+                let mut told = 0;
+                while let Some((count, rate)) = budget.wait(told) {
+                    told = count;
+                    let Some(me) = me.upgrade() else { return };
+                    if let Some(node) = me.node.upgrade() {
+                        node.budget(&me, rate);
+                    }
+                }
+            });
         }
         conn.set_buffer_limit(None);
         let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err().unwrap_or_else(|| "a better path".into());

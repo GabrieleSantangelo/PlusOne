@@ -14,6 +14,7 @@ use crate::log;
 use bytes::Bytes;
 use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, ServerConfig,
             TransportConfig};
+use crate::cc::{Budget, GccConfig};
 use crate::gate::Gate;
 use std::io;
 use std::net::SocketAddr;
@@ -71,7 +72,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn transport(rate: Arc<AtomicU64>) -> TransportConfig {
+fn transport(cc: Arc<GccConfig>) -> TransportConfig {
     let mut t = TransportConfig::default();
     // The session says when a path is dead (PATH_SILENCE); QUIC's own
     // timeout only frees what the session dropped.
@@ -92,7 +93,7 @@ fn transport(rate: Arc<AtomicU64>) -> TransportConfig {
     let mut ack = quinn::AckFrequencyConfig::default();
     ack.ack_eliciting_threshold(1u32.into()).max_ack_delay(Some(Duration::from_millis(2)));
     t.ack_frequency_config(Some(ack));
-    t.congestion_controller_factory(Arc::new(crate::cc::GccConfig { rate }));
+    t.congestion_controller_factory(cc);
     t
 }
 
@@ -101,7 +102,8 @@ fn transport(rate: Arc<AtomicU64>) -> TransportConfig {
 #[derive(Clone)]
 pub struct Quic {
     pub(crate) conn: Connection,
-    rate: Arc<AtomicU64>,
+    /// What its controller shares: the rate, the budget told.
+    cc: Arc<GccConfig>,
     /// Realtime bytes sent on it, all told: the bulk gets what they leave.
     realtime: Arc<AtomicU64>,
 }
@@ -110,7 +112,7 @@ impl Quic {
     /// A sealed datagram out, unless it would wait longer than LATE for the
     /// window or does not fit: false if dropped.
     pub(crate) fn send(&self, sealed: &[u8]) -> bool {
-        let rate = self.rate.load(Ordering::Relaxed);
+        let rate = self.cc.rate.load(Ordering::Relaxed);
         let waiting = DATAGRAM_SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space());
         if rate > 0 && waiting as f64 > rate as f64 * LATE.as_secs_f64() {
             return false;
@@ -124,10 +126,16 @@ impl Quic {
 
     /// What the controller allows now (bytes a second).
     pub fn rate(&self) -> u64 {
-        self.rate.load(Ordering::Relaxed)
+        self.cc.rate.load(Ordering::Relaxed)
+    }
+
+    /// The budget its controller tells, as it moves (cc.rs Budget).
+    pub(crate) fn budget(&self) -> Arc<Budget> {
+        self.cc.budget.clone()
     }
 
     pub(crate) fn close(&self) {
+        self.cc.budget.close();
         self.conn.close(0u32.into(), b"path over");
     }
 
@@ -142,14 +150,14 @@ impl Quic {
     }
 }
 
-fn client_config(client: &Arc<rustls::ClientConfig>) -> Result<(ClientConfig, Arc<AtomicU64>), String> {
+fn client_config(client: &Arc<rustls::ClientConfig>) -> Result<(ClientConfig, Arc<GccConfig>), String> {
     let mut tls = (**client).clone();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|e| e.to_string())?;
-    let rate: Arc<AtomicU64> = Arc::default();
+    let cc: Arc<GccConfig> = Arc::default();
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport(rate.clone())));
-    Ok((config, rate))
+    config.transport_config(Arc::new(transport(cc.clone())));
+    Ok((config, cc))
 }
 
 /// The server's TLS for QUIC: made once, for every connection.
@@ -159,12 +167,12 @@ fn server_crypto(server: &Arc<rustls::ServerConfig>) -> Result<Arc<quinn::crypto
     Ok(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| e.to_string())?))
 }
 
-/// A connection's: its own controller, whose rate it shares.
-fn server_config(crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>) -> (ServerConfig, Arc<AtomicU64>) {
-    let rate: Arc<AtomicU64> = Arc::default();
+/// A connection's: its own controller, and what it shares.
+fn server_config(crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>) -> (ServerConfig, Arc<GccConfig>) {
+    let cc: Arc<GccConfig> = Arc::default();
     let mut config = ServerConfig::with_crypto(crypto.clone());
-    config.transport_config(Arc::new(transport(rate.clone())));
-    (config, rate)
+    config.transport_config(Arc::new(transport(cc.clone())));
+    (config, cc)
 }
 
 /// An endpoint bound to address (port 0: any): it dials, and with server
@@ -231,7 +239,7 @@ impl ConnectionIdGenerator for MacCids {
 /// connection. Blocking (not on the runtime).
 pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, address: SocketAddr, timeout: Duration)
                    -> Result<(UnixStream, Quic), String> {
-    let (config, rate) = client_config(client)?;
+    let (config, cc) = client_config(client)?;
     runtime().block_on(async {
         let connecting = endpoint.connect_with(config, address, "plus-one.invalid").map_err(|e| e.to_string())?;
         let conn = tokio::time::timeout(timeout, connecting).await.map_err(|_| "no answer".to_owned())?
@@ -240,8 +248,8 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
         // session's TLS hello, which the dialer writes first.
         let (send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let realtime: Arc<AtomicU64> = Arc::default();
-        let stream = bridge(&conn, send, recv, rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
-        Ok((stream, Quic { conn, rate, realtime }))
+        let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
+        Ok((stream, Quic { conn, cc, realtime }))
     })
 }
 
@@ -266,7 +274,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                 incoming.ignore();
                 continue;
             };
-            let (config, rate) = server_config(&crypto);
+            let (config, cc) = server_config(&crypto);
             let on = on.clone();
             tokio::spawn(async move {
                 let from = incoming.remote_address();
@@ -275,8 +283,8 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                         .map_err(|e| e.to_string())?;
                     let (send, recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
                     let realtime: Arc<AtomicU64> = Arc::default();
-                    let stream = bridge(&conn, send, recv, rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
-                    Ok::<_, String>((stream, Quic { conn, rate, realtime }))
+                    let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
+                    Ok::<_, String>((stream, Quic { conn, cc, realtime }))
                 };
                 match tokio::time::timeout(whole, accepted).await {
                     Ok(Ok((stream, quic))) => {

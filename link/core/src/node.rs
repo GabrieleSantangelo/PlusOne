@@ -33,6 +33,9 @@ pub enum Event {
     Detached(Arc<Session>),
     /// On another path now (session.path()).
     Moved(Arc<Session>),
+    /// Its QUIC path's budget moved (architecture §3.11; bytes a second):
+    /// what realtime and bulk may use now.
+    Budget(Arc<Session>, u64),
     /// A device's session over: (its fingerprint, why).
     Gone(String, String),
 }
@@ -116,6 +119,10 @@ impl NodeInner {
 
     pub(crate) fn moved(&self, session: &Arc<Session>) {
         self.event(Event::Moved(session.clone()));
+    }
+
+    pub(crate) fn budget(&self, session: &Arc<Session>, rate: u64) {
+        self.event(Event::Budget(session.clone(), rate));
     }
 
     fn accept(self: &Arc<Self>, stream: Box<dyn Stream>, kind: &str) -> std::io::Result<Arc<Session>> {

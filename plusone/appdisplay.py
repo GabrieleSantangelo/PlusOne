@@ -439,11 +439,7 @@ class RateControl:
         the picture went from 20 to 4 Mbit/s in 4 s on a hotspot taking 36,
         and took 50 s to come back)."""
         if budget:
-            self.clean, self.ceiling = 0, None
-            target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE)))
-            if abs(target - self.kbps) < self.kbps * self.STEADY:
-                return None
-            return self._set(target)
+            return self.budget(budget)
         delay = capture_to_decoded - first_to_decoded if shown >= self.FRAMES else None
         if delay is not None:
             self.delays.append(delay)
@@ -478,6 +474,16 @@ class RateControl:
             return self._set(max(up, self.kbps + 1))
         return None
 
+    def budget(self, budget):
+        """The path's congestion controller's budget (kbit/s), now (also as
+        plus-one-link tells it changed, between reports): the new bitrate
+        if it changed, else None."""
+        self.clean, self.ceiling = 0, None
+        target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE)))
+        if abs(target - self.kbps) < self.kbps * self.STEADY:
+            return None
+        return self._set(target)
+
     def _set(self, kbps):
         kbps = max(MIN_KBPS, min(self.most, kbps))
         if kbps == self.kbps:
@@ -499,6 +505,8 @@ class LinkPackets:
         self.payload = plusone_link.MAX_DATAGRAM - VIDEO_HEADER.size
         self._open = [media, input]
         self.errors = set()
+        self._budget = None  # plus-one-link's last word on it: kbit/s, 0 for none (not a QUIC path)
+        self._watch = None
 
     def send(self, body):
         try:
@@ -521,8 +529,24 @@ class LinkPackets:
 
     def budget_kbps(self):
         """What the path's congestion controller allows now (kbit/s): a
-        QUIC path's (GCC), else None (the stream of before has none)."""
+        QUIC path's (GCC), else None (the stream of before has none). As
+        plus-one-link last told it (watch_budget()), else asked."""
+        if self._budget is not None:
+            return self._budget or None
         return self._device().get("rate_kbps") or None
+
+    def watch_budget(self, on_budget):
+        """on_budget(kbit/s, or None: no controller of its own) each time
+        plus-one-link says the path's budget changed (past 10 %, at once
+        for a cut: architecture §3.11), on its events' thread; until close()."""
+        def event(event):
+            if event.get("event") == "budget" and event.get("device") == self.device:
+                self._budget = int(event.get("kbps") or 0)
+                on_budget(self._budget or None)
+        try:
+            self._watch = self.connection.watch(event)
+        except (OSError, ValueError, plusone_link.LinkError) as e:
+            log("app display: the link's budget not watched:", e)
 
     def _device(self):
         try:
@@ -549,6 +573,8 @@ class LinkPackets:
         return None
 
     def close(self):
+        if self._watch is not None:
+            self._watch.close()
         for channel in (self.control, self.media, self.input):
             channel.close()
         self.connection.close()
@@ -603,6 +629,7 @@ class AppStreamer:
         media.cap_keyframes(enc, bitrate, fps)
         self.fps = fps
         self.rate = RateControl(bitrate)
+        self._rate_lock = threading.Lock()  # the stats' thread and the link's budget events
         self.skipped = 0  # frames not encoded: the network behind
         # When each frame going into the encoder was captured, in order: one
         # comes out per one in (no B frames), and a flush drops those held.
@@ -627,6 +654,22 @@ class AppStreamer:
     def start(self):
         self.pipeline.set_state(Gst.State.PLAYING)
         self._feedback.start()
+        if hasattr(self.channel, "watch_budget"):
+            self.channel.watch_budget(self._budget)
+
+    def _budget(self, kbps):
+        """plus-one-link says the path's budget changed: followed at once,
+        not at the next report (a second later: the queue filled meanwhile)."""
+        if not kbps or not self._running:
+            return
+        with self._rate_lock:
+            changed = self.rate.budget(kbps)
+            if changed is not None:
+                self._bitrate(changed)
+
+    def _bitrate(self, kbps):
+        self.enc.set_property("bitrate", kbps)
+        media.cap_keyframes(self.enc, kbps, self.fps)
 
     def stop(self):
         self._running = False
@@ -714,12 +757,12 @@ class AppStreamer:
                 _kind, shown, lost, *ms = STATS_FORMAT.unpack(body)
                 encoded, self._encoded = sorted(self._encoded), []
                 skipped, self.skipped = self.skipped, 0
-                before = self.rate.kbps
                 budget = self.channel.budget_kbps() if hasattr(self.channel, "budget_kbps") else None
-                kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget)
-                if kbps is not None:
-                    self.enc.set_property("bitrate", kbps)
-                    media.cap_keyframes(self.enc, kbps, self.fps)
+                with self._rate_lock:
+                    before = self.rate.kbps
+                    kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget)
+                    if kbps is not None:
+                        self._bitrate(kbps)
                 self.on_stats({"shown": shown, "lost": lost,
                                "capture_to_decoded": [v / 10 for v in ms[:3]],
                                "whole_to_decoded": [v / 10 for v in ms[3:]],

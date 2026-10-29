@@ -1,6 +1,7 @@
 """The app display's packets: their layout, sealed both ways, replays refused."""
 import socket
 import struct
+import threading
 import types
 
 import pytest
@@ -328,6 +329,53 @@ def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
     assert rate.report(60, 0, 30, 20, budget=500) == appdisplay.MIN_KBPS  # nor below the least
     rate.kbps = 9000
     assert rate.report(55, 3, 30, 20) == 6000  # no budget (a TCP path): a frame lost cuts, as before
+
+
+class FakeWatchedLink:
+    """plus-one-link's connection, as LinkPackets uses it: its events by hand."""
+
+    def __init__(self):
+        self.on_event, self.asked, self.closed = None, 0, False
+
+    def watch(self, on_event):
+        self.on_event = on_event
+        return types.SimpleNamespace(close=lambda: setattr(self, "closed", True))
+
+    def devices(self):
+        self.asked += 1
+        return [{"id": "tab", "rate_kbps": 9000}]
+
+    def close(self):
+        pass
+
+
+def test_the_links_budget_is_followed_as_it_changes():
+    link = FakeWatchedLink()
+    channel = types.SimpleNamespace(close=lambda: None)
+    packets = appdisplay.LinkPackets(link, "tab", channel, channel, channel)
+    assert packets.budget_kbps() == 9000 and link.asked == 1  # not told yet: asked
+    told = []
+    packets.watch_budget(told.append)
+    link.on_event({"event": "budget", "device": "other", "kbps": 1000})
+    link.on_event({"event": "up", "device": "tab"})
+    assert told == []
+    link.on_event({"event": "budget", "device": "tab", "kbps": 12000})
+    assert told == [12000] and packets.budget_kbps() == 12000
+    link.on_event({"event": "budget", "device": "tab", "kbps": None})  # on a path of no controller of its own
+    assert told == [12000, None] and packets.budget_kbps() is None
+    assert link.asked == 1  # told: never asked again
+    packets.close()
+    assert link.closed
+    # The streamer: the new budget at once, between the reports.
+    bitrates = []
+    streamer = types.SimpleNamespace(rate=appdisplay.RateControl(20000), _rate_lock=threading.Lock(), _running=True,
+                                     _bitrate=bitrates.append)
+    appdisplay.AppStreamer._budget(streamer, 10000)
+    appdisplay.AppStreamer._budget(streamer, 10300)  # a few percent: no change
+    appdisplay.AppStreamer._budget(streamer, None)
+    streamer._running = False
+    appdisplay.AppStreamer._budget(streamer, 4000)
+    assert bitrates == [8500]
 
 
 def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():

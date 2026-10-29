@@ -21,7 +21,7 @@ use quinn_proto::RttEstimator;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const GROUP: Duration = Duration::from_millis(5);
@@ -56,16 +56,66 @@ const BUCKET: Duration = Duration::from_millis(50);
 /// to 58 ms on a phone's hotspot): that cut a session doing nothing to the
 /// least rate, 17 times, and the screen started again from there.
 const STANDING_BUCKETS: usize = 6;
+/// The budget told the application (architecture §3.11): when the rate
+/// moved past this share of the last told, going up at most every
+/// PUBLISH_EVERY, going down at once.
+const PUBLISH_CHANGE: f64 = 0.10;
+const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GccConfig {
     /// The rate (bytes a second) for the application to read.
     pub rate: Arc<AtomicU64>,
+    pub budget: Arc<Budget>,
 }
 
 impl ControllerFactory for GccConfig {
     fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
-        Box::new(Gcc::new(now, mtu, self.rate.clone()))
+        Box::new(Gcc::new(now, mtu, self.rate.clone(), self.budget.clone()))
+    }
+}
+
+/// The rate as told the application, as it moves (PUBLISH_CHANGE): waited
+/// on (wait()), never polled, so nothing wakes while it holds. The
+/// controller runs under quinn's lock: it only notes the rate here, and a
+/// thread of the session's tells it on.
+#[derive(Debug, Default)]
+pub struct Budget {
+    /// How many told so far, the last (bytes a second), and over (its path
+    /// gone).
+    told: Mutex<(u64, u64, bool)>,
+    changed: Condvar,
+}
+
+impl Budget {
+    fn publish(&self, rate: u64) {
+        let mut told = self.told.lock().unwrap();
+        told.0 += 1;
+        told.1 = rate;
+        self.changed.notify_all();
+    }
+
+    /// How many told so far, and the last (bytes a second), not waiting.
+    #[cfg(test)]
+    fn last(&self) -> (u64, u64) {
+        let told = self.told.lock().unwrap();
+        (told.0, told.1)
+    }
+
+    /// The path gone: wait() returns None from now on.
+    pub fn close(&self) {
+        self.told.lock().unwrap().2 = true;
+        self.changed.notify_all();
+    }
+
+    /// The rate told after the after-th (how many told by then, the rate in
+    /// bytes a second), waiting for it; None once closed.
+    pub fn wait(&self, after: u64) -> Option<(u64, u64)> {
+        let mut told = self.told.lock().unwrap();
+        while told.0 == after && !told.2 {
+            told = self.changed.wait(told).unwrap();
+        }
+        (!told.2).then_some((told.0, told.1))
     }
 }
 
@@ -96,6 +146,10 @@ struct Gcc {
     mtu: u64,
     rate: f64,
     out: Arc<AtomicU64>,
+    /// The budget told the application: when, which rate.
+    budget: Arc<Budget>,
+    published: f64,
+    published_at: Instant,
     slow_start: bool,
     state: State,
     // Trendline.
@@ -162,9 +216,10 @@ fn record(line: std::fmt::Arguments) {
 }
 
 impl Gcc {
-    fn new(now: Instant, mtu: u16, out: Arc<AtomicU64>) -> Gcc {
+    fn new(now: Instant, mtu: u16, out: Arc<AtomicU64>, budget: Arc<Budget>) -> Gcc {
         out.store(START_RATE as u64, Ordering::Relaxed);
-        Gcc { start: now, mtu: mtu as u64, rate: START_RATE, out, slow_start: true, state: State::Hold, group: None,
+        Gcc { start: now, mtu: mtu as u64, rate: START_RATE, out, budget, published: 0.0, published_at: now,
+              slow_start: true, state: State::Hold, group: None,
               previous: None, accumulated: 0.0, smoothed: 0.0, history: VecDeque::new(), deltas: 0, threshold: 12.5,
               last_update: None, over_time: -1.0, over_count: 0, previous_trend: 0.0, signal: Signal::Normal,
               acked: VecDeque::new(), acked_bytes: 0, max_mean: None, max_var: 0.4, last_change: now, lost: 0,
@@ -384,6 +439,18 @@ impl Gcc {
         }
     }
 
+    /// The rate told the application, if it moved past PUBLISH_CHANGE of the
+    /// last told: going down at once (a queue fills meanwhile), going up at
+    /// most every PUBLISH_EVERY.
+    fn publish(&mut self, now: Instant) {
+        let moved = (self.rate - self.published).abs() > PUBLISH_CHANGE * self.published;
+        if moved && (self.rate < self.published || now.duration_since(self.published_at) >= PUBLISH_EVERY) {
+            self.published = self.rate;
+            self.published_at = now;
+            self.budget.publish(self.rate as u64);
+        }
+    }
+
     /// An acknowledgement frame read through (quinn's on_end_acks).
     fn end_acks(&mut self, now: Instant, app_limited: bool) {
         record(format_args!("{} e {} {}", self.id, now.duration_since(self.start).as_micros(), app_limited as u8));
@@ -402,6 +469,7 @@ impl Gcc {
         }
         self.control(now, app_limited);
         self.out.store(self.rate as u64, Ordering::Relaxed);
+        self.publish(now);
         if tracing() && now.duration_since(self.traced) >= TRACE_EVERY {
             self.traced = now;
             crate::log!("cc {:.0} ms: rate {:.0} KB/s, acked {:.0} KB/s, trend {:.2} / {:.2}, {:?} {:?}{}{}, queue {} ms, \
@@ -461,7 +529,7 @@ impl Controller for Gcc {
 #[cfg(fuzzing)]
 pub fn fuzz(data: &[u8]) {
     let start = Instant::now();
-    let mut gcc = Gcc::new(start, 1200, Arc::default());
+    let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
     let mut now = start;
     for event in data.chunks_exact(6) {
         now += Duration::from_micros(u16::from_be_bytes([event[0], event[1]]) as u64 * 16);
@@ -506,7 +574,7 @@ mod tests {
     fn sending_less_does_not_take_the_rate_down() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
         let rtt = Duration::from_millis(10);
         carry(&mut gcc, &mut now, 3e6, 3.0, rtt);
         let before = gcc.rate;
@@ -521,7 +589,7 @@ mod tests {
     fn an_idle_path_in_power_saving_is_no_queue() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
         carry(&mut gcc, &mut now, 1e6, 2.0, Duration::from_millis(8));
         let before = gcc.rate;
         // Then a keepalive every 2 s, its round trip 30-60 ms (the radio asleep).
@@ -539,7 +607,7 @@ mod tests {
     fn a_wifis_jitter_is_no_overuse() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
         let rtt = Duration::from_millis(9);
         carry(&mut gcc, &mut now, 1e6, 2.0, rtt);
         // Every 300 ms the round trip climbs to 30 ms in 40 ms and comes
@@ -557,7 +625,7 @@ mod tests {
     fn a_queue_growing_is_cut_early() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
         carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
         // The path's rate falls under ours: the round trip grows 10 ms each 100 ms.
         for step in 1..=8u64 {
@@ -577,7 +645,7 @@ mod tests {
         let Ok(text) = std::fs::read_to_string(path) else { return };
         let start = Instant::now();
         let at = |us: u64| start + Duration::from_micros(us);
-        let mut gcc = Gcc::new(start, 1452, Arc::default());
+        let mut gcc = Gcc::new(start, 1452, Arc::default(), Arc::default());
         let mut through: VecDeque<(u64, u64)> = VecDeque::new();
         let (mut through_bytes, mut next, mut over_double, mut seconds) = (0u64, 1_000_000u64, 0u32, 0u32);
         let mut ratios = Vec::new();
@@ -621,10 +689,36 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_is_told_as_it_moves_a_cut_at_once() {
+        let start = Instant::now();
+        let mut now = start;
+        let budget: Arc<Budget> = Arc::default();
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), budget.clone());
+        carry(&mut gcc, &mut now, 2e6, 3.0, Duration::from_millis(10));
+        let (count, rate) = budget.last();
+        // Going up: at most one every PUBLISH_EVERY, each past 10 %.
+        assert!(count >= 1 && count <= 30, "{count} in 3 s");
+        assert!((rate as f64 - gcc.rate).abs() <= 0.1 * rate as f64, "{rate} told, {} now", gcc.rate);
+        // A queue: the cut told at once, whatever the last told's time.
+        let cuts = gcc.cuts;
+        let mut step = 0;
+        while gcc.cuts == cuts && step < 50 {
+            step += 1;
+            carry(&mut gcc, &mut now, 2e6, 0.02, Duration::from_millis(10 + 4 * step));
+        }
+        assert_ne!(gcc.cuts, cuts, "never cut");
+        let (after, told) = budget.last();
+        assert!(after > count && told < rate, "the cut not told: {told} after {rate}");
+        assert!((told as f64 - gcc.rate).abs() <= 0.1 * told as f64, "{told} told, {} now", gcc.rate);
+        budget.close();
+        assert_eq!(budget.wait(budget.last().0), None);
+    }
+
+    #[test]
     fn a_queue_that_stands_is_cut() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
         carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
         // The same rate, the round trip 40 ms more and staying (a router's queue).
         carry(&mut gcc, &mut now, 2e6, 1.0, Duration::from_millis(50));
