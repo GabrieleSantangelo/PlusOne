@@ -106,6 +106,11 @@ pub struct Quic {
     cc: Arc<GccConfig>,
     /// Realtime bytes sent on it, all told: the bulk gets what they leave.
     realtime: Arc<AtomicU64>,
+    /// quinn's datagram room with none waiting: what it holds is this less
+    /// the room now. Not DATAGRAM_SEND_BUFFER: quinn-proto 0.11.17 keeps 32
+    /// bytes aside, and 32 a datagram waiting; empty, it read 32 bytes still
+    /// to send, and the desktop's wait for none never ended.
+    idle: usize,
 }
 
 impl Quic {
@@ -113,8 +118,10 @@ impl Quic {
     /// window or does not fit: false if dropped.
     pub(crate) fn send(&self, sealed: &[u8]) -> bool {
         let rate = self.cc.rate.load(Ordering::Relaxed);
-        let waiting = DATAGRAM_SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space());
-        if rate > 0 && waiting as f64 > rate as f64 * LATE.as_secs_f64() {
+        let room = self.conn.datagram_send_buffer_space();
+        // Nor past quinn's room: it would drop the oldest to make some,
+        // unseen (over about 42 Mbit/s, LATE's worth is more than it holds).
+        if rate > 0 && self.idle.saturating_sub(room) as f64 > rate as f64 * LATE.as_secs_f64() || sealed.len() > room {
             return false;
         }
         let sent = self.conn.send_datagram(Bytes::copy_from_slice(sealed)).is_ok();
@@ -126,7 +133,7 @@ impl Quic {
 
     /// The datagrams handed to quinn and not sent yet (bytes).
     pub(crate) fn queued(&self) -> usize {
-        DATAGRAM_SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space())
+        self.idle.saturating_sub(self.conn.datagram_send_buffer_space())
     }
 
     /// What the controller allows now (bytes a second).
@@ -254,7 +261,8 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
         let (send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let realtime: Arc<AtomicU64> = Arc::default();
         let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
-        Ok((stream, Quic { conn, cc, realtime }))
+        let idle = conn.datagram_send_buffer_space();
+        Ok((stream, Quic { conn, cc, realtime, idle }))
     })
 }
 
@@ -289,7 +297,8 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                     let (send, recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
                     let realtime: Arc<AtomicU64> = Arc::default();
                     let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone()).map_err(|e| e.to_string())?;
-                    Ok::<_, String>((stream, Quic { conn, cc, realtime }))
+                    let idle = conn.datagram_send_buffer_space();
+                    Ok::<_, String>((stream, Quic { conn, cc, realtime, idle }))
                 };
                 match tokio::time::timeout(whole, accepted).await {
                     Ok(Ok((stream, quic))) => {

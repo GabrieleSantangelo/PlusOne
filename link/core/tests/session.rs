@@ -695,6 +695,11 @@ fn a_tcp_session_moves_to_quic() {
         }
     }
     assert!(got >= 495, "{got} of 500 came back");
+    // What went has gone: nothing waits (the desktop leaves frames out on it).
+    while session.queued() > 0 {
+        assert!(started.elapsed() < Duration::from_secs(10), "{} bytes never left", session.queued());
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // Bulk both ways: 32 MiB there and back.
     let bulk = session.open("echo", "bulk", Class::Control).unwrap();
     let reader = {
