@@ -78,7 +78,7 @@ class DisplaySession(private val packets: Packets) {
         val first = System.nanoTime()  // its first packet came
     }
     private val frames = HashMap<Int, Frame>()
-    private var newest = -1          // the newest frame given to the decoder
+    private var newest = -1          // the newest frame given to the decoder, or given up
     @Volatile private var needKeyframe = true  // until one comes, the others cannot be decoded
     private var askedAt = 0L
 
@@ -207,9 +207,11 @@ class DisplaySession(private val packets: Packets) {
                 break
             }
             val b = ByteBuffer.wrap(body).order(ByteOrder.BIG_ENDIAN)
+            if (!b.hasRemaining()) continue
+            // Too short for its kind: dropped, never read past its end.
             when (b.get()) {
-                VIDEO -> video(b)
-                PONG -> pong(b.long, b.long)
+                VIDEO -> if (b.remaining() > VIDEO_HEADER) video(b)
+                PONG -> if (b.remaining() >= PONG_SIZE) pong(b.long, b.long)
             }
         }
     }
@@ -221,7 +223,17 @@ class DisplaySession(private val packets: Packets) {
         val index = b.short.toInt() and 0xffff
         val count = b.short.toInt() and 0xffff
         val captured = b.long
-        if (number <= newest || count == 0 || index >= count) return  // old, or replayed
+        if (number <= newest || count !in 1..MAX_PARTS || index >= count) return  // old, replayed, or none of the PC's
+        if (number !in frames && frames.size >= MAX_FRAMES) {
+            // The newest few put together only: the oldest given up, lost,
+            // its packets still to come old.
+            val oldest = minOf(number, frames.keys.min())
+            frames.remove(oldest)
+            newest = oldest
+            synchronized(timing) { lost++ }
+            needKeyframe = true
+            if (oldest == number) return
+        }
         val frame = frames.getOrPut(number) { Frame(count, keyframe, captured) }
         if (frame.count != count || frame.parts[index] != null) return
         frame.parts[index] = ByteArray(b.remaining()).also { b.get(it) }
@@ -369,6 +381,12 @@ class DisplaySession(private val packets: Packets) {
         const val KEYFRAME_AGAIN = 250_000_000L  // ns
         const val OFFSET_AGE = 10_000_000_000L   // ns
         const val MAX_RESTARTS = 3
+        const val VIDEO_HEADER = 1 + 4 + 2 + 2 + 8  // after the kind
+        const val PONG_SIZE = 8 + 8
+        // A frame's packets at most: 5.6 MB of H.264 in the link's 1380-byte
+        // datagrams, more than a 4K keyframe (and a decoder's input buffer).
+        const val MAX_PARTS = 4096
+        const val MAX_FRAMES = 4                // put together at a time
         const val HIDDEN_PING_EVERY = 10        // ticks (seconds)
 
         /** The session being shown, for DisplayActivity. */

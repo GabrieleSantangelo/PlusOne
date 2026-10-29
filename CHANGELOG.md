@@ -154,6 +154,9 @@
   to 800 kbit/s. A keyframe the tablet asks for again is sent only once the
   last one could have come (a round trip, and its own time on the way):
   each one more went into the queue the first one waited in.
+- Fixed: a desktop packet cut short closed the tablet's app, and the
+  frames that never came whole were all kept, until it ran out of memory;
+  such packets are dropped now, and four frames at most wait to be whole.
 
 ## 0.10.0
 
