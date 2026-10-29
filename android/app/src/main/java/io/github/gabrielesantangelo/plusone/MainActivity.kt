@@ -18,6 +18,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 import java.io.File
 import com.google.android.material.R as M
+import io.github.gabrielesantangelo.plusone.link.LinkServer
 import io.github.gabrielesantangelo.plusone.link.Paired
 
 /**
@@ -227,9 +228,10 @@ class MainActivity : AppCompatActivity() {
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 // Not paired: what to do on the PC. Paired: what this tablet is for, or whom it is connected to.
-                val paired = Paired.all(this@MainActivity).isNotEmpty()
+                val names = Paired.all(this@MainActivity)
+                val paired = names.isNotEmpty()
                 if (pc != null) {
-                    addView(label(getString(R.string.connected_to, pc.name.ifEmpty { "PC" }),
+                    addView(label(getString(R.string.connected_to, LinkServer.readable(names[pc.id] ?: pc.name)),
                         M.attr.textAppearanceTitleLarge, M.attr.colorOnPrimaryContainer))
                     val by = io.github.gabrielesantangelo.plusone.link.LinkStatus.name(this@MainActivity, pc.path, inSentence = true)
                     addView(label(if (pc.path == null) by else getString(R.string.via, by),

@@ -238,12 +238,6 @@ class LinkServer(
         return accepted && answer.get() == "pair-ok"
     }
 
-    /** The PC's name as it says it, to be read: no control characters, none
-     * that turn the text around them (U+202E and the like), not too long. */
-    private fun readable(name: String): String =
-        name.filter { !Character.isISOControl(it) && Character.getType(it) != Character.FORMAT.toInt() }
-            .trim().take(64).ifEmpty { "PC" }
-
     /** An address as the PC writes it: IPv4 without the "::ffff:" prefix, no scope. */
     private fun address(address: InetAddress): String =
         address.hostAddress.orEmpty().substringBefore('%').removePrefix("::ffff:")
@@ -266,5 +260,11 @@ class LinkServer(
         // KEEPALIVE) before a session ends: a PC gone without closing the
         // link (asleep, off the network) does not keep the microphone on.
         const val SILENT_PC = 15_000
+
+        /** The PC's name as it says it, to be read: no control characters, none
+         * that turn the text around them (U+202E and the like), not too long. */
+        fun readable(name: String): String =
+            name.filter { !Character.isISOControl(it) && Character.getType(it) != Character.FORMAT.toInt() }
+                .trim().take(64).ifEmpty { "PC" }
     }
 }

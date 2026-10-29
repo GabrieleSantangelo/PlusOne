@@ -5,6 +5,8 @@ import io.github.gabrielesantangelo.plusone.link.ChannelLink
 import io.github.gabrielesantangelo.plusone.link.Handler
 import io.github.gabrielesantangelo.plusone.link.LinkChannel
 import io.github.gabrielesantangelo.plusone.link.LinkCore
+import io.github.gabrielesantangelo.plusone.link.LinkServer
+import io.github.gabrielesantangelo.plusone.link.Paired
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
@@ -34,7 +36,9 @@ class LinkFeatures(private val service: CompanionService, private val core: Link
             queue(channel.device, channel.feature, channel.name).put(channel)
             return
         }
-        val pc = core.devices().firstOrNull { it.optString("id") == channel.device }?.optString("name") ?: "PC"
+        // The name it was paired with, else the one it says: in notifications, to be read.
+        val pc = LinkServer.readable(Paired.all(service)[channel.device]
+            ?: core.devices().firstOrNull { it.optString("id") == channel.device }?.optString("name").orEmpty())
         val link = ChannelLink(channel, pc) { name -> take(channel.device, channel.feature, name) }
         try {
             while (true) {

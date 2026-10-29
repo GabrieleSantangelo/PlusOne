@@ -166,6 +166,10 @@
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.
+- Security: over the new link too, a PC's name is shown as it was
+  paired, without control or direction-changing characters and at most
+  64 long, in the notifications (camera and microphone, the desktop,
+  signing) and on the main screen.
 
 ## 0.10.0
 
