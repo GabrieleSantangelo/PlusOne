@@ -4,7 +4,7 @@
 //! that session's path (both hellos name it), not a new session.
 
 use crate::identity::{Identity, Paired};
-use crate::session::{self, Incoming, Session};
+use crate::session::{self, Incoming, PathInfo, Session};
 use crate::stream::Stream;
 use crate::log;
 use serde_json::{json, Map, Value};
@@ -33,6 +33,10 @@ pub enum Event {
     /// Its QUIC path's budget moved (architecture §3.11; bytes a second):
     /// what realtime and bulk may use now.
     Budget(Arc<Session>, u64),
+    /// One of its paths changed state (session::PathState): taken (active,
+    /// with Up or Moved), suspect, active again, failed (before Detached,
+    /// unless another takes over).
+    Path(Arc<Session>, PathInfo),
     /// A device's session over: (its fingerprint, why).
     Gone(String, String),
 }
@@ -120,6 +124,10 @@ impl NodeInner {
 
     pub(crate) fn budget(&self, session: &Arc<Session>, rate: u64) {
         self.event(Event::Budget(session.clone(), rate));
+    }
+
+    pub(crate) fn path(&self, session: &Arc<Session>, path: PathInfo) {
+        self.event(Event::Path(session.clone(), path));
     }
 
     fn accept(self: &Arc<Self>, stream: Box<dyn Stream>, kind: &str) -> std::io::Result<Arc<Session>> {

@@ -14,7 +14,10 @@
 //!                                QUIC one), transport ("quic", "tcp",
 //!                                "stream": a cable's, Bluetooth's; null
 //!                                with no path), rate_kbps (its
-//!                                controller's), dropped
+//!                                controller's), dropped, paths (each:
+//!                                id, kind, transport, state "active",
+//!                                "suspect" or "failed", rtt_ms,
+//!                                silent_ms, budget_bps, budget_from)
 //!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]
 //!    [, "kind": "p2p"|"ap"]}     a session with the tablet there (or with
 //!                                that one, wherever it is): its id; "p2p",
@@ -48,7 +51,9 @@
 //!                                its path's congestion controller allows,
 //!                                as it moves (past 10 %, a cut at once:
 //!                                architecture §3.11), null on a path with
-//!                                none of its own (TCP, a cable)
+//!                                none of its own (TCP, a cable); and
+//!                                {"event": "path", "device", ...} as a
+//!                                path's state changes (as devices' paths)
 //! A connection that served or watched carries only events after that.
 //!
 //! Sessions are made when an app needs one, where the tablet was last
@@ -124,6 +129,7 @@ impl Daemon {
                 "transport": session.and_then(|s| s.transport()),
                 "rate_kbps": session.and_then(|s| s.rate()).map(|r| r * 8 / 1000),
                 "dropped": session.map(|s| s.dropped()).unwrap_or(0),
+                "paths": session.map(|s| s.paths()).unwrap_or_default().iter().map(|p| p.json()).collect::<Vec<_>>(),
             }));
         }
         json!({"ok": true, "devices": devices})
@@ -390,6 +396,12 @@ impl Daemon {
             Event::Budget(session, rate) => {
                 (json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}), None)
             }
+            Event::Path(session, path) => {
+                let mut message = path.json();
+                message["event"] = json!("path");
+                message["device"] = json!(session.peer);
+                (message, None)
+            }
             Event::Detached(session) => {
                 self.come_back(session.clone());
                 (json!({"event": "detached", "device": session.peer}), None)
@@ -588,15 +600,66 @@ mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
 
-    /// A daemon in a folder of its own, with nothing paired.
-    fn daemon(name: &str) -> Arc<Daemon> {
+    fn identity() -> Identity {
+        let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
+        Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap()
+    }
+
+    /// A folder of the test's own, empty.
+    fn folder(name: &str) -> PathBuf {
         let folder = std::env::temp_dir().join(format!("plus-one-link-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
-        let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
-        let identity = Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap();
+        folder
+    }
+
+    /// A daemon in a folder of its own, with nothing paired.
+    fn daemon(name: &str) -> Arc<Daemon> {
+        let folder = folder(name);
+        let identity = identity();
         let node = Node::new("pc", &identity, Arc::new(|_: &str| false)).unwrap();
         Arc::new(Daemon::new(node, folder.clone(), identity.fingerprint(), folder.join("link.json")))
+    }
+
+    /// A daemon in a folder of its own with a tablet paired, and the
+    /// tablet.
+    fn paired_daemon(name: &str) -> (Arc<Daemon>, Node) {
+        let folder = folder(name);
+        let (pc, tablet) = (identity(), identity());
+        let (pc_fingerprint, tablet_fingerprint) = (pc.fingerprint(), tablet.fingerprint());
+        std::fs::write(folder.join("paired.json"), json!({tablet_fingerprint: "tablet"}).to_string()).unwrap();
+        let config = folder.clone();
+        let node = Node::new("pc", &pc, Arc::new(move |fp: &str| paired(&config).contains_key(fp))).unwrap();
+        let daemon = Arc::new(Daemon::new(node, folder.clone(), pc_fingerprint.clone(), folder.join("link.json")));
+        let events = daemon.clone();
+        daemon.node.on_event(move |event| events.event(event));
+        let tablet = Node::new("tablet", &tablet, Arc::new(move |fp: &str| fp == pc_fingerprint)).unwrap();
+        (daemon, tablet)
+    }
+
+    /// The tablet's session with the daemon over a stream an app hands it,
+    /// as Bluetooth's: its id.
+    fn by_bluetooth(daemon: &Arc<Daemon>, tablet: &Node) -> String {
+        let (app, _served) = app(daemon);
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let accepter = tablet.clone();
+        std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "bt").map(|_| ()));
+        api::send_fds(app.as_raw_fd(), br#"{"op": "stream", "kind": "bt"}"#, &[ours.as_raw_fd()]);
+        drop(ours);
+        let reply = heard(&app).expect("no reply");
+        assert_eq!(reply["ok"], true, "{reply}");
+        reply["device"].as_str().unwrap().to_owned()
+    }
+
+    /// The events an app watching hears, until one of each kind in kinds
+    /// came (the last of each).
+    fn events_until(watching: &OwnedFd, kinds: &[&str]) -> std::collections::HashMap<String, Value> {
+        let mut seen = std::collections::HashMap::new();
+        while kinds.iter().any(|kind| !seen.contains_key(*kind)) {
+            let event = heard(watching).unwrap_or_else(|| panic!("not all of {kinds:?} told: {seen:?}"));
+            seen.insert(event["event"].as_str().unwrap_or("").to_owned(), event);
+        }
+        seen
     }
 
     /// An app's connection to it, served on a thread of its own.
@@ -753,5 +816,25 @@ mod tests {
         assert_eq!(state["usb"], json!(["R52X"]));
         let folder = daemon.state.parent().unwrap();
         assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1, "the temporary files left");
+    }
+
+    #[test]
+    fn a_tablets_paths_are_told_and_listed() {
+        let (daemon, tablet) = paired_daemon("paths");
+        let (watching, _watched) = app(&daemon);
+        assert_eq!(ask(&watching, json!({"op": "watch"}))["ok"], true);
+        let device = by_bluetooth(&daemon, &tablet);
+        let told = events_until(&watching, &["up", "path"]);
+        let path = &told["path"];
+        assert_eq!((&path["device"], &path["id"], &path["kind"], &path["transport"], &path["state"]),
+                   (&json!(device), &json!(1), &json!("bt"), &json!("stream"), &json!("active")), "{path}");
+        let (app, _served) = app(&daemon);
+        let devices = ask(&app, json!({"op": "devices"}));
+        let listed = &devices["devices"][0]["paths"];
+        assert_eq!(listed.as_array().map(Vec::len), Some(1), "{devices}");
+        assert_eq!((&listed[0]["id"], &listed[0]["kind"], &listed[0]["state"]), (&json!(1), &json!("bt"), &json!("active")));
+        assert!(listed[0]["silent_ms"].is_u64() && listed[0]["budget_from"].is_string(), "{listed}");
+        daemon.node.close();
+        tablet.close();
     }
 }

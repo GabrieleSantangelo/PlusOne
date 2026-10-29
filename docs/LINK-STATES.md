@@ -39,7 +39,7 @@ Device machine with candidates.
 |---|---|---|
 | `HANDSHAKE` | 5 s a read, 8 s whole | TLS and hellos on a new connection |
 | `PATH_SILENCE` | 5 s | nothing heard on a path (stream frames and datagrams alike): the path is lost **[built]** |
-| `PATH_SUSPECT` | 1.5 s | nothing heard: look for a better/other path already, keep this one |
+| `PATH_SUSPECT` | 1.5 s | nothing heard: look for a better/other path already, keep this one (told and logged **[built]**; nothing looked for yet) |
 | `UDP_PROOF` | 3 s | a pong this recent: datagrams go both ways **[built]** |
 | `RESUME_WAIT` | 15 s; 60 s with a channel open | a session with no path this long is over (60 s: time to move both devices to another network by hand) **[built]** |
 | `IDLE` | 60 s | a session with no channel, not wanted, not by cable: closed **[built]** |
@@ -156,8 +156,8 @@ Invariants:
 | **Dialing** | TCP connect / AOA switch and READY/GO **[built]** / L2CAP connect / Wi-Fi Direct group | connected → Handshaking; failed or timeout → (Device decides: next candidate) |
 | **Handshaking** | TLS and hellos (`HANDSHAKE`) | done → Probing |
 | **Probing** | UDP pings every 200 ms while not proven **[built]**; datagrams go on the stream meanwhile **[built]** | a pong → Up (datagrams on UDP); `UDP_PROOF` without → Up(stream-only) (a network dropping UDP still works) **[built]** |
-| **Up** | pings each second **[built]** | nothing heard `PATH_SUSPECT` → Suspect; UDP pongs stop `UDP_PROOF` → Up(stream-only) **[built]** |
-| **Suspect** | still used; the Device looks for another path at once (cable, last address on another network, mDNS) | heard again → Up; `PATH_SILENCE` → Lost; a better/working path adopted → (the session moves) |
+| **Up** | pings each second **[built]** | nothing heard `PATH_SUSPECT` → Suspect **[built]**; UDP pongs stop `UDP_PROOF` → Up(stream-only) **[built]** |
+| **Suspect** | still used **[built]**; the Device looks for another path at once (cable, last address on another network, mDNS) | heard again → Up **[built]**; `PATH_SILENCE` → Lost **[built]**; a better/working path adopted → (the session moves) |
 | **Lost** | closed; the transport's resources freed (the USB interface released, the group removed) **[built for usb]** | — |
 
 ## 5. The app's side

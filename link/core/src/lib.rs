@@ -24,7 +24,7 @@ pub mod sys;
 
 pub use identity::{fingerprint, Identity, Paired};
 pub use node::{Event, Handler, Node};
-pub use session::{Channel, Incoming, Session};
+pub use session::{Channel, Incoming, PathInfo, PathState, Session};
 pub use stream::Stream;
 
 /// How a channel's messages travel.

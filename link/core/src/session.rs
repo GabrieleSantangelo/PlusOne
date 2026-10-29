@@ -6,7 +6,8 @@
 //! channels; input and realtime too while there is no UDP), and, when
 //! there is IP under it, a UDP socket or the QUIC connection's datagrams
 //! (input and realtime, sealed with the session's keys from the first TLS
-//! exporter). A path lost, the session
+//! exporter). A path silent PATH_SUSPECT is suspect (told), and lost
+//! after PATH_SILENCE; a path lost, the session
 //! waits RESUME_WAIT for another (the dialer makes one: plus-one-link);
 //! a better one coming (the cable) takes over. Each side numbers its
 //! reliable frames (the session's messages, the control channels'); a ping
@@ -32,12 +33,15 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// A ping each this long, on the stream and over UDP.
 pub const PING_EVERY: Duration = Duration::from_secs(1);
+/// Nothing from the other side on a path this long, though it pings each
+/// PING_EVERY: the path is suspect (still used; told, Event::Path).
+pub const PATH_SUSPECT: Duration = Duration::from_millis(1500);
 /// Nothing from the other side on a path this long (its stream and its
 /// datagrams alike): the path is lost.
 pub const PATH_SILENCE: Duration = Duration::from_secs(5);
@@ -372,8 +376,69 @@ struct Reliable {
     acknowledged: u64,  // the newest of theirs we said we have
 }
 
+/// A path's state (LINK-STATES §4): heard lately; nothing heard for
+/// PATH_SUSPECT (still used); lost (PATH_SILENCE, its stream's error or
+/// end), its last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathState {
+    Active,
+    Suspect,
+    Failed,
+}
+
+impl PathState {
+    pub fn name(self) -> &'static str {
+        match self {
+            PathState::Active => "active",
+            PathState::Suspect => "suspect",
+            PathState::Failed => "failed",
+        }
+    }
+
+    fn from_u8(state: u8) -> PathState {
+        match state {
+            1 => PathState::Suspect,
+            2 => PathState::Failed,
+            _ => PathState::Active,
+        }
+    }
+}
+
+/// A path as it is now (Session::paths, Event::Path).
+#[derive(Clone, Debug)]
+pub struct PathInfo {
+    /// The session's number for it: a path taken again is another one.
+    pub id: u32,
+    /// "usb", "lan", "p2p", "ap", "bt", "relay".
+    pub kind: String,
+    /// What carries it (Session::transport).
+    pub transport: &'static str,
+    pub state: PathState,
+    /// The last round trip over its datagrams, if they work.
+    pub rtt_ms: Option<f32>,
+    /// Since something of the other side's last came on it.
+    pub silent_ms: u32,
+    /// What its congestion controller allows now (bits a second), and
+    /// whose: "gcc" (QUIC's, cc.rs), "drain" (what its stream drains,
+    /// measured), "prior" (its kind's, not measured yet), "none".
+    pub budget_bps: Option<u64>,
+    pub budget_from: &'static str,
+}
+
+impl PathInfo {
+    /// As plus-one-link and the app's core tell it: devices' "paths", the
+    /// "path" event.
+    pub fn json(&self) -> Value {
+        json!({"id": self.id, "kind": self.kind, "transport": self.transport, "state": self.state.name(),
+               "rtt_ms": self.rtt_ms.map(|rtt| (rtt as f64 * 100.0).round() / 100.0), "silent_ms": self.silent_ms,
+               "budget_bps": self.budget_bps, "budget_from": self.budget_from})
+    }
+}
+
 /// A path the session runs on now.
 struct Path {
+    /// PathInfo::id.
+    id: u32,
     kind: String,
     stream: Box<dyn Stream>,  // a clone of the session thread's, to shut it down
     udp: Option<UdpSocket>,
@@ -393,6 +458,8 @@ struct Path {
     /// handover too (they are sealed with the session's keys, replays
     /// dropped by the opener's window).
     ended: AtomicBool,
+    /// Its PathState, as a number: the session's thread alone moves it.
+    state: AtomicU8,
 }
 
 /// A path's end: its stream shut down, its QUIC connection closed, its
@@ -417,6 +484,15 @@ impl Path {
         self.heard_us.store(self.us().max(1), Ordering::Relaxed);
     }
 
+    /// Since something of the other side's last came on it (µs).
+    fn silent(&self) -> u64 {
+        self.us().saturating_sub(self.heard_us.load(Ordering::Relaxed))
+    }
+
+    fn state(&self) -> PathState {
+        PathState::from_u8(self.state.load(Ordering::Relaxed))
+    }
+
     /// Realtime or input went on it within the last REALTIME_GOING.
     fn realtime_going(&self) -> bool {
         let last = self.realtime_us.load(Ordering::Relaxed);
@@ -427,6 +503,23 @@ impl Path {
         let proven = self.proven_us.load(Ordering::Relaxed);
         (self.udp.is_some() || self.quic.is_some()) && proven != 0
             && self.us().saturating_sub(proven) < UDP_PROOF.as_micros() as u64
+    }
+
+    /// What its congestion controller allows now (bytes a second), and
+    /// whose (PathInfo::budget_from).
+    fn budget(&self) -> (Option<u64>, &'static str) {
+        match &self.quic {
+            Some(quic) => (Some(quic.rate()), "gcc"),
+            None => (None, "none"),
+        }
+    }
+
+    fn info(&self) -> PathInfo {
+        let (budget, from) = self.budget();
+        PathInfo { id: self.id, kind: self.kind.clone(), transport: self.transport, state: self.state(),
+                   rtt_ms: self.udp_works().then(|| self.rtt_us.load(Ordering::Relaxed) as f32 / 1000.0),
+                   silent_ms: (self.silent() / 1000).min(u32::MAX as u64) as u32,
+                   budget_bps: budget.map(|rate| rate * 8), budget_from: from }
     }
 }
 
@@ -461,6 +554,8 @@ pub struct Session {
     /// The path a handover left, and when it ends at the latest (retire()).
     retiring: Mutex<Option<(Arc<Path>, Instant)>>,
     retiring_any: AtomicBool,
+    /// The next path's PathInfo::id.
+    next_path: AtomicU32,
     sealer: Sealer,
     opener: Mutex<Opener>,
     dropped: AtomicU64,
@@ -647,20 +742,22 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
                      kind, id, resumes, forced, quic: None })
 }
 
-/// A connection made ready to be a path: non-blocking from now on, its
-/// UDP socket (if any) taken into the path.
-fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
+/// A connection made ready to be a path (id: the session's number for
+/// it): non-blocking from now on, its UDP socket (if any) taken into the
+/// path.
+fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
     established.stream.set_timeouts(None)?;
     established.stream.set_nonblocking(true)?;
     let udp = established.udp.take();
     let quic = established.quic.take();
     // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
     let transport = if quic.is_some() { "quic" } else { established.stream.transport() };
-    Ok(Arc::new(Path { kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
+    Ok(Arc::new(Path { id, kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
-                       gone: AtomicBool::new(false), ended: AtomicBool::new(false) }))
+                       gone: AtomicBool::new(false), ended: AtomicBool::new(false),
+                       state: AtomicU8::new(PathState::Active as u8) }))
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
@@ -713,12 +810,13 @@ impl Session {
             arriving: Mutex::default(),
             retiring: Mutex::default(),
             retiring_any: AtomicBool::new(false),
+            next_path: AtomicU32::new(1),
             sealer: std::mem::replace(&mut established.sealer, Sealer::new(&[0; 32], 0)),
             opener: Mutex::new(std::mem::replace(&mut established.opener, Opener::new(&[0; 32], 0))),
             dropped: AtomicU64::new(0),
         });
         // Its first path ready before anyone sees the session.
-        let path = prepare(&mut established)?;
+        let path = prepare(&mut established, session.next_path.fetch_add(1, Ordering::Relaxed))?;
         *session.path.lock().unwrap() = Some(path.clone());
         let me = session.clone();
         std::thread::Builder::new().name("link-session".into()).spawn(move || me.run(established, path))?;
@@ -791,6 +889,12 @@ impl Session {
     /// The last round trip over UDP, if it works.
     pub fn rtt(&self) -> Option<Duration> {
         self.current().filter(|path| path.udp_works()).map(|path| Duration::from_micros(path.rtt_us.load(Ordering::Relaxed)))
+    }
+
+    /// Its paths as they are now: the one it runs on (none while it waits
+    /// for one).
+    pub fn paths(&self) -> Vec<PathInfo> {
+        self.current().map(|path| path.info()).into_iter().collect()
     }
 
     /// Bytes sent and not yet on the air (the UDP socket's, the queue's,
@@ -1216,7 +1320,7 @@ impl Session {
     /// One path, until it is lost, a better one is handed over, or the
     /// session is over: why it ended.
     fn run_path(self: &Arc<Self>, mut established: Established, path: Option<Arc<Path>>, resumed: bool) -> String {
-        let path = match path.map(Ok).unwrap_or_else(|| prepare(&mut established)) {
+        let path = match path.map(Ok).unwrap_or_else(|| prepare(&mut established, self.next_path.fetch_add(1, Ordering::Relaxed))) {
             Ok(path) => path,
             Err(e) => {
                 self.retire(None);
@@ -1237,6 +1341,7 @@ impl Session {
                 node.moved(self);
             }
         }
+        self.tell_path(&path, PathState::Active);
         if path.udp.is_some() {
             let (me, path) = (self.clone(), path.clone());
             let _ = std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(path));
@@ -1267,6 +1372,17 @@ impl Session {
         conn.set_buffer_limit(None);
         let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err();
         path.gone.store(true, Ordering::SeqCst);
+        // Lost (not left for a better one, nor ended with the session): failed.
+        if let Some(reason) = reason.as_ref().filter(|_| !self.is_closed() && !self.closing.load(Ordering::SeqCst)) {
+            let silent = Duration::from_micros(path.silent());
+            let suspect = match path.state() {
+                PathState::Suspect => format!(", suspect for {:.1} s", silent.saturating_sub(PATH_SUSPECT).as_secs_f64()),
+                _ => String::new(),
+            };
+            log!("{}: the {} path ({}) failed ({reason}), {:.1} s after the last heard{suspect}", self.label(), path.kind,
+                 path.id, silent.as_secs_f64());
+            self.tell_path(&path, PathState::Failed);
+        }
         // A better path took over: this one is retired, not ended (retire()).
         let handed_over = reason.is_none() && !self.is_closed() && self.arriving.lock().unwrap().is_some();
         self.retire(handed_over.then(|| path.clone()));
@@ -1274,6 +1390,15 @@ impl Session {
             end_path(&path);
         }
         reason.unwrap_or_else(|| "a better path".into())
+    }
+
+    /// path's state from now on (the session's thread alone moves it),
+    /// told (Event::Path).
+    fn tell_path(self: &Arc<Self>, path: &Path, state: PathState) {
+        path.state.store(state as u8, Ordering::Relaxed);
+        if let Some(node) = self.node.upgrade() {
+            node.path(self, path.info());
+        }
     }
 
     /// The path a handover left (None: none), and the one it left before,
@@ -1341,6 +1466,7 @@ impl Session {
         self.stream_budget.store(STREAM_BUDGET, Ordering::Relaxed);
         let mut next_ping = Instant::now();
         let mut next_udp_ping = Instant::now();
+        let mut suspect_since = None;
         // Frames that came with the hello.
         while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
             self.heard_on(path);
@@ -1417,9 +1543,24 @@ impl Session {
                 !outbox.urgent.is_empty() || (outbox.reliable_bytes > 0 && paced.is_none() && room)
             };
             let now = Instant::now();
-            let silent = path.us().saturating_sub(path.heard_us.load(Ordering::Relaxed));
+            let silent = path.silent();
             if silent > PATH_SILENCE.as_micros() as u64 {
                 return Err(format!("nothing heard for {:.1} s", silent as f64 / 1e6));
+            }
+            // Nothing heard for PATH_SUSPECT, though the other side pings
+            // each PING_EVERY: suspect, until something comes (a datagram
+            // on a suspect path wakes this).
+            let suspect = silent >= PATH_SUSPECT.as_micros() as u64;
+            if suspect != suspect_since.is_some() {
+                if suspect {
+                    log!("{}: the {} path ({}) is suspect: nothing heard for {:.1} s", self.label(), path.kind, path.id,
+                         silent as f64 / 1e6);
+                    suspect_since = Some(now);
+                } else if let Some(since) = suspect_since.take() {
+                    log!("{}: the {} path ({}) heard again, suspect for {:.1} s", self.label(), path.kind, path.id,
+                         now.duration_since(since).as_secs_f64());
+                }
+                self.tell_path(path, if suspect { PathState::Suspect } else { PathState::Active });
             }
             let ack_due = {
                 let reliable = self.reliable.lock().unwrap();
@@ -1446,6 +1587,10 @@ impl Session {
             }
             let datagrams = path.udp.is_some() || path.quic.is_some();
             let mut deadline = if datagrams { next_ping.min(next_udp_ping) } else { next_ping };
+            if suspect_since.is_none() {
+                // When it is suspect, if nothing comes before: no timer of its own.
+                deadline = deadline.min(now + PATH_SUSPECT.saturating_sub(Duration::from_micros(silent)));
+            }
             if let Some(until) = self.retiring_until(now) {
                 deadline = deadline.min(until);  // the path a handover left, at the latest
             }
@@ -1635,6 +1780,9 @@ impl Session {
     fn datagram_in(&self, path: &Path, buf: &mut [u8], from: Option<SocketAddr>, sealed: &mut Vec<u8>) {
         let Some((count, channel, body)) = self.opener.lock().unwrap().open(buf) else { return };
         path.heard();
+        if path.state() == PathState::Suspect && !path.gone.load(Ordering::Relaxed) {
+            self.wake.wake();  // active again: the session's thread says so (drive)
+        }
         self.heard_on(path);
         // Where it came from is where the other side is now (its address
         // may change; only a sealed packet can say so).
@@ -1672,7 +1820,7 @@ mod tests {
 
     use super::*;
     use crate::identity::{Identity, Paired};
-    use crate::Node;
+    use crate::{Event, Node};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
@@ -1700,8 +1848,11 @@ mod tests {
         conn: rustls::Connection,
         stream: Box<dyn Stream>,
         decoder: Decoder,
-        /// Its UDP socket, if the stream has IP under it: open, never read.
-        _udp: Option<UdpSocket>,
+        /// Its UDP socket, if the stream has IP under it (open, never
+        /// read), the PC's, and its datagrams' sealer.
+        udp: Option<UdpSocket>,
+        udp_peer: Option<SocketAddr>,
+        sealer: Sealer,
         next: u64,
     }
 
@@ -1722,7 +1873,7 @@ mod tests {
                 let ours = move |_: &str| resumes.clone().map(|id| (id, true));
                 let established = establish(conn.into(), stream(), false, hello, "usb", &ours).unwrap();
                 Fake { conn: established.conn, stream: established.stream, decoder: established.decoder,
-                       _udp: established.udp, next: 1 }
+                       udp: established.udp, udp_peer: established.udp_peer, sealer: established.sealer, next: 1 }
             })
         }
 
@@ -1745,6 +1896,13 @@ mod tests {
 
         fn say(&mut self, message: Value) {
             self.reliable(frame::SESSION, 0, message.to_string().as_bytes());
+        }
+
+        /// A datagram to the PC's UDP socket, sealed.
+        fn datagram(&self, channel: u16, body: &[u8]) {
+            let mut sealed = Vec::new();
+            self.sealer.seal(channel, body, &mut sealed);
+            self.udp.as_ref().unwrap().send_to(&sealed, self.udp_peer.unwrap()).unwrap();
         }
 
         /// The PC's next message of one of these types (the others passed over).
@@ -1808,6 +1966,27 @@ mod tests {
             let session = self.pc.connect(address, Duration::from_secs(2)).unwrap();
             (session, faking.join().unwrap())
         }
+    }
+
+    /// What node tells of its sessions' paths as each comes, and when;
+    /// Detached as None.
+    fn told_paths(node: &Node) -> mpsc::Receiver<(Instant, Option<PathInfo>)> {
+        let (tell, told) = mpsc::channel();
+        node.on_event(move |event| {
+            let said = match event {
+                Event::Path(_, path) => Some(path),
+                Event::Detached(_) => None,
+                _ => return,
+            };
+            let _ = tell.send((Instant::now(), said));
+        });
+        told
+    }
+
+    /// The next of told, the path's id and state (None: Detached).
+    fn next_told(told: &mpsc::Receiver<(Instant, Option<PathInfo>)>) -> (Instant, Option<(u32, PathState)>, Option<PathInfo>) {
+        let (at, path) = told.recv_timeout(Duration::from_secs(8)).expect("nothing told");
+        (at, path.as_ref().map(|path| (path.id, path.state)), path)
     }
 
     /// This process's threads named so, each one's directory in /proc.
@@ -1973,6 +2152,96 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(channel.recv(&mut buf, Some(Duration::from_secs(5))).unwrap(), Some(5), "the channel closed");
         assert_eq!(session.channels(), 1);
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_silent_path_is_suspect_at_once_and_lost_as_before() {
+        // A tablet that sends nothing, not even its pings: its path suspect
+        // PATH_SUSPECT after it was last heard (told then, not at the next
+        // ping, up to a second on), asleep meanwhile (its own pings alone
+        // wake it); active again once heard; lost after PATH_SILENCE as
+        // before, told before the session is detached.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let told = told_paths(&devices.pc);
+        let (session, mut fake) = devices.by_cable(false, None);
+        let (taken, path, info) = next_told(&told);
+        assert_eq!(path, Some((1, PathState::Active)));
+        assert_eq!(info.map(|info| (info.kind, info.transport)), Some(("usb".to_owned(), "stream")));
+        let (at, path, _) = next_told(&told);
+        assert_eq!(path, Some((1, PathState::Suspect)));
+        let after = at.duration_since(taken);
+        assert!(after >= Duration::from_millis(1400) && after < Duration::from_millis(1800), "suspect after {after:?}");
+        assert_eq!(session.paths().iter().map(|path| path.state).collect::<Vec<_>>(), [PathState::Suspect]);
+        let (before, spent) = (sleeps("link-session"), cpu("link-session"));
+        std::thread::sleep(Duration::from_millis(1500));
+        let woke = sleeps("link-session") - before;
+        let spent = cpu("link-session").saturating_sub(spent);
+        assert!(woke <= 4 && spent < Duration::from_millis(100), "suspect, it woke {woke} times in 1.5 s, {spent:?} of CPU");
+        fake.send(frame::PING, 0, &0u64.to_be_bytes());
+        let (heard, path, _) = next_told(&told);
+        assert_eq!(path, Some((1, PathState::Active)));
+        assert_eq!(next_told(&told).1, Some((1, PathState::Suspect)));
+        let (lost, path, info) = next_told(&told);
+        assert_eq!(path, Some((1, PathState::Failed)));
+        let after = lost.duration_since(heard);
+        assert!(after >= PATH_SILENCE && after < PATH_SILENCE + Duration::from_millis(1500), "lost after {after:?}");
+        assert!(info.unwrap().silent_ms >= 5000);
+        assert_eq!(next_told(&told).1, None, "then detached");
+        assert!(session.paths().is_empty());
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_suspect_path_heard_by_a_datagram_is_active_at_once() {
+        // Only the session's thread moves a path's state: the datagrams'
+        // wakes it, and the path is active again at once, not at its next
+        // ping (each second, past UDP_PROOF on a path whose UDP is not
+        // proven: a second from now).
+        let _one = one_at_a_time();
+        let devices = devices();
+        let told = told_paths(&devices.pc);
+        let (_session, fake) = devices.by_tcp();
+        let (taken, path, _) = next_told(&told);
+        assert_eq!(path, Some((1, PathState::Active)));
+        assert_eq!(next_told(&told).1, Some((1, PathState::Suspect)));
+        std::thread::sleep((taken + UDP_PROOF + Duration::from_millis(300)).saturating_duration_since(Instant::now()));
+        let sent = Instant::now();
+        let mut ping = vec![PING];
+        ping.extend_from_slice(&0u64.to_be_bytes());
+        fake.datagram(DATAGRAM_PATH, &ping);
+        let (heard, path, _) = next_told(&told);
+        assert_eq!(path, Some((1, PathState::Active)));
+        let after = heard.duration_since(sent);
+        assert!(after < Duration::from_millis(300), "active again {after:?} after a datagram");
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_path_heard_wakes_for_its_pings_alone() {
+        // A tablet that pings each second and does nothing else: the PC's
+        // session wakes for its own pings and the tablet's, nothing more
+        // (when the path would be suspect is in the wait it has, no timer
+        // of its own).
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, mut fake) = devices.by_cable(false, None);
+        let (stop, stopped) = mpsc::channel::<()>();
+        let pinging = std::thread::spawn(move || {
+            while stopped.recv_timeout(PING_EVERY) == Err(mpsc::RecvTimeoutError::Timeout) {
+                fake.send(frame::PING, 0, &0u64.to_be_bytes());
+            }
+            fake
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let before = sleeps("link-session");
+        std::thread::sleep(Duration::from_secs(3));
+        let woke = sleeps("link-session") - before;
+        assert!(woke <= 8, "the session's thread woke {woke} times in 3 s, with pings alone");
+        assert_eq!(session.paths().iter().map(|path| path.state).collect::<Vec<_>>(), [PathState::Active]);
+        stop.send(()).unwrap();
+        drop(pinging.join().unwrap());
         devices.pc.close();
     }
 }

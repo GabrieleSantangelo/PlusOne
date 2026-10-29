@@ -10,7 +10,7 @@
 //!   devices, close;
 //! - nativeNext(handle, ms): the next event (a channel the PC opened, with
 //!   its "fd"; a PC up, moved, gone: "path" and "transport" with up and
-//!   moved), or null;
+//!   moved; a path's state changed: "path", as devices' "paths"), or null;
 //! - nativeStop(handle).
 
 use jni::objects::{GlobalRef, JByteArray, JObject, JObjectArray, JString, JValue};
@@ -248,7 +248,8 @@ fn number<T: TryFrom<u64>>(request: &Value, key: &str, default: Option<T>) -> Re
 fn session_json(session: &plusone_link::Session) -> Value {
     json!({"id": session.peer, "name": session.name, "features": session.features(), "path": session.path(),
            "transport": session.transport(), "channels": session.channels(),
-           "rtt_ms": session.rtt().map(|r| r.as_secs_f64() * 1000.0), "dropped": session.dropped()})
+           "rtt_ms": session.rtt().map(|r| r.as_secs_f64() * 1000.0), "dropped": session.dropped(),
+           "paths": session.paths().iter().map(|p| p.json()).collect::<Vec<_>>()})
 }
 
 fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
@@ -391,6 +392,12 @@ fn start(env: &mut JNIEnv, name: JString, certificate: JByteArray, signer: JObje
             Event::Moved(session) => json!({"event": "moved", "device": session.peer, "path": session.path(),
                                             "transport": session.transport()}),
             Event::Budget(session, rate) => json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}),
+            Event::Path(session, path) => {
+                let mut message = path.json();
+                message["event"] = json!("path");
+                message["device"] = json!(session.peer);
+                message
+            }
             Event::Detached(session) => json!({"event": "detached", "device": session.peer}),
             Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),
         };
