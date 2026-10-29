@@ -15,6 +15,11 @@ import java.nio.ByteOrder
 class OpusDecoder(rate: Int, channels: Int) {
     private val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
     private val info = MediaCodec.BufferInfo()
+    /** The numbers of the packets in the decoder, oldest first: each sound
+     * that comes out is the oldest's. Not its timestamp: Android's decoder
+     * gives the first one's and the samples since (5000 µs a packet), and a
+     * packet read as 4999 missed before it was concealed: the sound crackled. */
+    private val inside = ArrayDeque<Int>()
 
     init {
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, rate, channels)
@@ -36,6 +41,8 @@ class OpusDecoder(rate: Int, channels: Int) {
             put(packet, offset, length)
         }
         codec.queueInputBuffer(input, 0, length, number.toLong() and 0xffffffffL, 0)
+        inside.addLast(number)
+        while (inside.size > HELD_MOST) inside.removeFirst()  // eaten with nothing out: not waited for
         val out = ArrayList<Pair<Int, ByteArray>>(1)
         var wait = WAIT_US
         while (true) {
@@ -48,7 +55,8 @@ class OpusDecoder(rate: Int, channels: Int) {
                 get(pcm)
             }
             codec.releaseOutputBuffer(index, false)
-            if (pcm.isNotEmpty()) out.add(info.presentationTimeUs.toInt() to pcm)
+            val of = inside.removeFirstOrNull() ?: continue
+            if (pcm.isNotEmpty()) out.add(of to pcm)
             wait = 0  // more only if it has them now
         }
     }
@@ -63,6 +71,7 @@ class OpusDecoder(rate: Int, channels: Int) {
 
     companion object {
         const val WAIT_US = 5_000L
+        const val HELD_MOST = 8  // packets
 
         /** RFC 7845's identification header: version 1, no pre-skip, no
          * gain, one stream (mapping family 0). */
