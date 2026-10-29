@@ -101,6 +101,11 @@ fn paired_name(entry: &Value) -> &str {
 }
 
 impl Daemon {
+    fn new(node: Node, config: PathBuf, ours: String, state: PathBuf) -> Daemon {
+        Daemon { node, config, ours, state, finding: Mutex::default(), usb: usb::Watcher::new(),
+                 switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(), serial: AtomicU64::new(0) }
+    }
+
     fn devices(&self) -> Value {
         let mut devices = Vec::new();
         let sessions = self.node.sessions();
@@ -399,11 +404,15 @@ impl Daemon {
         let client = Arc::new(client);
         let mut buf = vec![0u8; REQUEST];
         let mut served: Vec<(String, u64)> = Vec::new();
-        while let Ok(Some((length, given))) = api::receive(client.as_raw_fd(), &mut buf) {
-            let request: Value = match serde_json::from_slice(&buf[..length]) {
+        while let Ok(Some(received)) = api::receive(client.as_raw_fd(), &mut buf) {
+            let request = match received {
+                Ok((length, given)) => serde_json::from_slice::<Value>(&buf[..length]).map(|r| (r, given)).map_err(|e| e.to_string()),
+                Err(refused) => Err(refused.to_owned()),
+            };
+            let (request, given) = match request {
                 Ok(request) => request,
                 Err(e) => {
-                    let _ = api::send(client.as_raw_fd(), &json!({"ok": false, "error": e.to_string()}), None);
+                    let _ = api::send(client.as_raw_fd(), &json!({"ok": false, "error": e}), None);
                     continue;
                 }
             };
@@ -493,10 +502,7 @@ fn main() {
         let base = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{home}/.local/state"));
         format!("{base}/plus-one/link.json")
     }));
-    let daemon = Arc::new(Daemon { node: node.clone(), config, ours: identity.fingerprint(), state, finding: Mutex::default(),
-                                   usb: usb::Watcher::new(),
-                                   switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(),
-                                   serial: AtomicU64::new(0) });
+    let daemon = Arc::new(Daemon::new(node.clone(), config, identity.fingerprint(), state));
     let cable = daemon.clone();
     std::thread::Builder::new().name("link-usb".into()).spawn(move || cable.watch_usb()).unwrap();
     let reaper = daemon.clone();
@@ -541,5 +547,60 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// A daemon in a folder of its own, with nothing paired.
+    fn daemon(name: &str) -> Arc<Daemon> {
+        let folder = std::env::temp_dir().join(format!("plus-one-link-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
+        let identity = Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap();
+        let node = Node::new("pc", &identity, Arc::new(|_: &str| false)).unwrap();
+        Arc::new(Daemon::new(node, folder.clone(), identity.fingerprint(), folder.join("link.json")))
+    }
+
+    /// An app's connection to it, served on a thread of its own.
+    fn app(daemon: &Arc<Daemon>) -> (OwnedFd, std::thread::JoinHandle<()>) {
+        let mut pair = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
+        let (app, ours) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let wait = libc::timeval { tv_sec: 5, tv_usec: 0 };
+        unsafe {
+            libc::setsockopt(pair[0], libc::SOL_SOCKET, libc::SO_RCVTIMEO, &wait as *const libc::timeval as *const libc::c_void,
+                             std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+        }
+        let daemon = daemon.clone();
+        (app, std::thread::spawn(move || daemon.client(ours)))
+    }
+
+    /// The next message the app reads (None: nothing within 5 s, or its end).
+    fn heard(app: &OwnedFd) -> Option<Value> {
+        let mut buf = vec![0u8; REQUEST];
+        let (length, _) = api::receive(app.as_raw_fd(), &mut buf).ok()??.ok()?;
+        serde_json::from_slice(&buf[..length]).ok()
+    }
+
+    fn ask(app: &OwnedFd, request: Value) -> Value {
+        api::send(app.as_raw_fd(), &request, None).unwrap();
+        heard(app).expect("no reply")
+    }
+
+    #[test]
+    fn a_request_with_too_many_descriptors_refused() {
+        let daemon = daemon("descriptors");
+        let (app, _served) = app(&daemon);
+        let null = std::fs::File::open("/dev/null").unwrap();
+        api::send_fds(app.as_raw_fd(), br#"{"op": "devices"}"#, &[null.as_raw_fd(); 8]);
+        let reply = heard(&app).expect("no reply");
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "too many descriptors");
+        assert_eq!(ask(&app, json!({"op": "devices"}))["ok"], true);
     }
 }

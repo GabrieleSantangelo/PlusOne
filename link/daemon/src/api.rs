@@ -60,8 +60,10 @@ pub fn accept(listener: &OwnedFd) -> io::Result<Option<OwnedFd>> {
 }
 
 /// One message from an app, and the descriptor it carries if any (a
-/// stream for a path: "stream"): None at its end.
-pub fn receive(client: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, Option<OwnedFd>)>> {
+/// stream for a path: "stream"; any other closed): None at its end; why
+/// for one refused (too big, its descriptors cut short), the connection
+/// as it was.
+pub fn receive(client: RawFd, buf: &mut [u8]) -> io::Result<Option<Result<(usize, Option<OwnedFd>), &'static str>>> {
     let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
     let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
     let mut control = vec![0u8; space];
@@ -82,18 +84,30 @@ pub fn receive(client: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, Optio
     };
     let mut fd = None;
     unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&header);
-        if !cmsg.is_null() && (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-            fd = Some(OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const RawFd)));
+        let mut cmsg = libc::CMSG_FIRSTHDR(&header);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+                let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    // Each one ours now: the first kept, any other closed.
+                    let given = OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i)));
+                    fd.get_or_insert(given);
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&header, cmsg);
         }
     }
     if length == 0 {
         return Ok(None);
     }
     if header.msg_flags & libc::MSG_TRUNC != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "a request too big"));
+        return Ok(Some(Err("a request too big")));
     }
-    Ok(Some((length, fd)))
+    if header.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Ok(Some(Err("too many descriptors")));
+    }
+    Ok(Some(Ok((length, fd))))
 }
 
 /// One message to an app, never waiting for room (an event: an app that
@@ -134,5 +148,76 @@ pub fn send(client: RawFd, message: &serde_json::Value, fd: Option<OwnedFd>) -> 
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
+    }
+}
+
+/// A request with descriptors (as many as an app likes).
+#[cfg(test)]
+pub fn send_fds(client: RawFd, request: &[u8], fds: &[RawFd]) {
+    let mut iov = libc::iovec { iov_base: request.as_ptr() as *mut libc::c_void, iov_len: request.len() };
+    let size = std::mem::size_of_val(fds) as u32;
+    let space = unsafe { libc::CMSG_SPACE(size) } as usize;
+    let mut control = vec![0u8; space];
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iov;
+    header.msg_iovlen = 1;
+    header.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    header.msg_controllen = space as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&header);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size) as _;
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg) as *mut RawFd, fds.len());
+        assert_eq!(libc::sendmsg(client, &header, 0), request.len() as isize);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe: (its reading end, its writing end).
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut ends = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
+    }
+
+    /// Whether every writing end of the pipe is closed (reading it, its end).
+    fn closed(reading: &OwnedFd) -> bool {
+        let mut byte = 0u8;
+        unsafe { libc::read(reading.as_raw_fd(), &mut byte as *mut u8 as *mut libc::c_void, 1) == 0 }
+    }
+
+    fn connection() -> (OwnedFd, OwnedFd) {
+        let mut pair = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) }
+    }
+
+    #[test]
+    fn a_second_descriptor_is_closed() {
+        let (app, daemon) = connection();
+        let (first, _) = pipe();
+        let (reading, writing) = pipe();
+        send_fds(app.as_raw_fd(), br#"{"op": "stream", "kind": "bt"}"#, &[first.as_raw_fd(), writing.as_raw_fd()]);
+        drop(writing);
+        let mut buf = vec![0u8; 1024];
+        let (length, given) = receive(daemon.as_raw_fd(), &mut buf).unwrap().unwrap().unwrap();
+        assert_eq!(&buf[..length], br#"{"op": "stream", "kind": "bt"}"#);
+        assert!(given.is_some());
+        assert!(closed(&reading));
+    }
+
+    #[test]
+    fn descriptors_cut_short_refused_and_closed() {
+        let (app, daemon) = connection();
+        let (reading, writing) = pipe();
+        send_fds(app.as_raw_fd(), br#"{"op": "devices"}"#, &[writing.as_raw_fd(); 8]);
+        drop(writing);
+        let mut buf = vec![0u8; 1024];
+        assert_eq!(receive(daemon.as_raw_fd(), &mut buf).unwrap().unwrap().err(), Some("too many descriptors"));
+        assert!(closed(&reading));
     }
 }

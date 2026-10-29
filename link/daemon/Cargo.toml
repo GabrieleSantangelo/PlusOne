@@ -14,3 +14,6 @@ path = "src/main.rs"
 plus-one-link = { path = "../core" }
 serde_json = "1"
 libc = "0.2"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
