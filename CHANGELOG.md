@@ -108,7 +108,9 @@
   by its announcement: update both.
 - **One host on the network can no longer keep the PC out**: at most two
   handshakes at once from one address, and new ones at a rate, on the
-  link and on the app's listener.
+  link and on the app's listener. Nor slow it down finding the tablet:
+  thousands of made-up announcements took the PC seconds to go through,
+  and stayed in its memory; it now keeps 32.
 - **The desktop keeps its quality on a phone's hotspot**: a lost packet or
   a still screen no longer takes the picture down to a few Mbit/s; on the
   link's QUIC paths the picture follows the link's congestion controller,

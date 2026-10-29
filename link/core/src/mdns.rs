@@ -3,7 +3,7 @@
 //! what answers within a moment. Android's responder answers this way, not
 //! to a query from another port (legacy unicast).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -15,6 +15,9 @@ const PTR: u16 = 12;
 const TXT: u16 = 16;
 const SRV: u16 = 33;
 const A: u16 = 1;
+/// What one browse keeps at most: instances of the service, and the ones
+/// it tells (anyone on the network can send any number of records).
+const KEPT: usize = 32;
 
 /// What the app announces instead of its id (SEC-15; plusone/link/tags.py,
 /// Tags.kt): a tag per paired PC ("t"), only that PC recognises, a quarter
@@ -116,8 +119,8 @@ fn query(service: &str) -> Vec<u8> {
     message
 }
 
-/// Who serves service ("_plusone-link._tcp.local"), within wait; done as
-/// soon as stop says so of one found.
+/// Who serves service ("_plusone-link._tcp.local"), within wait (KEPT at
+/// most); done as soon as stop says so of one found.
 pub fn browse(service: &str, wait: Duration, stop: impl Fn(&Found) -> bool) -> io::Result<Vec<Found>> {
     let socket = socket()?;
     let fd = socket.as_raw_fd();
@@ -141,7 +144,7 @@ pub fn browse(service: &str, wait: Duration, stop: impl Fn(&Found) -> bool) -> i
     let mut again = [Duration::from_millis(250), Duration::from_millis(1000)].into_iter();
     let mut next = again.next();
     ask();
-    let mut records = Records::default();
+    let mut records = Records::new(service);
     let mut found: Vec<Found> = Vec::new();
     let mut buf = [0u8; 9000];
     while started.elapsed() < wait {
@@ -151,34 +154,41 @@ pub fn browse(service: &str, wait: Duration, stop: impl Fn(&Found) -> bool) -> i
         }
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         let Ok((length, from)) = socket.recv_from(&mut buf) else { continue };
-        if records.read(&buf[..length]).is_none() {
-            continue;
-        }
-        for item in records.found(service, from) {
-            if !found.iter().any(|f| f.instance == item.instance && f.address == item.address) {
-                let done = stop(&item);
-                found.push(item);
-                if done {
-                    return Ok(found);
-                }
+        let Some(changed) = records.read(&buf[..length]) else { continue };
+        for item in records.found(changed, from) {
+            let done = stop(&item);
+            found.push(item);
+            if done {
+                return Ok(found);
             }
         }
     }
     Ok(found)
 }
 
-/// The records heard so far, by name.
-#[derive(Default)]
+/// What one browse heard of the service's instances (KEPT at most, the
+/// first ones), by lowercase name; nothing of anything else.
 struct Records {
-    ptr: HashMap<String, Vec<String>>,
+    service: String,
+    /// Each instance as it is named.
+    ptr: HashMap<String, String>,
     srv: HashMap<String, (String, u16)>,
     txt: HashMap<String, HashMap<String, String>>,
+    /// The addresses of the hosts the instances are on.
     a: HashMap<String, Ipv4Addr>,
+    /// What found() told already: each instance once where it is.
+    told: HashSet<(String, SocketAddr)>,
 }
 
 impl Records {
-    /// A response's records; None if it is not one, or is broken.
-    fn read(&mut self, message: &[u8]) -> Option<()> {
+    fn new(service: &str) -> Records {
+        Records { service: service.trim_end_matches('.').to_lowercase(), ptr: HashMap::new(), srv: HashMap::new(),
+                  txt: HashMap::new(), a: HashMap::new(), told: HashSet::new() }
+    }
+
+    /// A response's records: the instances it changed; None if it is not
+    /// one, or is broken.
+    fn read(&mut self, message: &[u8]) -> Option<Vec<String>> {
         if message.len() < 12 || message[2] & 0x80 == 0 {
             return None;
         }
@@ -188,6 +198,8 @@ impl Records {
         for _ in 0..questions {
             at = name(message, at)?.1 + 4;
         }
+        // (kind, owner, where its data is, its length)
+        let mut heard = Vec::new();
         for _ in 0..records {
             let (owner, after) = name(message, at)?;
             let header = message.get(after..after + 10)?;
@@ -195,13 +207,32 @@ impl Records {
             let length = u16::from_be_bytes([header[8], header[9]]) as usize;
             let data = after + 10;
             message.get(data..data + length)?;
-            match kind {
-                PTR => self.ptr.entry(owner.to_lowercase()).or_default().push(name(message, data)?.0),
-                SRV if length >= 7 => {
-                    let port = u16::from_be_bytes([message[data + 4], message[data + 5]]);
-                    self.srv.insert(owner.to_lowercase(), (name(message, data + 6)?.0.to_lowercase(), port));
+            heard.push((kind, owner.to_lowercase(), data, length));
+            at = data + length;
+        }
+        let mut changed = Vec::new();
+        // The service's instances first, then what is of them alone.
+        for &(kind, ref owner, data, _) in &heard {
+            if kind == PTR && *owner == self.service {
+                let instance = name(message, data)?.0;
+                let key = instance.to_lowercase();
+                if self.ptr.len() < KEPT && !self.ptr.contains_key(&key) {
+                    self.ptr.insert(key.clone(), instance);
+                    changed.push(key);
                 }
-                TXT => {
+            }
+        }
+        for &(kind, ref owner, data, length) in &heard {
+            match kind {
+                SRV if length >= 7 && self.ptr.contains_key(owner) => {
+                    let port = u16::from_be_bytes([message[data + 4], message[data + 5]]);
+                    let srv = (name(message, data + 6)?.0.to_lowercase(), port);
+                    if self.srv.get(owner) != Some(&srv) {
+                        self.srv.insert(owner.clone(), srv);
+                        changed.push(owner.clone());
+                    }
+                }
+                TXT if self.ptr.contains_key(owner) => {
                     let mut entries = HashMap::new();
                     let mut i = data;
                     while i < data + length {
@@ -212,33 +243,43 @@ impl Records {
                         }
                         i += 1 + size;
                     }
-                    self.txt.insert(owner.to_lowercase(), entries);
-                }
-                A if length == 4 => {
-                    self.a.insert(owner.to_lowercase(), Ipv4Addr::new(message[data], message[data + 1], message[data + 2], message[data + 3]));
+                    if self.txt.get(owner) != Some(&entries) {
+                        self.txt.insert(owner.clone(), entries);
+                        changed.push(owner.clone());
+                    }
                 }
                 _ => {}
             }
-            at = data + length;
         }
-        Some(())
+        // The addresses of the hosts the instances are on now, no other.
+        let srv = &self.srv;
+        self.a.retain(|host, _| srv.values().any(|(h, _)| h == host));
+        for &(kind, ref owner, data, length) in &heard {
+            if kind == A && length == 4 && self.srv.values().any(|(host, _)| host == owner) {
+                let ip = Ipv4Addr::new(message[data], message[data + 1], message[data + 2], message[data + 3]);
+                if self.a.insert(owner.clone(), ip) != Some(ip) {
+                    changed.extend(self.srv.iter().filter(|(_, (host, _))| host == owner).map(|(key, _)| key.clone()));
+                }
+            }
+        }
+        Some(changed)
     }
 
-    /// The instances of service complete enough to reach (the host's
-    /// address unknown: the responder's, from).
-    fn found(&self, service: &str, from: SocketAddr) -> Vec<Found> {
-        let service = service.trim_end_matches('.').to_lowercase();
+    /// Of the instances changed, the ones complete enough to reach (the
+    /// host's address unknown: the responder's, from) and not told yet
+    /// there; KEPT in all at most.
+    fn found(&mut self, changed: Vec<String>, from: SocketAddr) -> Vec<Found> {
         let mut found = Vec::new();
-        for instance in self.ptr.get(&service).into_iter().flatten() {
-            let key = instance.to_lowercase();
-            let Some((host, port)) = self.srv.get(&key) else { continue };
+        for key in changed {
+            let (Some(instance), Some((host, port))) = (self.ptr.get(&key), self.srv.get(&key)) else { continue };
             let ip = self.a.get(host).copied().or(match from {
                 SocketAddr::V4(v4) => Some(*v4.ip()),
                 SocketAddr::V6(_) => None,
             });
-            if let Some(ip) = ip {
-                found.push(Found { instance: instance.clone(), address: SocketAddr::new(ip.into(), *port),
-                                   txt: self.txt.get(&key).cloned().unwrap_or_default() });
+            let Some(ip) = ip else { continue };
+            let address = SocketAddr::new(ip.into(), *port);
+            if self.told.len() < KEPT && self.told.insert((key.clone(), address)) {
+                found.push(Found { instance: instance.clone(), address, txt: self.txt.get(&key).cloned().unwrap_or_default() });
             }
         }
         found
@@ -248,9 +289,9 @@ impl Records {
 /// What one response tells of service (link/fuzz: a stranger's packet).
 #[cfg(fuzzing)]
 pub fn read_response(service: &str, message: &[u8]) -> Vec<Found> {
-    let mut records = Records::default();
-    let _ = records.read(message);
-    records.found(service, SocketAddr::from(([192, 0, 2, 1], 5353)))
+    let mut records = Records::new(service);
+    let changed = records.read(message).unwrap_or_default();
+    records.found(changed, SocketAddr::from(([192, 0, 2, 1], 5353)))
 }
 
 /// A name at at (compression followed): it, and where the record goes on.
@@ -310,14 +351,63 @@ mod tests {
         m.extend_from_slice(&(txt.len() as u16).to_be_bytes());
         m.extend_from_slice(txt);
         m.extend_from_slice(&[0xc0, host_at as u8, 0, 1, 0x80, 1, 0, 0, 0, 120, 0, 4, 10, 0, 0, 7]);
-        let mut records = Records::default();
-        records.read(&m).unwrap();
-        let found = records.found("_plusone-link._tcp.local", "10.9.9.9:5353".parse().unwrap());
+        let mut records = Records::new("_plusone-link._tcp.local");
+        let changed = records.read(&m).unwrap();
+        let found = records.found(changed, "10.9.9.9:5353".parse().unwrap());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].instance, "Tab._plusone-link._tcp.local");
         assert_eq!(found[0].address, "10.0.0.7:43331".parse().unwrap());
         assert_eq!(found[0].txt["id"], "6a2665bcebe1984c");
         assert_eq!(found[0].txt["v"], "910");
+        // Heard again: nothing new.
+        let changed = records.read(&m).unwrap();
+        assert!(changed.is_empty() && records.found(changed, "10.9.9.9:5353".parse().unwrap()).is_empty());
+    }
+
+    /// One response: count PTR records to instances of its own (seed), each
+    /// with an SRV, as anyone on the network can send.
+    fn flood(seed: u32, count: usize) -> Vec<u8> {
+        let mut m = vec![0, 0, 0x84, 0, 0, 0];
+        m.extend_from_slice(&((2 * count) as u16).to_be_bytes());
+        m.extend_from_slice(&[0, 0, 0, 0]);
+        let service_at = m.len();
+        for i in 0..count {
+            if i == 0 {
+                label(&mut m, "_plusone-link._tcp.local");
+                m.extend_from_slice(&[0, 12, 0, 1, 0, 0, 0, 120, 0, 11]);
+            } else {
+                m.extend_from_slice(&[0xc0, service_at as u8, 0, 12, 0, 1, 0, 0, 0, 120, 0, 11]);
+            }
+            let instance_at = m.len();
+            m.push(8);
+            m.extend_from_slice(format!("{:08x}", seed * 1000 + i as u32).as_bytes());
+            m.extend_from_slice(&[0xc0, service_at as u8]);
+            m.extend_from_slice(&[0xc0 | (instance_at >> 8) as u8, instance_at as u8, 0, 33, 0, 1, 0, 0, 0, 120, 0, 8,
+                                  0, 0, 0, 0, 0x1f, 0x90, 0xc0, service_at as u8]);
+        }
+        m
+    }
+
+    #[test]
+    fn a_flood_of_instances_kept_to_a_few() {
+        let mut records = Records::new("_plusone-link._tcp.local");
+        let from: SocketAddr = "10.9.9.9:5353".parse().unwrap();
+        let mut told = 0;
+        for seed in 0..30 {
+            let changed = records.read(&flood(seed, 200)).unwrap();
+            assert!(changed.len() <= 2 * KEPT, "{} changed", changed.len());
+            told += records.found(changed, from).len();
+        }
+        assert_eq!(told, KEPT);
+        assert!(records.ptr.len() <= KEPT && records.srv.len() <= KEPT && records.told.len() <= KEPT);
+        // Each port another place: still told KEPT in all.
+        let mut m = flood(0, 1);
+        let port = m.len() - 4;
+        for p in 0..1000u16 {
+            m[port..port + 2].copy_from_slice(&p.to_be_bytes());
+            let changed = records.read(&m).unwrap();
+            assert!(records.found(changed, from).is_empty());
+        }
     }
 
     #[test]
