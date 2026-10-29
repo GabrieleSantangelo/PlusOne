@@ -85,11 +85,12 @@
   background or the PC locked (it was made again at the first stroke
   after each); another user's session in front, it goes, as before.
 - **No freeze while a big PDF is read**: a PDF to sign (up to 256 MB)
-  was read where Plus One does everything else, before it went to the
-  tablet and after it was signed on the PC: meanwhile the window stood
-  still, and Quick Settings and Files had no answer from Plus One. It is
-  read aside now, the PDFs one after the other in the order asked, and
-  Plus One answers meanwhile.
+  was read, and copied for the tablet, where Plus One does everything
+  else, before it went and after it was signed on the PC: meanwhile the
+  window stood still, and Quick Settings and Files had no answer from
+  Plus One. It is read and copied aside now, the PDFs one after the
+  other in the order asked, and Plus One answers meanwhile. A copy cut
+  short (the disk full) is no longer left behind.
 - **What carries the tablet, shown all along**: when plus-one-link hung up
   on Plus One's listening for the tablet's news (it does on one it could
   not tell), the window and Quick Settings showed no path for up to 15 s,

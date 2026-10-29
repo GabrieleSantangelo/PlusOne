@@ -1,4 +1,6 @@
 """Signing on the tablet, in its app: requests, and signing here instead."""
+import os
+
 from gi.repository import GLib
 import pytest
 
@@ -310,6 +312,37 @@ def test_a_pdf_signed_here_is_read_off_the_main_loop(monkeypatch, tmp_path):
     signing._done(window, path, str(tmp_path / "form-signed.pdf"))
     assert spin(lambda: results) and results == [(str(tmp_path / "form-signed.pdf"), True)]
     assert read[0] is not threading.main_thread() and app.held == 0
+
+
+def test_the_copy_that_goes_is_made_off_the_main_loop(monkeypatch, tmp_path):
+    import threading
+    app, signing, _, _ = make(monkeypatch)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+    copied, sent = [], []
+    copy = signing_module.shutil.copyfileobj
+    monkeypatch.setattr(signing_module.shutil, "copyfileobj",
+                        lambda a, b: copied.append(threading.current_thread()) or copy(a, b))
+    monkeypatch.setattr(sign_jobs, "sign", lambda target, path, **kw: sent.append(open(path, "rb").read()))
+    path = str(tmp_path / "form.pdf")
+    signing.request(path)
+    assert spin(lambda: sent) and sent == [b"%PDF-1.4\n%%EOF\n"]
+    assert copied[0] is not threading.main_thread()
+    assert spin(lambda: not signing.in_app and app.held == 0)
+
+
+def test_a_copy_that_cannot_be_made_is_said_and_leaves_nothing(monkeypatch, tmp_path):
+    app, signing, _, _ = make(monkeypatch)
+    app.discovery.app_on = ("10.0.0.2", 40000, "Galaxy Tab", APP)
+
+    def full(source, copy):
+        copy.write(b"%PDF-1.4\n")
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(signing_module.shutil, "copyfileobj", full)
+    monkeypatch.setattr(sign_jobs, "sign", lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
+    signing.request(str(tmp_path / "form.pdf"))
+    assert spin(lambda: not signing.reading)
+    assert app.notes[-1] == "sign" and not signing.in_app and app.held == 0
+    assert os.listdir(tmp_path / "sent") == []  # no half copy
 
 
 def test_what_is_not_a_pdf_is_said_before_it_goes():

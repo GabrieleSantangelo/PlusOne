@@ -91,23 +91,50 @@ class Signing:
 
     # -- in the tablet's app ---------------------------------------------------
     def _sign_in_app(self, path, target):
-        targets, tablet, app_id = target
+        _targets, tablet, _app_id = target
         log(f"signing in the app on {tablet}: {path}")
+        token = uuid.uuid4().hex
+        self.in_app[path] = token
+        # Plus One stays until the answer comes, window closed or not.
+        self.app.hold()
+        self._notify_in_app(path, _("Sending {name} to Plus One on {tablet}"), tablet)
+        # The copy that goes (up to pdf.MAX_SIZE) made off the main loop too,
+        # in the same order: the PDFs' turns are taken in it.
+        self._read(lambda: self._copy(path), lambda sent: self._copied(path, token, target, sent))
+
+    @staticmethod
+    def _copy(path):
+        """A copy of path as it is now, in SENT: its name, or the OSError."""
+        sent = None
         try:
             os.makedirs(SENT, mode=0o700, exist_ok=True)
             fd, sent = tempfile.mkstemp(suffix=".pdf", dir=SENT)
             with os.fdopen(fd, "wb") as f, open(path, "rb") as original:
                 shutil.copyfileobj(original, f)
         except OSError as e:
-            note = Gio.Notification.new(_("Cannot open {name}").format(name=os.path.basename(path)))
-            note.set_body(e.strerror or str(e))
-            self.app.send_notification(NOTIFICATION, note)
+            if sent is not None:
+                try:
+                    os.unlink(sent)  # half a copy: not left behind
+                except OSError:
+                    pass
+            return e
+        return sent
+
+    def _copied(self, path, token, target, sent):
+        """_sign_in_app's, once the copy that goes is made (sent: its name,
+        or why not)."""
+        targets, _tablet, app_id = target
+        if not isinstance(sent, str):
+            if self.in_app.get(path) == token:
+                del self.in_app[path]
+                note = Gio.Notification.new(_("Cannot open {name}").format(name=os.path.basename(path)))
+                note.set_body(getattr(sent, "strerror", None) or str(sent))
+                self.app.send_notification(NOTIFICATION, note)
+            self.app.release()
             return
-        token = uuid.uuid4().hex
-        self.in_app[path] = token
-        # Plus One stays until the answer comes, window closed or not.
-        self.app.hold()
-        self._notify_in_app(path, _("Sending {name} to Plus One on {tablet}"), tablet)
+        if self.in_app.get(path) != token:
+            self._forget_sent(sent)  # the user chose to sign on the PC meanwhile (or asked again since)
+            return
 
         from .ink import load_pen
         color, width, _smoothing = load_pen(PEN)
