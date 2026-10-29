@@ -244,10 +244,16 @@ def _ink_form(writer, marks, width, height):
 def _page_resources(page):
     """The page's own resources dictionary, copied from its page tree when
     inherited (adding to a shared one would touch other pages)."""
-    from pypdf.generic import DictionaryObject, NameObject
-    node = page
+    from pypdf.generic import DictionaryObject, IndirectObject, NameObject
+    node, seen = page, set()
     while "/Resources" not in node and "/Parent" in node:
-        node = node["/Parent"].get_object()
+        parent = node.raw_get("/Parent")
+        key = (parent.idnum, parent.generation) if isinstance(parent, IndirectObject) else id(parent)
+        if key in seen:
+            node = DictionaryObject()  # a tree that is its own parent: nothing to inherit (it went round for ever)
+            break
+        seen.add(key)
+        node = parent.get_object()
     found = node.get("/Resources")
     resources = DictionaryObject(found.get_object()) if found is not None else DictionaryObject()
     page[NameObject("/Resources")] = resources

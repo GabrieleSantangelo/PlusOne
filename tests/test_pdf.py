@@ -1,5 +1,6 @@
 """Saving marks onto a PDF: content kept, marks where the pen put them."""
 import os
+import threading
 
 import cairo
 import pytest
@@ -202,3 +203,23 @@ def test_page_boxes_with_indirect_corners(tmp_path):
     with open(path, "wb") as f:
         writer.write(f)
     assert visible_box(PdfReader(str(path)).pages[0]) == (0.0, 0.0, 300.0, 400.0)
+
+
+def test_a_page_tree_that_is_its_own_parent(tmp_path):
+    # Nothing to inherit, and no end going up it: the save went round at
+    # 100 % for ever (the window could not close, Plus One stayed).
+    from pypdf.generic import NameObject
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(200, 200)
+    if "/Resources" in page:
+        del page[NameObject("/Resources")]
+    writer._root_object["/Pages"][NameObject("/Parent")] = writer._root_object.raw_get("/Pages")
+    src = tmp_path / "loop.pdf"
+    with open(src, "wb") as f:
+        writer.write(f)
+    done = {}
+    saving = threading.Thread(target=lambda: done.update(path=save_signed(str(src), {0: [blob(100, 100)]})),
+                              daemon=True)
+    saving.start()
+    saving.join(5)
+    assert not saving.is_alive() and os.path.isfile(done["path"])

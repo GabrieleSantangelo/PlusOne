@@ -94,6 +94,11 @@
   the session going on all the while. Plus One listens again at once now
   while plus-one-link answers, at most once a second, the path shown
   meanwhile; and what changed in between is shown as it is.
+- **A malformed PDF no longer hangs its saving**: a PDF whose tree of
+  pages names itself as its own parent made the signed copy's saving go
+  round for ever, a core at 100 %: on the PC the signing window could no
+  longer be closed, and signed on the tablet Plus One never let go of
+  it. Its signed copy is saved now, as any other's.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and
