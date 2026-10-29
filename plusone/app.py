@@ -28,7 +28,7 @@ from . import __version__, add_log_handler, i18n, log, once, wifi  # noqa: E402
 from .engine import Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .signing import Signing  # noqa: E402
-from .devices import SPEAKERS_NAME, Devices, make_default_sink  # noqa: E402
+from .devices import SPEAKERS_NAME, BluetoothAudio, Devices, make_default_sink  # noqa: E402
 from .link import Discovery, Nearby, Tablets  # noqa: E402
 from .link.paths import Paths  # noqa: E402
 from .seat import Seat  # noqa: E402
@@ -288,6 +288,10 @@ class PlusOneApp(Adw.Application):
         # Which tablets have the app, and where: for pairing, the desktop,
         # signing and the devices. Avahi listens anyway.
         self.discovery.start()
+        # Turned off by a Plus One that did not live to turn it back. Here,
+        # not as Devices are made: a second Plus One of a moment (Sign with
+        # Plus One) makes them too, and turned it on under the speakers.
+        BluetoothAudio.restore()
         self.devices.apply()
         # The desktop locked or another user's in front: the tablet's input
         # reaches nothing, its camera and microphone pause (SEC-22).

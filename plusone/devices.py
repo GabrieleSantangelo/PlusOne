@@ -1160,7 +1160,6 @@ class Devices:
         self.camera = Camera(app)
         self.microphone = Microphone(app)
         self.speakers = Speakers(app)
-        BluetoothAudio.restore()  # turned off by a Plus One that did not live to turn it back
         self.tablet = None  # the fingerprint of the tablet in use, as last applied
 
     def apply(self):

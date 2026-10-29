@@ -563,6 +563,15 @@ def test_a_stream_played_again_is_looked_at_again_a_moment_later():
     assert looked[1] - looked[0] >= devices.AGAIN_AFTER_EVENT / 1000 - 0.05
 
 
+def test_a_second_plus_one_of_a_moment_turns_no_bluetooth_audio_back(monkeypatch):
+    # Sign with Plus One starts a second one, which makes its Devices: the
+    # tablet's A2DP, off under the first one's speakers, stays off.
+    restored = []
+    monkeypatch.setattr(devices.BluetoothAudio, "restore", classmethod(lambda cls: restored.append(cls)))
+    devices.Devices(FakeApp())
+    assert restored == []
+
+
 def test_the_tablets_speakers_stay_the_output_across_a_restart(tmp_path, monkeypatch):
     made, default = [], ["plusone_speakers"]
     monkeypatch.setattr(devices.Speakers, "WAS_OUTPUT", str(tmp_path / "speakers-were-the-output"))
