@@ -200,7 +200,9 @@ class Link:
 
     def devices(self):
         """The paired tablets: [{"id", "name", "connected", "features",
-        "rtt_ms", "dropped"}]."""
+        "rtt_ms", "dropped", "paths"}]; each path {"id", "kind", "transport",
+        "state" ("active", "suspect", "failed"), "rtt_ms", "silent_ms",
+        "budget_bps", "budget_from"}."""
         return self._request({"op": "devices"})[0]["devices"]
 
     def connect(self, address=None, device=None, timeout=5.0):
@@ -254,10 +256,11 @@ class Link:
 
     def watch(self, on_event):
         """Tablets coming and going, from now on: on_event({"event": "up",
-        "moved", "detached" or "gone", "device", ...}); and {"event":
+        "moved", "detached" or "gone", "device", ...}); {"event":
         "budget", "device", "kbps"}: what the path's congestion controller
-        allows as it moves (None: a path with none of its own). close() the
-        result to stop."""
+        allows as it moves (None: a path with none of its own); and
+        {"event": "path", "device", ...}: a path's state changed (as
+        devices()' "paths"). close() the result to stop."""
         return _Events(self.path, {"op": "watch"}, lambda event, _fd: on_event(event), "link-watch")
 
     def close(self):

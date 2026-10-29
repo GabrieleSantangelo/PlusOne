@@ -83,7 +83,7 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
         return LinkChannel(reply.getInt("fd"), device, feature, name, kind, reply.optInt("id"))
     }
 
-    /** The PCs with a session now: [{"id", "name", "features", "rtt_ms", "dropped"}]. */
+    /** The PCs with a session now: [{"id", "name", "features", "rtt_ms", "dropped", "paths"}]. */
     fun devices(): List<JSONObject> {
         val devices = request(JSONObject().put("op", "devices")).getJSONArray("devices")
         return List(devices.length()) { devices.getJSONObject(it) }

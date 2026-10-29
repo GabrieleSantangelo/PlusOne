@@ -1,7 +1,9 @@
 """What each tablet is connected by now, from plus-one-link's events
 (docs/LINK.md): the cable, the Wi-Fi..., or nothing for a moment while
 its session waits for another path. Told to the window and to GNOME's
-Quick Settings (the app's Title and Detail).
+Quick Settings (the app's Title and Detail). Each path's state (active,
+suspect, failed) is kept too, and logged when it is in trouble: nothing
+shows it yet.
 """
 import threading
 import time
@@ -27,13 +29,15 @@ class Paths:
     """on_change(): on the main loop, whenever a tablet's path changed.
     path(device): the user's name for it, RECONNECTING while the session
     waits for one, or None (no session over the link: the link of before,
-    or none at all)."""
+    or none at all). states(device): its paths as plus-one-link last told
+    them."""
 
     def __init__(self, on_change, on_link=None):
         self.on_change = on_change
         self.on_link = on_link or (lambda link: None)  # plus-one-link there (again): told our settings
         self._paths = {}  # device id -> kind, or None (waiting)
-        self._heard = set()  # the devices an event told of since the watch was made
+        self._states = {}  # device id -> {path id: plus-one-link's word on it}
+        self._heard = set()  # the devices an event told of since the watch was made, and (device, path id)s
         self._lock = threading.Lock()  # the events' thread and the watch's: one change at a time
         self._watcher = None
         self._stopped = threading.Event()
@@ -49,17 +53,46 @@ class Paths:
                 return NAMES.get(kind, kind) if kind else RECONNECTING
         return None
 
+    def states(self, device):
+        """The paths to device (its id) as plus-one-link last told them:
+        [{"id", "kind", "transport", "state", "rtt_ms", "silent_ms",
+        "budget_bps", "budget_from"}], what else it says too."""
+        return list(self._states.get(device, {}).values())
+
     def _set(self, device, kind, gone=False):
         """Under _lock."""
         before = dict(self._paths)
         paths = dict(before)
         if gone:
             paths.pop(device, None)
+            self._states = {id_: known for id_, known in self._states.items() if id_ != device}
         else:
             paths[device] = kind
         self._paths = paths  # a new one: readers never see it change under them
         if paths != before:
             GLib.idle_add(self._changed)
+
+    def _state(self, device, path):
+        """A path's state, as plus-one-link tells it ("path" events,
+        devices' "paths"): kept (a failed one forgotten), logged as it gets
+        in trouble or out of it. Under _lock."""
+        if not isinstance(path, dict) or "id" not in path:
+            return
+        known = dict(self._states.get(device, {}))
+        before = known.get(path["id"], {}).get("state")
+        state = path.get("state")
+        if state == "failed":
+            known.pop(path["id"], None)
+        else:
+            known[path["id"]] = path
+        self._states = {**self._states, device: known}
+        name = NAMES.get(path.get("kind"), path.get("kind"))
+        if state in ("suspect", "failed") and state != before:  # not again at each watch
+            silent = path.get("silent_ms")
+            log(f"link: the {name} path ({path['id']}) is {state}"
+                + (f", nothing heard for {silent / 1000:.1f} s" if isinstance(silent, (int, float)) else ""))
+        elif before == "suspect" and state == "active":
+            log(f"link: the {name} path ({path['id']}) is active again")
 
     def _changed(self):
         self.on_change()
@@ -68,12 +101,14 @@ class Paths:
     def _event(self, event):
         kind = event.get("event")
         device = event.get("device")
-        if not device or kind not in ("up", "moved", "detached", "gone"):
+        if not device or kind not in ("up", "moved", "path", "detached", "gone"):
             return
         with self._lock:
-            self._heard.add(device)
+            self._heard.add((device, event.get("id")) if kind == "path" else device)
             if kind in ("up", "moved"):
                 self._set(device, event.get("path"))
+            elif kind == "path":
+                self._state(device, event)
             elif kind == "detached":
                 self._set(device, None)
             else:
@@ -81,13 +116,24 @@ class Paths:
 
     def _found(self, devices):
         """plus-one-link's devices(), asked once the watch was made: the
-        sessions there are now, but for a device an event told of since
-        (the events tell it as it is from then on, whichever came first)."""
-        connected = {device["id"]: device.get("path") for device in devices if device.get("connected")}
+        sessions there are now and their paths, but for a device or a path
+        an event told of since (the events tell it as it is from then on,
+        whichever came first). A path known before and neither listed nor
+        told of since is no more (its end told while nothing watched)."""
+        connected = {device["id"]: device for device in devices if device.get("connected")}
         with self._lock:
             for device in set(self._paths) | set(connected):
                 if device not in self._heard:
-                    self._set(device, connected.get(device), gone=device not in connected)
+                    self._set(device, connected.get(device, {}).get("path"), gone=device not in connected)
+            for device in set(self._paths) & set(connected):
+                listed = {path["id"]: path for path in connected[device].get("paths") or []
+                          if isinstance(path, dict) and "id" in path}
+                known = self._states.get(device, {})
+                self._states = {**self._states, device: {id_: path for id_, path in known.items()
+                                                         if id_ in listed or (device, id_) in self._heard}}
+                for id_, path in listed.items():
+                    if (device, id_) not in self._heard:
+                        self._state(device, path)
 
     def _answers(self):
         """Whether plus-one-link is there, and answers (devices())."""
@@ -133,6 +179,7 @@ class Paths:
                     with self._lock:
                         for device in list(self._paths):
                             self._set(device, None, gone=True)
+                        self._states = {}  # and what any path was
             self._stopped.wait(max(0.0, since + REWATCH - time.monotonic()) if answers else AGAIN)
 
     def stop(self):

@@ -98,6 +98,23 @@ class PathLabelTest {
     }
 
     @Test
+    fun aPathsStateIsKeptAndShowsNothing() {
+        val pc = "12".repeat(32)
+        LinkStatus.event(onAndroid("""{"event": "up", "device": "$pc", "name": "PC", "path": "bt", "transport": "stream"}"""))
+        val shown = LinkStatus.pcs[pc]
+        LinkStatus.event(onAndroid("""{"event": "path", "device": "$pc", "id": 1, "kind": "bt", "transport": "stream",
+            "state": "suspect", "rtt_ms": null, "silent_ms": 1500, "budget_bps": 900000, "budget_from": "prior",
+            "said later": [1]}"""))
+        assertEquals(LinkStatus.Path(1, "bt", "stream", "suspect", null, 1500, 900000, "prior"), LinkStatus.paths[pc]?.get(1L))
+        assertEquals(shown, LinkStatus.pcs[pc])
+        LinkStatus.event(onAndroid("""{"event": "path", "device": "$pc", "id": 1, "kind": "bt", "state": "failed",
+            "silent_ms": 5000}"""))
+        assertNull(LinkStatus.paths[pc]?.get(1L))
+        LinkStatus.event(onAndroid("""{"event": "gone", "device": "$pc"}"""))
+        assertNull(LinkStatus.paths[pc])
+    }
+
+    @Test
     fun aNullOrMissingTransportIsNone() {
         val pc = "cd".repeat(32)
         assertEquals("null", onAndroid("""{"transport": null}""").optString("transport"))  // what the guard is for

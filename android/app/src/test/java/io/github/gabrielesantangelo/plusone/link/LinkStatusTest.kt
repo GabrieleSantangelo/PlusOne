@@ -29,8 +29,12 @@ class LinkStatusTest {
         // The core says nothing more once closed: no "gone" for them.
         LinkStatus.event(up("a", "lan"))
         LinkStatus.event(up("b", "usb"))
+        LinkStatus.event(JSONObject().put("event", "path").put("device", "b").put("id", 1).put("kind", "usb")
+            .put("state", "active"))
+        assertEquals("active", LinkStatus.paths["b"]?.get(1L)?.state)
         LinkStatus.clear()
         assertEquals(emptyMap<String, LinkStatus.Pc>(), LinkStatus.pcs)
+        assertEquals(emptyMap<String, Map<Long, LinkStatus.Path>>(), LinkStatus.paths)  // nor their paths'
         assertNull(LinkStatus.current())
     }
 

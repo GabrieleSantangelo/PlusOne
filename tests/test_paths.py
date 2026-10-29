@@ -29,6 +29,33 @@ def test_events_say_the_path(monkeypatch):
     assert len(changes) == 5
 
 
+def test_each_path_s_state_is_kept_and_its_trouble_logged_not_shown(monkeypatch):
+    monkeypatch.setattr(paths, "plusone_link", None)
+    monkeypatch.setattr(paths.GLib, "idle_add", lambda f: f())
+    logged = []
+    monkeypatch.setattr(paths, "log", lambda *parts: logged.append(" ".join(map(str, parts))))
+    changes = []
+    watched = paths.Paths(lambda: changes.append(1))
+    watched._event({"event": "up", "device": DEVICE, "path": "bt"})
+    path = {"event": "path", "device": DEVICE, "id": 1, "kind": "bt", "transport": "stream", "state": "active",
+            "rtt_ms": None, "silent_ms": 0, "budget_bps": 900000, "budget_from": "prior", "said later": [1]}
+    watched._event(path)
+    assert [p["budget_bps"] for p in watched.states(DEVICE)] == [900000] and logged == []
+    watched._event(dict(path, state="suspect", silent_ms=1500))
+    assert [p["state"] for p in watched.states(DEVICE)] == ["suspect"]
+    assert logged == ["link: the Bluetooth path (1) is suspect, nothing heard for 1.5 s"]
+    watched._event(dict(path, silent_ms=2))
+    assert logged[-1] == "link: the Bluetooth path (1) is active again"
+    watched._event(dict(path, state="failed", silent_ms=5000))
+    assert watched.states(DEVICE) == [] and logged[-1] == "link: the Bluetooth path (1) is failed, nothing heard for 5.0 s"
+    watched._event({"event": "path", "device": DEVICE, "state": "suspect"})  # no id: not one
+    assert watched.states(DEVICE) == [] and len(logged) == 3
+    assert watched.path(DEVICE) == "Bluetooth" and changes == [1]  # nothing shown changed
+    watched._event(dict(path, id=2))
+    watched._event({"event": "gone", "device": DEVICE})
+    assert watched.states(DEVICE) == []
+
+
 def looked_for_once(monkeypatch, devices):
     """Paths._run once (its wait for the next look ends it), with a
     plus-one-link whose devices() is devices: (Paths, what was closed, waits)."""
@@ -147,3 +174,29 @@ def test_a_watch_made_again_tells_what_changed_while_nothing_watched(monkeypatch
         monkeypatch, lambda: FakeLink([True], lambda: answers[len(rounds)], lambda: events[len(rounds)]), 2,
         lambda watched, _waits: rounds.append(dict(watched._paths)))
     assert rounds == [{DEVICE: "usb", other: "lan"}, {DEVICE: "lan", third: "usb"}]
+
+
+def test_each_watch_takes_the_paths_states_listed_but_those_told_of_since(monkeypatch):
+    # devices()' "paths" at each watch: a path listed no more ended while
+    # nothing watched; one an event told of since is as the event says (it
+    # may have come after the answer); a path still in trouble is not logged
+    # again. plus-one-link gone: no path's state left.
+    logged = []
+    monkeypatch.setattr(paths, "log", lambda *parts: logged.append(" ".join(map(str, parts))))
+    usb = {"id": 1, "kind": "usb", "transport": "stream", "state": "active", "silent_ms": 0}
+    lan = {"id": 2, "kind": "lan", "transport": "quic", "state": "suspect", "silent_ms": 1600}
+    answers = [[{"id": DEVICE, "connected": True, "path": "usb", "paths": [usb, lan]}],
+               [{"id": DEVICE, "connected": True, "path": "lan", "paths": [dict(lan, silent_ms=2600)]}],
+               [{"id": DEVICE, "connected": True, "path": "lan", "paths": [dict(lan, silent_ms=3600)]}]]
+    events = [[], [], [dict(lan, event="path", device=DEVICE, state="active", silent_ms=3)]]
+    there, rounds = [True], []
+
+    def on_wait(watched, waits):
+        rounds.append([(path["id"], path["state"]) for path in watched.states(DEVICE)])
+        if len(waits) == 3:
+            there[0] = False  # plus-one-link goes
+    watched_by(monkeypatch, lambda: FakeLink(there, lambda: answers[len(rounds)], lambda: events[len(rounds)]), 4,
+               on_wait)
+    assert rounds == [[(1, "active"), (2, "suspect")], [(2, "suspect")], [(2, "active")], []]
+    assert logged == ["link: the Wi-Fi path (2) is suspect, nothing heard for 1.6 s",
+                      "link: the Wi-Fi path (2) is active again"]
