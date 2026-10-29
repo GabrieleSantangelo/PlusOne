@@ -339,6 +339,20 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
 
 // -- JNI ------------------------------------------------------------------------------
 
+/// body's value, or failed()'s if it panicked: a panic unwinding out of an
+/// extern "system" call ends the app (Rust aborts there), and one thread
+/// of the core's that panicked holding a lock (a session's) would make
+/// each call after it panic too. What the app is told is a failure it
+/// handles already: an error answer, no event, no node.
+fn guarded<T>(body: impl FnOnce() -> T, failed: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|panic| {
+        let what = panic.downcast_ref::<&str>().copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("?");
+        plusone_link::log!("a panic under a call of the app's ({what}): answered as a failure");
+        failed()
+    })
+}
+
 fn string(env: &mut JNIEnv, value: &JString) -> String {
     env.get_string(value).map(|s| s.into()).unwrap_or_default()
 }
@@ -351,7 +365,11 @@ fn new_string(env: &mut JNIEnv, value: &str) -> jstring {
 pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_nativeStart<'local>(
     mut env: JNIEnv<'local>, _this: JObject<'local>, name: JString<'local>, certificate: JByteArray<'local>,
     signer: JObject<'local>) -> jlong {
-    let name = string(&mut env, &name);
+    guarded(|| start(&mut env, name, certificate, signer), || 0)
+}
+
+fn start(env: &mut JNIEnv, name: JString, certificate: JByteArray, signer: JObject) -> jlong {
+    let name = string(env, &name);
     let Ok(certificate) = env.convert_byte_array(&certificate) else { return 0 };
     let (Ok(vm), Ok(signer)) = (env.get_java_vm(), env.new_global_ref(signer)) else { return 0 };
     let identity = Identity::signed_by(certificate, Arc::new(Keystore { vm: Arc::new(vm), signer }));
@@ -386,48 +404,61 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
 #[no_mangle]
 pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_nativeSetPaired<'local>(
     mut env: JNIEnv<'local>, _this: JObject<'local>, handle: jlong, fingerprints: JObjectArray<'local>) {
-    let Some(core) = core(handle) else { return };
-    let count = env.get_array_length(&fingerprints).unwrap_or(0);
-    let mut paired = HashSet::new();
-    for i in 0..count {
-        if let Ok(item) = env.get_object_array_element(&fingerprints, i) {
-            paired.insert(string(&mut env, &JString::from(item)));
+    guarded(|| {
+        let Some(core) = core(handle) else { return };
+        let count = env.get_array_length(&fingerprints).unwrap_or(0);
+        let mut paired = HashSet::new();
+        for i in 0..count {
+            if let Ok(item) = env.get_object_array_element(&fingerprints, i) {
+                paired.insert(string(&mut env, &JString::from(item)));
+            }
         }
-    }
-    *core.paired.write().unwrap() = paired;
-    // Forgotten by the user: its sessions over at once.
-    core.node.check_paired();
+        *core.paired.write().unwrap() = paired;
+        // Forgotten by the user: its sessions over at once.
+        core.node.check_paired();
+    }, || ())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_nativeRequest<'local>(
     mut env: JNIEnv<'local>, _this: JObject<'local>, handle: jlong, json: JString<'local>) -> jstring {
     let text = string(&mut env, &json);
-    let reply = match (core(handle), serde_json::from_str::<Value>(&text)) {
+    let reply = guarded(|| match (core(handle), serde_json::from_str::<Value>(&text)) {
         (None, _) => json!({"ok": false, "error": "stopped"}),
         (_, Err(e)) => json!({"ok": false, "error": e.to_string()}),
         (Some(core), Ok(message)) => request(&core, &message).unwrap_or_else(|e| json!({"ok": false, "error": e})),
-    };
+    }, || json!({"ok": false, "error": "the link's core failed"}));
     new_string(&mut env, &reply.to_string())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_nativeNext<'local>(
     mut env: JNIEnv<'local>, _this: JObject<'local>, handle: jlong, timeout_ms: jint) -> jstring {
-    let Some(core) = core(handle) else { return std::ptr::null_mut() };
-    let event = core.events.lock().unwrap().recv_timeout(Duration::from_millis(timeout_ms.max(0) as u64));
+    let wait = Duration::from_millis(timeout_ms.max(0) as u64);
+    let event = guarded(|| {
+        let core = core(handle)?;
+        let event = core.events.lock().unwrap().recv_timeout(wait);
+        event.ok()
+    }, || {
+        std::thread::sleep(wait);  // as if nothing came: the app's events thread asks again then, not at once
+        None
+    });
     match event {
-        Ok(event) => new_string(&mut env, &event.to_string()),
-        Err(_) => std::ptr::null_mut(),
+        Some(event) => new_string(&mut env, &event.to_string()),
+        None => std::ptr::null_mut(),
     }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_nativeStop<'local>(
     _env: JNIEnv<'local>, _this: JObject<'local>, handle: jlong) {
-    if let Some(core) = CORES.lock().unwrap().remove(&handle) {
-        core.node.close();
-    }
+    guarded(|| {
+        // Out of CORES first: its lock not held while the node closes.
+        let core = CORES.lock().unwrap().remove(&handle);
+        if let Some(core) = core {
+            core.node.close();
+        }
+    }, || ())
 }
 
 #[cfg(test)]
@@ -479,6 +510,23 @@ mod tests {
         let mut buf = [0u8; 256];
         assert_eq!(pc.read(&mut buf).map_err(|e| e.kind()), Ok(0));
         cable.join().unwrap();
+    }
+
+    #[test]
+    fn a_panic_under_a_call_is_its_failure_not_the_apps_end() {
+        // A lock of the core's (a session's) poisoned by one of its threads
+        // that panicked holding it: whoever takes it next panics too, as
+        // "devices" would under nativeRequest.
+        let lock = Arc::new(Mutex::new(0u32));
+        let held = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("a thread of the core's fails holding it");
+        }).join();
+        let reply = guarded(|| json!({"ok": true, "channels": *lock.lock().unwrap()}),
+                            || json!({"ok": false, "error": "the link's core failed"}));
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(guarded(|| json!({"ok": true}), || json!(null))["ok"], json!(true));
     }
 
     #[test]

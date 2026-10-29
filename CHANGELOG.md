@@ -304,6 +304,10 @@
   seconds; started again, it could not use the cable until it was
   plugged in again. It lets go of the cable now, at the PC's next
   answer, and takes it again as it starts.
+- Fixed: a fault inside the new link's core on the tablet ended the
+  whole app, and the desktop, the sound and the camera with it; the call
+  it came in now fails, as the app expects calls to the link to, and the
+  app goes on.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.
