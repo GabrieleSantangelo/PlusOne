@@ -66,6 +66,11 @@
   second beside its pings, on each side, and twice a second while it
   waited for the network to come back; now it wakes for its pings alone,
   and not at all while it waits.
+- **Reaching the tablet never hangs on a host that answers slowly**:
+  something on the network answering where the tablet was, a byte every
+  few seconds, held the PC's connecting to the tablet for ever (each
+  byte came in time, and nothing limited the whole); the PC now gives
+  up on it after 8 s, as the tablet does on a PC, and tries elsewhere.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

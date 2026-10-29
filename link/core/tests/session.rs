@@ -972,6 +972,40 @@ fn an_open_given_up_while_away_is_closed_on_the_other_side_too() {
 }
 
 #[test]
+fn a_host_that_trickles_its_bytes_is_given_up() {
+    // Each byte in time for a read's own timeout (5 s), the handshake
+    // never done: the PC gives up on it after 8 s (HANDSHAKE_WHOLE, as
+    // the listening side does), where it waited for ever.
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().unwrap();
+        let mut hello = [0u8; 4096];
+        let _ = tcp.read(&mut hello);
+        // A handshake record 4 KiB long, a byte a second.
+        let mut trickle = vec![0x16, 0x03, 0x03, 0x10, 0x00];
+        trickle.resize(5 + 4096, 0);
+        for byte in trickle {
+            if tcp.write_all(&[byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    let (pc_id, _) = identity();
+    let pc = Node::new("pc", &pc_id, Arc::new(|_: &str| true)).unwrap();
+    let started = Instant::now();
+    let (done, dialed) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(pc.connect(address, Duration::from_secs(2)).map(|_| ()));
+    });
+    let result = dialed.recv_timeout(Duration::from_secs(12));
+    assert!(result.as_ref().is_ok_and(|r| r.is_err()), "after 12 s: {result:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "given up after {:?}", started.elapsed());
+}
+
+#[test]
 fn the_sixty_fifth_channel_is_refused() {
     let (pc, _tablet, address) = pair();
     let session = pc.connect(address, Duration::from_secs(2)).unwrap();

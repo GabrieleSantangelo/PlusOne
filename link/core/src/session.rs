@@ -56,7 +56,12 @@ const UDP_PROBE: Duration = Duration::from_millis(200);
 /// No room in the UDP socket: this long for some, then the packet is lost
 /// (a keyframe's tail where the system caps the socket's room).
 const UDP_STALL: Duration = Duration::from_millis(20);
+/// Each read and write of a connection's handshake and hellos waits this
+/// long at most, and the whole of them HANDSHAKE_WHOLE (a host that
+/// trickled its bytes, each in time, held the side that dialed it for
+/// ever); the listening side closes a connection no session by then too.
 const HANDSHAKE: Duration = Duration::from_secs(5);
+pub(crate) const HANDSHAKE_WHOLE: Duration = Duration::from_secs(8);
 const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// An input or realtime message's largest size: sealed (30 bytes more), it
 /// fits a QUIC datagram on a 1500-byte network (QUIC's header, tag and
@@ -506,6 +511,42 @@ impl Established {
     }
 }
 
+/// A connection's stream during its handshake and hellos: none of its
+/// reads and writes goes past the instant (HANDSHAKE_WHOLE).
+struct Until<'a>(&'a mut Box<dyn Stream>, Instant);
+
+impl Until<'_> {
+    /// The stream's timeouts down to the time left, once under HANDSHAKE.
+    fn left(&mut self) -> io::Result<()> {
+        let left = self.1.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "no session in time"));
+        }
+        if left < HANDSHAKE {
+            self.0.set_timeouts(Some(left))?;
+        }
+        Ok(())
+    }
+}
+
+impl Read for Until<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.left()?;
+        self.0.read(buf)
+    }
+}
+
+impl Write for Until<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.left()?;
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// The TLS handshake, the keys and the hellos, on a new connection. The
 /// verifier has checked the other side is paired. kind: what it runs on;
 /// ours: the session we have with that device, if any (to go on with it:
@@ -513,8 +554,9 @@ impl Established {
 pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream>, dialer: bool, hello: Value,
                         kind: &str, ours: &dyn Fn(&str) -> Option<(String, bool)>) -> io::Result<Established> {
     stream.set_timeouts(Some(HANDSHAKE))?;
+    let until = Instant::now() + HANDSHAKE_WHOLE;
     while conn.is_handshaking() {
-        conn.complete_io(&mut stream)?;
+        conn.complete_io(&mut Until(&mut stream, until))?;
     }
     let peer = conn.peer_certificates().and_then(|c| c.first()).map(|c| crate::fingerprint(c))
         .ok_or_else(|| invalid("no certificate"))?;
@@ -566,11 +608,11 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
     frame::encode(frame::SESSION, 0, &body, &mut bytes);
     conn.writer().write_all(&bytes)?;
     while conn.wants_write() {
-        conn.write_tls(&mut stream)?;
+        conn.write_tls(&mut Until(&mut stream, until))?;
     }
     let mut decoder = Decoder::default();
     let theirs = loop {
-        if let Some((kind, _, body)) = read_frame(&mut conn, &mut stream, &mut decoder)? {
+        if let Some((kind, _, body)) = read_frame(&mut conn, &mut Until(&mut stream, until), &mut decoder)? {
             if kind != frame::SESSION || body.len() < 8 {
                 return Err(invalid("a frame before the hello"));
             }
@@ -615,7 +657,7 @@ fn prepare(established: &mut Established) -> io::Result<Arc<Path>> {
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
-fn read_frame(conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>, decoder: &mut Decoder)
+fn read_frame(conn: &mut rustls::Connection, stream: &mut dyn Read, decoder: &mut Decoder)
               -> io::Result<Option<(u8, u16, Vec<u8>)>> {
     if let Some(frame) = decoder.next()? {
         return Ok(Some(frame));

@@ -18,9 +18,6 @@ use std::time::Duration;
 /// A feature's code for the channels the other side opens for it.
 pub type Handler = Arc<dyn Fn(Incoming) + Send + Sync>;
 
-/// A connection that is not a session this long after it came: closed
-/// (each read has its own timeout too; this is the whole of it).
-const HANDSHAKE_WHOLE: Duration = Duration::from_secs(8);
 /// The other side says it takes QUIC (its hello): a QUIC path to it is
 /// tried this long, beside the TCP one the session has already.
 const QUIC_TRY: Duration = Duration::from_secs(3);
@@ -327,7 +324,7 @@ impl Node {
                     let (done, ended) = mpsc::channel::<()>();
                     if let Ok(watched) = tcp.try_clone() {
                         let _ = std::thread::Builder::new().name("link-accept-watch".into()).spawn(move || {
-                            if ended.recv_timeout(HANDSHAKE_WHOLE) == Err(mpsc::RecvTimeoutError::Timeout) {
+                            if ended.recv_timeout(session::HANDSHAKE_WHOLE) == Err(mpsc::RecvTimeoutError::Timeout) {
                                 let _ = watched.shutdown(std::net::Shutdown::Both);
                             }
                         });
@@ -359,7 +356,7 @@ impl Node {
         *self.0.quic.lock().unwrap() = Some(endpoint.clone());
         self.0.quic_port.store(bound.port(), Ordering::SeqCst);
         let node = self.0.clone();
-        crate::quic::listen(endpoint, self.0.server.clone(), self.0.gate.clone(), HANDSHAKE_WHOLE,
+        crate::quic::listen(endpoint, self.0.server.clone(), self.0.gate.clone(), session::HANDSHAKE_WHOLE,
                             move |stream, quic| {
             let from = quic.conn.remote_address();
             if node.closed.load(Ordering::SeqCst) {
