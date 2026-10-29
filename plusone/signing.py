@@ -16,7 +16,6 @@ import uuid
 from gi.repository import Gio, GLib
 
 from . import link, log, once, sign_jobs, signatures
-from .link import channels
 from .i18n import _
 
 NOTIFICATION = "sign"
@@ -190,8 +189,9 @@ class Signing:
         announce it too, and only the real one proves it (TLS)."""
         tablet = self.app.tablets.active()
         where = self.app.tablets.targets(tablet) if tablet else []
-        # No address, but over the link (the cable): it goes there.
-        reached = bool(where) or (tablet is not None and channels.connected(tablet.app_id))
+        # No address, but a session over the link (the cable's): it goes
+        # there. As Paths knows it from the link's events: nothing asked.
+        reached = bool(where) or (tablet is not None and self.app.paths.path(tablet.fingerprint) is not None)
         return (where, tablet.name, tablet.app_id) if reached else None
 
     def _read(self, work, then):

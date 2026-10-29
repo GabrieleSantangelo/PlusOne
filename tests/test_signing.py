@@ -1,5 +1,6 @@
 """Signing on the tablet, in its app: requests, and signing here instead."""
 import os
+import types
 
 from gi.repository import GLib
 import pytest
@@ -61,6 +62,8 @@ class FakeApp:
         self.discovery = FakeNearby()
         self.tablets = Tablets(self.settings, discovery=self.discovery,
                                paired=FakePaired({TAB: {"name": "Galaxy Tab"}} if paired else {}))
+        self.sessions = {}  # what plus-one-link's events said: the tablet's path, while it has a session
+        self.paths = types.SimpleNamespace(path=self.sessions.get)
         self.notes = []
 
     def add_action(self, action):
@@ -152,6 +155,19 @@ def spin(until, timeout=5):
         GLib.MainContext.default().iteration(False)
         time.sleep(0.005)
     return until()
+
+
+def test_by_cable_alone_the_tablets_app_signs(monkeypatch, tmp_path):
+    # Never on the network: plus-one-link's session (the cable's), as its
+    # events said it, and nothing asked of it here (the main loop).
+    from plusone.link import channels
+    app, signing, _, notes = make(monkeypatch)
+    app.sessions[TAB] = "cable"
+    monkeypatch.setattr(channels, "connected", lambda app_id: pytest.fail("plus-one-link asked on the main loop"))
+    sent = []
+    monkeypatch.setattr(signing, "_sign_in_app", lambda path, target: sent.append(target))
+    signing.request(str(tmp_path / "form.pdf"))
+    assert spin(lambda: sent) and sent == [([], "Galaxy Tab", APP)] and not notes
 
 
 def test_the_tablets_app_signs_when_it_is_on_the_network(monkeypatch, tmp_path):

@@ -85,10 +85,12 @@
   background or the PC locked (it was made again at the first stroke
   after each); another user's session in front, it goes, as before.
 - **No freeze while plus-one-link takes its time**: whether the tablet's
-  app needed this PC's version was asked of plus-one-link where Plus One
-  does everything else, each time something changed (a tablet whose app
-  announces no version, the cable's): a slow answer held the window and
-  Quick Settings for as long, up to seconds. It is asked aside now.
+  app needed this PC's version, and whether a PDF to sign could go to it
+  by cable, were asked of plus-one-link where Plus One does everything
+  else (for a tablet whose app announces no version, or with no address
+  on the network): a slow answer held the window and Quick Settings for
+  as long, up to seconds. The first is asked aside now; the second is
+  known from what plus-one-link already told.
 - **No freeze while a big PDF is read**: a PDF to sign (up to 256 MB)
   was read, and copied for the tablet, where Plus One does everything
   else, before it went and after it was signed on the PC: meanwhile the
