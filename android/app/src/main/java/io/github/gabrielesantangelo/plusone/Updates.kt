@@ -22,9 +22,22 @@ import java.security.MessageDigest
  */
 object Updates {
     const val MAX_APK = 64L * 1024 * 1024
+    private const val UPDATES = "updates"
 
     fun versionCode(context: Context): Long =
         context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+
+    /** A file of its own for an update on its way (two at once, from two PCs
+     * or both links, would write one over the other), in cache's "updates". */
+    fun incoming(cache: File): File = File.createTempFile("update", ".apk", File(cache, UPDATES).apply { mkdirs() })
+
+    /** What updates left in cache: one being installed ends this process,
+     * maybe before its file is deleted (so did the one file of before). As
+     * the service starts, before any update can come. */
+    fun clean(cache: File) {
+        File(cache, UPDATES).listFiles()?.forEach { it.delete() }
+        File(cache, "update.apk").delete()
+    }
 
     /** Why file is not this app's update, or null if it is. */
     fun check(context: Context, file: File, sha256: String): String? {

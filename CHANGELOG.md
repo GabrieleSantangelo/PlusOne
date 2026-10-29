@@ -292,6 +292,9 @@
   own access point's, while the last one was still ending, the last one
   ending removed the new group, or took the tablet's app off the new
   network; it lets go only of what is still its own now.
+- Fixed: two updates of the tablet's app coming at once (from two PCs,
+  say) were written to the same file, each over the other, and one
+  ending deleted it under the other; each has a file of its own now.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.

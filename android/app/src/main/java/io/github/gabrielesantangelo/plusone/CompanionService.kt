@@ -78,6 +78,7 @@ class CompanionService : Service(), LinkServer.Host {
         }
         // PDFs of jobs this process no longer has (it was ended meanwhile).
         File(cacheDir, "jobs").listFiles()?.forEach { if (it.nameWithoutExtension !in Jobs.ids) it.delete() }
+        Updates.clean(cacheDir)
         Jobs.listen(queueChanged)
         queueChanged()  // nor a notification for them
         // One for both links: the room it keeps for PDFs counts uploads on

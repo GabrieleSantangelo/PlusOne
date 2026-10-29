@@ -4,7 +4,6 @@ import android.util.Log
 import io.github.gabrielesantangelo.plusone.link.Handler
 import io.github.gabrielesantangelo.plusone.link.Link
 import org.json.JSONObject
-import java.io.File
 
 /** The paired PC's update of this app (plusone/updates.py): taken, checked,
  * installed (this process ends with it), unless the PC uses the tablet now
@@ -30,7 +29,7 @@ class UpdateHandler(private val service: CompanionService) : Handler {
             link.refuse("off")
             return false
         }
-        val file = File(service.cacheDir, "update.apk")
+        val file = Updates.incoming(service.cacheDir)
         try {
             file.outputStream().use { link.readPayload(size, it) }
             val reason = if (service.busy()) "busy" else Updates.check(service, file, request.optString("sha256"))
