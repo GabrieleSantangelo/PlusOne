@@ -3,7 +3,10 @@
 PC. As root (D-Bus activated on the system bus), one virtual HID tablet per
 caller on /dev/uhid, with the S Pen's own descriptor, fed only the pen's
 reports, which the caller sends through a socket it gets from Open().
-Polkit says who may: the active local session (the action below).
+Polkit says who may: the active local session (the action below). The
+pen goes as soon as that session is no longer the one in front (another
+user's switched to, or it ended): its caller could go on sending, and the
+other user's compositor would take the reports as clicks.
 
 Not a /dev/uhid file descriptor handed out: its holder could destroy the
 pen and create a keyboard on it. Through the socket only 10-byte pen
@@ -24,6 +27,11 @@ from gi.repository import Gio, GLib  # noqa: E402
 NAME = "io.github.gabrielesantangelo.PlusOne.Pen"
 PATH = "/io/github/gabrielesantangelo/PlusOne/Pen"
 ACTION = "io.github.gabrielesantangelo.plusone.pen"
+DBUS = "org.freedesktop.DBus"
+LOGIN1 = "org.freedesktop.login1"
+MANAGER = "/org/freedesktop/login1"
+SESSION = "org.freedesktop.login1.Session"
+PROPERTIES = "org.freedesktop.DBus.Properties"
 XML = f"""<node><interface name="{NAME}">
   <method name="Open"><arg name="reports" type="h" direction="out"/></method>
 </interface></node>"""
@@ -47,7 +55,7 @@ idle_source = None
 
 
 class Pen:
-    def __init__(self):
+    def __init__(self, session=None):
         self.uhid = os.open(UHID, os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK)
         try:
             os.write(self.uhid, struct.pack("<I128s64s64sHHIIII", UHID_CREATE2, DEVICE_NAME.encode(),
@@ -64,6 +72,7 @@ class Pen:
             # The kernel's start/open notifications: read, or its queue fills.
             GLib.io_add_watch(self.uhid, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, self._drain),
         ]
+        self.session = session  # its caller's, watched while it lives (None: --session)
         pens[self.ours.fileno()] = self
 
     def _report(self, _fd, condition):
@@ -99,6 +108,8 @@ class Pen:
             return
         for watch in self.watches:
             GLib.source_remove(watch)
+        if self.session is not None:
+            self.session.release()
         try:
             os.write(self.uhid, struct.pack("<I", UHID_DESTROY))
         except OSError:
@@ -106,6 +117,77 @@ class Pen:
         os.close(self.uhid)
         self.ours.close()
         arm_idle()
+
+
+def call(bus, name, path, interface, method, args, reply):
+    return bus.call_sync(name, path, interface, method, args, GLib.VariantType(reply),
+                         Gio.DBusCallFlags.NONE, 10000, None).unpack()
+
+
+class Session:
+    """The caller's logind session: its process's, else its user's graphical
+    one, as polkit judges it (Plus One, a D-Bus service of its user's, is in
+    no session of its own). Watched from before it is read, so a switch in
+    between is not missed; logind's signals only, no timer."""
+
+    def __init__(self, bus, sender):
+        self.bus, self.ids = bus, []
+        self.path = self._find(sender)
+        if self.path is None:
+            return
+        self.ids = [bus.signal_subscribe(LOGIN1, PROPERTIES, "PropertiesChanged", self.path, SESSION,
+                                         Gio.DBusSignalFlags.NONE, self._changed),
+                    bus.signal_subscribe(LOGIN1, "org.freedesktop.login1.Manager", "SessionRemoved", MANAGER,
+                                         None, Gio.DBusSignalFlags.NONE, self._removed)]
+
+    def _find(self, sender):
+        pid = call(self.bus, DBUS, "/org/freedesktop/DBus", DBUS, "GetConnectionUnixProcessID",
+                   GLib.Variant("(s)", (sender,)), "(u)")[0]
+        try:
+            return call(self.bus, LOGIN1, MANAGER, "org.freedesktop.login1.Manager", "GetSessionByPID",
+                        GLib.Variant("(u)", (pid,)), "(o)")[0]
+        except GLib.Error:
+            pass
+        uid = call(self.bus, DBUS, "/org/freedesktop/DBus", DBUS, "GetConnectionUnixUser",
+                   GLib.Variant("(s)", (sender,)), "(u)")[0]
+        try:
+            user = call(self.bus, LOGIN1, MANAGER, "org.freedesktop.login1.Manager", "GetUser",
+                        GLib.Variant("(u)", (uid,)), "(o)")[0]
+            _id, path = call(self.bus, LOGIN1, user, PROPERTIES, "Get",
+                             GLib.Variant("(ss)", ("org.freedesktop.login1.User", "Display")), "(v)")[0]
+        except GLib.Error:
+            return None
+        return None if path == "/" else path
+
+    def in_front(self):
+        """Active on a seat (one with none, over SSH, is always "active")."""
+        if self.path is None:
+            return False
+        try:
+            values = call(self.bus, LOGIN1, self.path, PROPERTIES, "GetAll", GLib.Variant("(s)", (SESSION,)),
+                          "(a{sv})")[0]
+            return bool(values["Active"]) and bool(values["Seat"][0])
+        except (GLib.Error, KeyError):
+            return False
+
+    def _changed(self, _connection, _sender, _path, _interface, _signal, params):
+        _session, values, invalidated = params.unpack()
+        if values.get("Active") is False or ("Active" in invalidated and not self.in_front()):
+            self._gone()
+
+    def _removed(self, _connection, _sender, _path, _interface, _signal, params):
+        if params.unpack()[1] == self.path:
+            self._gone()
+
+    def _gone(self):
+        for pen in list(pens.values()):
+            if pen.session is self:
+                pen.close()
+
+    def release(self):
+        for subscription in self.ids:
+            self.bus.signal_unsubscribe(subscription)
+        self.ids = []
 
 
 def authorized(bus, sender):
@@ -119,20 +201,30 @@ def authorized(bus, sender):
     return reply.unpack()[0][0]
 
 
-def method_call(connection, sender, _path, _interface, method, _params, invocation, polkit_bus):
+def method_call(connection, sender, _path, _interface, method, _params, invocation, system_bus):
     if method != "Open":
         invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
         return
+    session = None
     try:
-        if not authorized(polkit_bus, sender):
+        if not authorized(system_bus, sender):
             invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied",
                                          "not the session in front of this PC")
             return
         if len(pens) >= MAX_PENS:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.LimitsExceeded", "too many pens")
             return
-        pen = Pen()
+        if system_bus is not None:
+            session = Session(system_bus, sender)
+            if not session.in_front():
+                session.release()
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied",
+                                             "not the session in front of this PC")
+                return
+        pen = Pen(session)
     except (GLib.Error, OSError) as e:
+        if session is not None:
+            session.release()
         invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(e))
         return
     fds = Gio.UnixFDList.new()
@@ -155,9 +247,9 @@ def main():
     interface = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
 
     def acquired(connection, _name):
-        polkit_bus = None if session else connection
+        system_bus = None if session else connection
         connection.register_object(PATH, interface,
-                                   lambda *a: method_call(*a, polkit_bus), None, None)
+                                   lambda *a: method_call(*a, system_bus), None, None)
 
     Gio.bus_own_name(bus_type, NAME, Gio.BusNameOwnerFlags.NONE, acquired, None, lambda *a: loop.quit())
     arm_idle()

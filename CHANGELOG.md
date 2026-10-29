@@ -17,6 +17,11 @@
   and once Bluetooth went off the PC found no Plus One on the tablet until
   the app started again; it now listens each time Bluetooth comes back on,
   and as soon as the app is allowed Bluetooth.
+- **The pen stops when the PC switches user**: the tablet's pen, once
+  given, lasted as long as the program that asked for it, and after a
+  switch to another user's session that program could still click in
+  theirs. The pen helper now takes it away as soon as its session is no
+  longer the one in front, and gives none to a session that is not.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and
