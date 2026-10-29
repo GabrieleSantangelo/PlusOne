@@ -4,14 +4,20 @@ import io.github.gabrielesantangelo.plusone.link.Handler
 import io.github.gabrielesantangelo.plusone.link.Link
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.io.IOException
 import java.io.OutputStream
 import java.net.InetAddress
 
-/** The features over the link's core (LinkFeatures): a control channel's requests. */
+/** The features over the link's core (LinkFeatures): a control channel's
+ * requests, and the channels for its packets the PC opens with it. */
 class LinkFeaturesTest {
     /** A control channel: the PC's messages as they come on it, a payload's
      * pieces among them (here, what one reads as if it were a message). */
@@ -64,5 +70,57 @@ class LinkFeaturesTest {
         assertThrows(IllegalArgumentException::class.java) { LinkFeatures.serve(control, handler) }
         assertEquals(emptyList<String>(), control.sent)
         assertEquals(listOf("closed"), asked)
+    }
+
+    @Test
+    fun askedAsEachRequestGoesToTheHandlerAlone() {
+        val control = Control(request("ping"), request("a-later-pcs-request"), request("got"), request("got"))
+        assertThrows(IOException::class.java) { LinkFeatures.serve(control, handler) { asked += "asked" } }
+        assertEquals(listOf("asked", "got", "asked", "got", "closed"), asked)
+    }
+
+    /** A channel of the PC's for packets: whether it was closed. */
+    private class Channel : Closeable {
+        @Volatile var closed = false
+        override fun close() { closed = true }
+    }
+
+    @Test
+    fun theChannelsASessionDidNotTakeCloseAsItEnds() {
+        val parked = Parked<Channel>()
+        val pcm = Channel().also { parked.park("pc", "speakers", "pcm", it) }
+        val asked = parked.count()  // its request: refused, the speakers off
+        parked.close("pc", "speakers", until = asked)
+        assertTrue(pcm.closed)
+        assertNull(parked.take("pc", "speakers", "pcm", 0))
+    }
+
+    @Test
+    fun aLaterSessionsChannelsAndOtherFeaturesStay() {
+        val parked = Parked<Channel>()
+        val old = Channel().also { parked.park("pc", "speakers", "pcm", it) }
+        val asked = parked.count()
+        // The next session's, opened as this one ends; another feature's; another PC's.
+        val later = Channel().also { parked.park("pc", "speakers", "pcm", it) }
+        val media = Channel().also { parked.park("pc", "display", "media", it) }
+        val other = Channel().also { parked.park("other", "speakers", "pcm", it) }
+        parked.close("pc", "speakers", until = asked)
+        assertTrue(old.closed)
+        assertFalse(later.closed || media.closed || other.closed)
+        assertSame(later, parked.take("pc", "speakers", "pcm", 0))
+        assertSame(media, parked.take("pc", "display", "media", 0))
+        assertSame(other, parked.take("other", "speakers", "pcm", 0))
+    }
+
+    @Test
+    fun theNewestIsTakenTheOlderOnesClosed() {
+        val parked = Parked<Channel>()
+        val old = Channel().also { parked.park("pc", "display", "media", it) }
+        val new = Channel().also { parked.park("pc", "display", "media", it) }
+        assertSame(new, parked.take("pc", "display", "media", 0))
+        assertTrue(old.closed)
+        assertFalse(new.closed)
+        parked.close("pc", "display", until = parked.count())  // taken: the session's own now
+        assertFalse(new.closed)
     }
 }

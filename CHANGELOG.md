@@ -280,6 +280,10 @@
   whatever else was to go on it, for as long as the session lasted; the
   channel closes after 30 s now, and the answer waits for the PC to ask
   for it again.
+- Fixed: with the speakers off in the tablet's app, each time the PC
+  asked for them over the new link (every 10 s while it played) left a
+  socket open in the app, for as long as it ran; a channel the PC opens
+  for a session that does not take it now closes with that session.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.

@@ -76,8 +76,9 @@ class Requests(private val handlers: List<Handler>) {
     private val byType = handlers.flatMap { handler -> handler.types.map { it to handler } }.toMap()
 
     /** Blocks while link lasts; otherVersion: the PC speaks another
-     * protocol version, which only an update is answered for. */
-    fun serve(link: Link, otherVersion: Boolean) {
+     * protocol version, which only an update is answered for; asked() as
+     * each request goes to its handler. */
+    fun serve(link: Link, otherVersion: Boolean, asked: () -> Unit = {}) {
         try {
             while (true) {
                 val message = link.receive()
@@ -92,6 +93,7 @@ class Requests(private val handlers: List<Handler>) {
                 }
                 if (otherVersion && handler?.acrossVersions != true) return
                 if (handler == null) continue  // a request of a later PC: not known here
+                asked()
                 if (!handler.handle(link, message, size)) return
             }
         } finally {
