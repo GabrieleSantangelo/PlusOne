@@ -308,6 +308,11 @@
   whole app, and the desktop, the sound and the camera with it; the call
   it came in now fails, as the app expects calls to the link to, and the
   app goes on.
+- Fixed: once the tablet's app had not come to the front when the PC
+  asked for its camera or microphone (the screen it opens for that never
+  showed), it never tried again: every later request waited on that one
+  and was refused, and the camera and the microphone stayed out of the
+  PC's reach until the app was opened. It tries again at the next one.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.

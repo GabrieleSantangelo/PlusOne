@@ -15,8 +15,6 @@ import io.github.gabrielesantangelo.plusone.link.LinkServer
 import io.github.gabrielesantangelo.plusone.link.MdnsAnnouncer
 import io.github.gabrielesantangelo.plusone.link.TcpListener
 import java.io.File
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -278,7 +276,10 @@ class CompanionService : Service(), LinkServer.Host {
     // Its types now: camera and microphone stay once they were taken in
     // front, so the PC's next use needs no CaptureActivity.
     @Volatile private var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-    private var elevating: CompletableFuture<Boolean>? = null  // under sessions
+    private val elevation = Elevation {
+        startActivity(Intent(this, CaptureActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION))
+    }
 
     fun allowedTypes(kind: String) = types and typeOf(kind) != 0
 
@@ -294,19 +295,7 @@ class CompanionService : Service(), LinkServer.Host {
         // screen), and not over the lock screen: else no use trying.
         val locked = getSystemService(android.app.KeyguardManager::class.java).isKeyguardLocked
         if (locked || !(Settings.canDrawOverlays(this) || Front.shown)) return false
-        // Camera and microphone asked at once: one activity, one wait.
-        val done = synchronized(sessions) {
-            elevating?.takeIf { !it.isDone } ?: CompletableFuture<Boolean>().also {
-                elevating = it
-                startActivity(Intent(this, CaptureActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION))
-            }
-        }
-        try {
-            done.get(ELEVATE_WAIT, TimeUnit.MILLISECONDS)
-        } catch (e: Exception) {
-            Log.w(TAG, "could not come to the front for the camera or microphone: $e")
-        }
+        if (!elevation.await(ELEVATE_WAIT)) Log.w(TAG, "could not come to the front for the camera or microphone")
         return allowedTypes(kind)
     }
 
@@ -323,7 +312,7 @@ class CompanionService : Service(), LinkServer.Host {
             types = wanted
             if (!showForeground()) types = before  // what the service really has
         }
-        synchronized(sessions) { elevating?.complete(true) }
+        elevation.elevated()
     }
 
     /** The foreground service with its types, and its notification as the
