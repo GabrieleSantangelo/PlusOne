@@ -473,13 +473,14 @@ fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
     let whole = collecting.join().unwrap();
     // Shown: whole, with every frame since the last keyframe whole.
     let (mut decodable, mut shown, mut latencies) = (false, vec![0u32; seconds.ceil() as usize + 1], Vec::new());
+    let last_second = shown.len() - 1;
     let mut lost = 0;
     for &(n, keyframe, when, ns) in &sent {
         match whole.get(&n) {
             Some(&back) => {
                 decodable |= keyframe;
                 if decodable {
-                    shown[(when as usize).min(shown.len() - 1)] += 1;
+                    shown[(when as usize).min(last_second)] += 1;
                     latencies.push((back - ns) as f64 / 1e6);
                 }
             }
