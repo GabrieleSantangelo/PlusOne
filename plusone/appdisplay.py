@@ -167,7 +167,7 @@ class Input:
         self.scale = scale_for(size)  # the monitor's pixels per desktop pixel
         self.pen = None       # the pen's device once made (prepare()); False: none to be had
         self.pen_last = None  # the last report, while the pen is in range
-        # The pen made on a thread of its own, let go of on the listening one:
+        # The pen made on a thread of its own, closed on the listening one:
         # one on its way (its turn: close() makes it an older one's, closed
         # as it comes), and none made again after close(last=True).
         self._pen_lock = threading.Lock()
@@ -219,15 +219,22 @@ class Input:
         if self.pen_last is not None and now - self.heard >= INPUT_SILENCE:
             self._pen(self.pen_last[:1] + b"\x00" + self.pen_last[2:])
 
-    def close(self, last=False):
-        """Whatever touches let go of, and the pen's device with it (made
-        again as the pen comes near, or prepare()); last: never again."""
+    def let_go(self):
+        """Whatever touches let go of (the app paused, the desktop locked);
+        the pen's device stays, made once (D-Bus, the helper's polkit, the
+        tablet's settings written)."""
         if self.gesture is not None:
             self._touch({}, lost=True)
         if self.fling is not None:
             self._stop_fling()
         if self.pen_last is not None:
             self._pen(self.pen_last[:1] + b"\x00" + self.pen_last[2:])
+
+    def close(self, last=False):
+        """let_go(), and the pen's device closed (another user's session in
+        front, the session's end): made again by prepare(), or as the pen
+        comes near; last: never again."""
+        self.let_go()
         with self._pen_lock:
             device, self.pen = self.pen, None
             self._making, self._turn, self._last = False, self._turn + 1, self._last or last
@@ -414,7 +421,7 @@ class Input:
         if device:
             device.report(report)
         elif device is None and report[1] & pen.IN_RANGE:
-            self.prepare()  # let go of since (hidden, the seat's): made again, not waited for
+            self.prepare()  # closed since (another user's session was in front): made again, not waited for
         pen.feed.publish(report)  # the signing window draws with them as they come
         self.pen_last = report if report[1] & pen.IN_RANGE else None
 
@@ -800,7 +807,9 @@ class AppStreamer:
             busy = self.input is not None and self.input.busy()
             body = self.channel.receive(0.02 if busy else IDLE_WAIT)
             if self.gated and self.input and not self._let_go:
-                self.input.close()  # whatever touches, let go (within 20 ms while it touched)
+                self.input.let_go()  # whatever touches, let go (within 20 ms while it touched)
+            if not self.active and self.input and self.input.pen:
+                self.input.close()  # another user's session in front: the pen's device too (SEC-22)
             self._let_go = self.gated
             if self.input:
                 self.input.check()
@@ -847,10 +856,8 @@ class AppStreamer:
             self.shown = shown
             self._capture()
         if not shown and self.input:
-            self.input.close()  # nothing left touching
+            self.input.let_go()  # nothing left touching
         if shown:
-            if self.input and self._frame:
-                self.input.prepare()  # the pen let go of with the rest: ready again before it comes
             self.force_keyframe()
         self.on_visible(shown)
 
@@ -858,10 +865,10 @@ class AppStreamer:
         """The desktop may not be touched now (seat.py): the app's input is
         dropped, not queued, and the listening thread lets go of whatever
         touches; inactive (another user's session in front), nothing is
-        captured either."""
+        captured either, and the pen's device is closed."""
         was, self.gated = self.gated, closed
         if was and not closed and self.input and self._frame:
-            self.input.prepare()  # the pen let go of with the rest: ready again before it comes
+            self.input.prepare()  # closed if another user's session was in front: ready again before it comes
         with self._state_lock:
             if active == self.active:
                 return

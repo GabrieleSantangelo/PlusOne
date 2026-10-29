@@ -81,7 +81,9 @@
   at its first stroke, on the thread that takes the fingers: meanwhile, a
   moment and up to 25 s at worst, the fingers, the picture's repairs and
   the measures of the network waited. The pen is made as the desktop
-  comes up now, beside them, and again as it shows after a pause.
+  comes up now, beside them, and kept while the tablet's app is in the
+  background or the PC locked (it was made again at the first stroke
+  after each); another user's session in front, it goes, as before.
 - **No freeze while a big PDF is read**: a PDF to sign (up to 256 MB)
   was read where Plus One does everything else, before it went to the
   tablet and after it was signed on the PC: meanwhile the window stood

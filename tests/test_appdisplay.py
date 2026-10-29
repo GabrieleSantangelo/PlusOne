@@ -324,8 +324,8 @@ def test_the_pen_is_made_off_the_listening_thread():
 
 def test_the_pen_is_made_as_the_desktop_comes_up():
     # Ahead of the first stroke: as the first frame goes (the monitor is
-    # Mutter's then, to map the pen onto), and as the desktop is shown or
-    # may be touched again (the pen let go of with the rest meanwhile).
+    # Mutter's then, to map the pen onto), and as the desktop may be
+    # touched again (closed if another user's session was in front).
     prepared = []
     buffer = types.SimpleNamespace(get_size=lambda: 3, extract_dup=lambda at, size: b"abc",
                                    has_flags=lambda flags: False)
@@ -335,16 +335,13 @@ def test_the_pen_is_made_as_the_desktop_comes_up():
                                      gated=False, _capture=lambda: None, force_keyframe=lambda: None,
                                      on_visible=lambda shown: None,
                                      input=types.SimpleNamespace(prepare=lambda: prepared.append(1),
-                                                                 close=lambda: None))
+                                                                 let_go=lambda: None))
     for _ in range(3):
         appdisplay.AppStreamer._send(streamer, sink)
     assert prepared == [1]
-    appdisplay.AppStreamer.visible(streamer, False)
-    appdisplay.AppStreamer.visible(streamer, True)
-    assert prepared == [1, 1]
     appdisplay.AppStreamer.gate(streamer, True)
     appdisplay.AppStreamer.gate(streamer, False)
-    assert prepared == [1, 1, 1]
+    assert prepared == [1, 1]
 
 
 def test_a_pen_made_once_the_desktop_ended_is_closed():

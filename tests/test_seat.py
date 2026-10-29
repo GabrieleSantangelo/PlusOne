@@ -130,7 +130,7 @@ def test_no_session_known_is_no_input(monkeypatch):
 
 class FakeInput:
     def __init__(self):
-        self.packets, self.closed = [], 0
+        self.packets, self.let_goes, self.pen = [], 0, None
 
     def busy(self):
         return True
@@ -142,8 +142,8 @@ class FakeInput:
         self.packets.append(body)
         return True
 
-    def close(self):
-        self.closed += 1
+    def let_go(self):
+        self.let_goes += 1
 
 
 def listen(streamer, bodies):
@@ -163,13 +163,13 @@ def listen(streamer, bodies):
 
 def test_locked_the_tablet_s_input_is_dropped_and_what_touches_let_go():
     touch = bytes([appdisplay.INPUT, 0, 0])
-    streamer = types.SimpleNamespace(input=FakeInput(), gated=False, _let_go=False)
+    streamer = types.SimpleNamespace(input=FakeInput(), gated=False, active=True, _let_go=False)
     listen(streamer, [touch])
-    assert streamer.input.packets == [touch] and streamer.input.closed == 0
+    assert streamer.input.packets == [touch] and streamer.input.let_goes == 0
     streamer.gated = True
     listen(streamer, [touch, None, touch])
     assert streamer.input.packets == [touch]  # nothing more: dropped, not queued
-    assert streamer.input.closed == 1  # let go once, at once
+    assert streamer.input.let_goes == 1  # let go once, at once
     streamer.gated = False
     listen(streamer, [touch])
     assert streamer.input.packets == [touch, touch]
@@ -202,6 +202,44 @@ class WatchedLock:
 
     def __exit__(self, *exc):
         self.lock.release()
+
+
+def test_the_pen_stays_while_paused_or_locked_and_goes_with_another_user_in_front():
+    # Made once (D-Bus, the helper's polkit, the tablet's settings written),
+    # not again at the next stroke after each pause or lock; another
+    # user's session in front, closed (the helper takes it away too), and
+    # made again once the seat is ours.
+    made, closed = [], []
+
+    def make_pen():
+        made.append(1)
+        return types.SimpleNamespace(report=lambda report: None, close=lambda: closed.append(1))
+    touch = appdisplay.Input(types.SimpleNamespace(), (1000, 1000), make_pen)
+    streamer = types.SimpleNamespace(input=touch, gated=False, active=True, _let_go=False, shown=True, _frame=1,
+                                     _state_lock=threading.Lock(), _capture=lambda: None,
+                                     force_keyframe=lambda: None, on_visible=lambda shown: None)
+    near = bytes([appdisplay.INPUT, 0, 1, appdisplay.pen.IN_RANGE]) + bytes(8)
+
+    def pen_there():
+        deadline = time.monotonic() + 5
+        while not touch.pen and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return touch.pen
+    touch.prepare()
+    assert pen_there() and made == [1]
+    appdisplay.AppStreamer.visible(streamer, False)  # the app paused
+    appdisplay.AppStreamer.visible(streamer, True)
+    listen(streamer, [near])
+    appdisplay.AppStreamer.gate(streamer, True)  # locked
+    listen(streamer, [None])
+    appdisplay.AppStreamer.gate(streamer, False)
+    listen(streamer, [near])
+    assert made == [1] and closed == [] and touch.pen
+    appdisplay.AppStreamer.gate(streamer, True, active=False)  # another user's session in front
+    listen(streamer, [None])
+    assert closed == [1] and touch.pen is None
+    appdisplay.AppStreamer.gate(streamer, False, active=True)
+    assert pen_there() and made == [1, 1]
 
 
 def streamer_of(pipeline, shown=True):
