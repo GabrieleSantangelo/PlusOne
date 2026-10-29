@@ -159,6 +159,8 @@
   such packets are dropped now, and four frames at most wait to be whole.
 - Fixed: a message nested thousands of levels deep, from a PC over the
   link, closed the tablet's app; only its channel closes now.
+- Fixed: the tablet's keystore failing to sign a connection closed the
+  app; only that connection fails now.
 
 ## 0.10.0
 

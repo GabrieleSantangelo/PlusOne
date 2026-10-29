@@ -190,14 +190,15 @@ fn general(e: impl fmt::Display) -> rustls::Error {
 impl Signer for Keystore {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
         let mut env = self.vm.attach_current_thread().map_err(general)?;
-        let data = env.byte_array_from_slice(message).map_err(general)?;
-        let signed = env.call_method(&self.signer, "sign", "([B)[B", &[JValue::Object(&data)])
-            .and_then(|value| value.l()).map_err(general)?;
-        if env.exception_check().unwrap_or(false) {
+        let signed = keystore_sign(&mut env, &self.signer, message);
+        // An exception (Kotlin's, or JNI's own) told and cleared, whatever
+        // failed: left pending, the thread's detach would end the app.
+        if env.exception_check().unwrap_or(true) {
+            let _ = env.exception_describe();
             let _ = env.exception_clear();
             return Err(general("the keystore did not sign"));
         }
-        env.convert_byte_array(JByteArray::from(signed)).map_err(general)
+        signed.map_err(general)
     }
 
     fn scheme(&self) -> SignatureScheme {
@@ -205,7 +206,23 @@ impl Signer for Keystore {
     }
 }
 
+/// signer.sign(message): the signature, or an error (its null: it could not).
+fn keystore_sign(env: &mut JNIEnv, signer: &GlobalRef, message: &[u8]) -> jni::errors::Result<Vec<u8>> {
+    let data = env.byte_array_from_slice(message)?;
+    let signed = env.call_method(signer, "sign", "([B)[B", &[JValue::Object(&data)])?.l()?;
+    env.convert_byte_array(JByteArray::from(signed))
+}
+
 // -- requests ---------------------------------------------------------------------------
+
+/// request[key] as the number it is used as: one out of its range an
+/// error, never another number; default when it is not there.
+fn number<T: TryFrom<u64>>(request: &Value, key: &str, default: Option<T>) -> Result<T, String> {
+    match request.get(key) {
+        None | Some(Value::Null) => default.ok_or_else(|| format!("no {key}")),
+        Some(value) => value.as_u64().and_then(|n| T::try_from(n).ok()).ok_or_else(|| format!("{key} out of range: {value}")),
+    }
+}
 
 fn session_json(session: &plusone_link::Session) -> Value {
     json!({"id": session.peer, "name": session.name, "features": session.features(), "path": session.path(),
@@ -217,7 +234,7 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
     let text = |key: &str| request[key].as_str().ok_or(format!("no {key}"));
     match request["op"].as_str().unwrap_or("") {
         "listen" => {
-            let port = request["port"].as_u64().unwrap_or(0) as u16;
+            let port: u16 = number(request, "port", Some(0))?;
             let bound = core.node.listen(([0, 0, 0, 0], port).into()).map_err(|e| e.to_string())?;
             // QUIC on the same port (UDP): the PC's TCP session moves to it
             // (our hello says it). Without it, TCP alone, as before.
@@ -239,7 +256,7 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
         "accept_fd" => {
             // The cable's for as long as it is plugged in: one owner, which
             // opened it once (Android's accessory opens only once).
-            let fd = request["fd"].as_i64().filter(|fd| *fd >= 0).ok_or("no fd")? as i32;
+            let fd: i32 = number(request, "fd", None)?;
             let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
             if CABLE.swap(true, Ordering::SeqCst) {
                 return Err("the cable has an owner already".into());
@@ -254,7 +271,7 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
         "accept_stream" => {
             // A stream the app made (a Bluetooth socket's, bridged): a path
             // of that kind, the PC making the session on it.
-            let fd = request["fd"].as_i64().filter(|fd| *fd >= 0).ok_or("no fd")? as i32;
+            let fd: i32 = number(request, "fd", None)?;
             let stream = std::os::unix::net::UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
             let (node, kind) = (core.node.clone(), text("path")?.to_owned());
             std::thread::Builder::new().name("link-stream".into()).spawn(move || {
@@ -274,8 +291,9 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
         }
         "serve" => {
             let feature = text("feature")?.to_owned();
+            let version: u32 = number(request, "version", Some(1))?;
             let sender = Mutex::new(core.sender.clone());
-            core.node.serve(&feature, request["version"].as_u64().unwrap_or(1) as u32, move |incoming| {
+            core.node.serve(&feature, version, move |incoming| {
                 let channel = incoming.channel;
                 let event = json!({"event": "incoming", "device": incoming.session.peer, "feature": channel.feature,
                                    "channel": channel.name, "class": channel.class.name(), "id": channel.id});
@@ -390,5 +408,31 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
     _env: JNIEnv<'local>, _this: JObject<'local>, handle: jlong) {
     if let Some(core) = CORES.lock().unwrap().remove(&handle) {
         core.node.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_number_out_of_its_range_is_an_error_not_another() {
+        let request = json!({"port": 65536, "fd": 2147483648u64, "version": 4294967296u64, "negative": -1});
+        assert!(number::<u16>(&request, "port", Some(0)).is_err());
+        assert!(number::<i32>(&request, "fd", None).is_err());
+        assert!(number::<u32>(&request, "version", Some(1)).is_err());
+        assert!(number::<i32>(&request, "negative", None).is_err());
+        assert!(number::<u16>(&json!({"port": "47236"}), "port", Some(0)).is_err());
+    }
+
+    #[test]
+    fn a_number_in_its_range_or_its_default() {
+        let request = json!({"port": 65535, "fd": 2147483647, "version": 3});
+        assert_eq!(number::<u16>(&request, "port", Some(0)), Ok(65535));
+        assert_eq!(number::<i32>(&request, "fd", None), Ok(i32::MAX));
+        assert_eq!(number::<u32>(&request, "version", Some(1)), Ok(3));
+        assert_eq!(number::<u16>(&json!({}), "port", Some(0)), Ok(0));
+        assert_eq!(number::<u32>(&json!({"version": null}), "version", Some(1)), Ok(1));
+        assert_eq!(number::<i32>(&json!({}), "fd", None), Err("no fd".to_owned()));
     }
 }

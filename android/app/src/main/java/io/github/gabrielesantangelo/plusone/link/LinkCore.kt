@@ -28,11 +28,16 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
     @Volatile var onEvent: ((JSONObject) -> Unit)? = null
 
     /** Signs for the TLS handshake (from Rust, on its thread): the key never
-     * leaves the keystore. */
-    private class Signer(private val key: PrivateKey) {
+     * leaves the keystore. Null if it cannot: nothing thrown into Rust, the
+     * handshake fails. */
+    internal class Signer(private val key: PrivateKey) {
         @Suppress("unused")  // called through JNI
-        fun sign(data: ByteArray): ByteArray =
+        fun sign(data: ByteArray): ByteArray? = try {
             Signature.getInstance("SHA256withECDSA").run { initSign(key); update(data); sign() }
+        } catch (e: Throwable) {
+            Log.w(TAG, "link: the keystore did not sign: $e")
+            null
+        }
     }
 
     init {
