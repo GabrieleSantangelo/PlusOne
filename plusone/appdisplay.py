@@ -78,6 +78,11 @@ QUEUE_MS = 60    # data waiting to go out past this many ms of the bitrate: the 
 # The kernel counts a packet waiting to go out with its buffers (TIOCOUTQ:
 # about 2.3 KB for 1472 bytes), not its bytes alone.
 TRUESIZE = 3 / 2
+# A packet's bytes on the way past its H.264: our header, the link's seal,
+# quinn's own count of a datagram (or UDP's and IP's).
+PACKET_EXTRA = 80
+# A frame not encoded, by why (the stats' line says how many of each).
+LEFT_OUT = {"queue": "the link's queue", "budget": "over the budget"}
 
 
 # Widths offered for the desktop in the app, each at the tablet's proportions
@@ -455,8 +460,12 @@ class RateControl:
     network took less: the picture stuttered at each of the controller's
     cuts, and at each of its steps up. Following a budget, the bitrate
     goes down only once it no longer FITS in it (its share leaves 15 %: a
-    smaller cut costs nothing), and up only by UP at least, UP_AFTER after
-    its last change."""
+    smaller cut costs nothing) and has not for HOLD: the controller cut by
+    30 % six times a minute on a good Wi-Fi, most of them taken back within
+    the second, and each one's keyframe made the frames after it late, lost,
+    asked for again. Meanwhile whole frames are left out to stay within the
+    budget (Allowance): fewer frames for that second, none late. Up only by
+    UP at least, UP_AFTER after its last change."""
 
     SHARE = 0.85    # of a path's budget (its congestion controller's), the video's
     STEADY = 0.05   # up to the most: by this much at least
@@ -465,6 +474,7 @@ class RateControl:
                     # goes 1.5 times what goes through at most: 1.25 held at 9.5 Mbit/s
                     # for 90 s on a hotspot taking 50)...
     UP_AFTER = 2.0  # ...this long (s) after the last change at least
+    HOLD = 1.0      # s: the budget under what the bitrate needs this long before it goes down
     GROWN_MS = 25   # over the least: a queue
     CLEAN = 3       # reports in a row without loss nor queue before going up
     HISTORY = 10    # reports the least is taken over
@@ -484,6 +494,8 @@ class RateControl:
         self.delays = collections.deque(maxlen=self.HISTORY)
         self.changed_at = -math.inf  # the bitrate's last change for a budget (time.monotonic())
         self.why = None  # what the last change returned was for, for the log
+        self.last = None  # the last budget (kbit/s) and the others' share
+        self.under = None  # since when the bitrate no longer fits in the budget (time.monotonic())
 
     def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None, others=0, now=None):
         """A report, and the frames not encoded since the last; the new
@@ -541,18 +553,43 @@ class RateControl:
         changed, else None."""
         now = time.monotonic() if now is None else now
         self.clean, self.ceiling = 0, None
+        self.last = (budget, others)
         target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE - others)))
+        if self.kbps <= self.allowed(budget, others):
+            self.under = None
+        elif self.under is None:
+            self.under = now
         if target < self.kbps:
-            if self.kbps <= (budget - others) * self.FITS:
+            if self.under is None or now - self.under < self.HOLD:
                 return None
         elif (target < self.kbps * self.UP and (target < self.most or target < self.kbps * (1 + self.STEADY))
               or now - self.changed_at < self.UP_AFTER):
             return None
+        under, self.under = self.under, None
         kbps = self._set(target)
         if kbps is not None:
             self.changed_at = now
-            self.why = f"the budget {budget} kbit/s, the others' {others:.0f}"
+            self.why = (f"the budget {budget} kbit/s, the others' {others:.0f}"
+                        + (f"; under it for {now - under:.1f} s" if under is not None else ""))
         return kbps
+
+    def tick(self, now=None):
+        """Between the budget's events (it may tell nothing new for long):
+        the new bitrate once the budget has been under it for HOLD, else
+        None."""
+        if self.under is None or self.last is None:
+            return None
+        return self.budget(*self.last, now=now)
+
+    def unbudgeted(self):
+        """The path has no controller of its own now (TCP, a cable)."""
+        self.last = self.under = None
+
+    @classmethod
+    def allowed(cls, budget, others=0):
+        """What the video may send within a budget (kbit/s): FITS of it,
+        less the others'."""
+        return max(0.0, (budget - others) * cls.FITS)
 
     def _set(self, kbps):
         kbps = max(MIN_KBPS, min(self.most, kbps))
@@ -560,6 +597,60 @@ class RateControl:
             return None
         self.kbps = kbps
         return kbps
+
+
+class Allowance:
+    """What the video may still send within the path's budget (bytes), a
+    bucket: it fills at what RateControl.allowed() leaves the video, up to
+    DEPTH frames' worth (a keyframe's VBV_FRAMES, and one), and each frame
+    sent takes its bytes out. A frame goes into the encoder only while the
+    bucket is not in debt: over the budget (a cut the bitrate has not
+    followed yet, HOLD), whole frames are left out, the next encoded
+    against the last (nothing breaks), and what goes stays within the
+    budget. No budget (TCP, the link of before): no limit."""
+
+    DEPTH = media.VBV_FRAMES + 1
+
+    def __init__(self, fps):
+        self.fps = fps
+        self.kbps = None  # what fills it; None: no budget
+        self.level = 0.0
+        self.at = None
+        self.lock = threading.Lock()  # the budget's thread, and the streaming one
+
+    def follow(self, kbps, now=None):
+        """The video's part of the budget now (kbit/s), or None."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if kbps is None:
+                self.kbps, self.level, self.at = None, 0.0, None
+                return
+            if self.kbps is None:
+                self.kbps, self.level, self.at = kbps, self._depth(kbps), now  # full at first
+                return
+            self._fill(now)
+            self.kbps = kbps
+            self.level = min(self.level, self._depth(kbps))
+
+    def allows(self, now):
+        with self.lock:
+            if self.kbps is None:
+                return True
+            self._fill(now)
+            return self.level >= 0
+
+    def take(self, size, now):
+        with self.lock:
+            if self.kbps is not None:
+                self._fill(now)
+                self.level -= size
+
+    def _depth(self, kbps):
+        return kbps * 125 * self.DEPTH / self.fps
+
+    def _fill(self, now):
+        self.level = min(self._depth(self.kbps), self.level + self.kbps * 125 * max(0.0, now - self.at))
+        self.at = now
 
 
 class LinkPackets:
@@ -691,14 +782,7 @@ class AppStreamer:
             f"appsink name=out emit-signals=true sync=false async=false max-buffers=0")
         enc = self.enc = self.pipeline.get_by_name("enc")
         media.cap_keyframes(enc, bitrate, fps)
-        self.fps = fps
-        self.rate = RateControl(bitrate)
-        self.kbps = bitrate  # the encoder's
-        self._rate_lock = threading.Lock()  # the stats' thread and the link's budget events
-        self.skipped = 0  # frames not encoded: the network behind
-        # The path's budget (kbit/s), if its controller is its own (QUIC's):
-        # what waits counts against it, and in bytes as they are.
-        self._budget_kbps = channel.budget_kbps() if hasattr(channel, "budget_kbps") else None
+        self._rates(channel, fps, bitrate)
         # When each frame going into the encoder was captured, in order: one
         # comes out per one in (no B frames), and a flush drops those held.
         # (Its output timestamps could not be traced back after a flush.)
@@ -711,14 +795,29 @@ class AppStreamer:
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         self._bus_handler = bus.connect("message::error", self._failed)
-        self._frame = 0
-        self._last_keyframe = 0.0
-        self._keyframes = 0  # sent since the last stats
         self._encoded = []  # ms from capture to sent, since the last stats
-        self._running = True
         self._feedback = threading.Thread(target=self._listen, daemon=True)
         to = f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams) else "the link"
         log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {to}")
+
+    def _rates(self, channel, fps, bitrate):
+        """What decides which frames go and at what bitrate (not GStreamer's:
+        the tests make a streamer of it alone)."""
+        self.channel, self.fps = channel, fps
+        self.rate = RateControl(bitrate)
+        self.kbps = bitrate  # the encoder's
+        self._rate_lock = threading.Lock()  # the stats' thread and the link's budget events
+        self.skipped = collections.Counter()  # frames not encoded, by why (LEFT_OUT)
+        # The path's budget (kbit/s), if its controller is its own (QUIC's):
+        # what waits counts against it, and in bytes as they are.
+        self._budget_kbps = channel.budget_kbps() if hasattr(channel, "budget_kbps") else None
+        self.allowance = Allowance(fps)
+        if self._budget_kbps:
+            self.allowance.follow(RateControl.allowed(self._budget_kbps))
+        self._frame = 0
+        self._last_keyframe = 0.0
+        self._keyframes = 0  # sent since the last stats
+        self._running = True
 
     def start(self):
         with self._state_lock:
@@ -731,11 +830,25 @@ class AppStreamer:
         """plus-one-link says the path's budget changed: followed at once,
         not at the next report (a second later: the queue filled meanwhile)."""
         self._budget_kbps = kbps
-        if not kbps or not self._running:
+        if not self._running:
+            return
+        if not kbps:
+            with self._rate_lock:
+                self.rate.unbudgeted()
+                self.allowance.follow(None)
             return
         others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
         with self._rate_lock:
+            self.allowance.follow(RateControl.allowed(kbps, others))
             changed = self.rate.budget(kbps, others)
+            if changed is not None:
+                self._bitrate(changed, self.rate.why)
+
+    def _tick(self):
+        """From the listening thread, a few times a second: the bitrate
+        down once the budget has been under it for HOLD."""
+        with self._rate_lock:
+            changed = self.rate.tick()
             if changed is not None:
                 self._bitrate(changed, self.rate.why)
 
@@ -767,18 +880,9 @@ class AppStreamer:
         self.on_error(f"{message.src.get_name()}: {error.message}")
 
     def _frame_in(self, pad, info):
-        # The network behind (more waiting to go out than QUEUE_MS of the
-        # bitrate): this frame is not encoded, rather than queued after the
-        # others (the delay would grow, and grow). A frame that never went
-        # in breaks nothing; the next one is encoded against the last. On a
-        # path with a budget, QUEUE_MS of it, under what the link holds
-        # realtime for (quic.rs LATE, 100 ms of the same rate): past it the
-        # link drops a frame's packets, and the frames after are broken.
-        budget = self._budget_kbps
-        most = (min(self.rate.kbps, budget) * QUEUE_MS // 8 if budget
-                else self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
-        if self.channel.queued() > max(64 << 10, most):
-            self.skipped += 1
+        why = self._left_out(time.monotonic())
+        if why:
+            self.skipped[why] += 1
             return Gst.PadProbeReturn.DROP
         # pipewiresrc and a live test source stamp buffers with the running
         # time at capture, and the pipeline's clock is the monotonic one.
@@ -790,6 +894,26 @@ class AppStreamer:
         while len(self._captured) > 16:  # never out of step for long
             self._captured.popleft()
         return Gst.PadProbeReturn.OK
+
+    def _left_out(self, now):
+        """Why the frame going into the encoder now is not encoded, or None.
+        A frame that never went in breaks nothing; the next one is encoded
+        against the last.
+        "queue": the network behind (more waiting to go out than QUEUE_MS
+        of the bitrate), rather than queued after the others (the delay
+        would grow, and grow). On a path with a budget, QUEUE_MS of it,
+        under what the link holds realtime for (quic.rs LATE, 100 ms of the
+        same rate): past it the link drops a frame's packets, and the
+        frames after are broken.
+        "budget": over the budget's allowance (Allowance)."""
+        budget = self._budget_kbps
+        most = (min(self.rate.kbps, budget) * QUEUE_MS // 8 if budget
+                else self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
+        if self.channel.queued() > max(64 << 10, most):
+            return "queue"
+        if not self.allowance.allows(now):
+            return "budget"
+        return None
 
     def _send(self, appsink):
         """Streaming thread: one frame, out at once."""
@@ -811,6 +935,7 @@ class AppStreamer:
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
             self.channel.send(header + data[index * payload:(index + 1) * payload])
+        self.allowance.take(len(data) + count * PACKET_EXTRA, time.monotonic())
         self._encoded.append((time.monotonic_ns() - captured) / 1e6)
         return Gst.FlowReturn.OK
 
@@ -827,6 +952,7 @@ class AppStreamer:
             self._let_go = self.gated
             if self.input:
                 self.input.check()
+            self._tick()
             if not body:
                 continue
             kind = body[0]
@@ -846,11 +972,14 @@ class AppStreamer:
             elif kind == STATS and len(body) == STATS_FORMAT.size:
                 _kind, shown, lost, *ms = STATS_FORMAT.unpack(body)
                 encoded, self._encoded = sorted(self._encoded), []
-                skipped, self.skipped = self.skipped, 0
+                left_out, self.skipped = self.skipped, collections.Counter()
+                skipped = sum(left_out.values())
                 budget = self.channel.budget_kbps() if hasattr(self.channel, "budget_kbps") else None
                 others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
                 keyframes, self._keyframes = self._keyframes, 0
                 with self._rate_lock:
+                    if budget:
+                        self.allowance.follow(RateControl.allowed(budget, others))  # the others' share moves
                     kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget, others)
                     if kbps is not None:
                         self._bitrate(kbps, self.rate.why)
@@ -858,7 +987,8 @@ class AppStreamer:
                                "capture_to_decoded": [v / 10 for v in ms[:3]],
                                "whole_to_decoded": [v / 10 for v in ms[3:]],
                                "capture_to_sent": encoded[len(encoded) // 2] if encoded else None,
-                               "skipped": skipped, "kbps": self.rate.kbps, "keyframes": keyframes})
+                               "skipped": skipped, "left_out": dict(left_out), "kbps": self.rate.kbps,
+                               "keyframes": keyframes})
 
     def visible(self, shown):
         """The app shows the desktop, or not: nothing is captured or encoded
@@ -911,13 +1041,18 @@ class AppStreamer:
         self.keyframes.request()
 
 
+def _left_out(stats):
+    causes = stats.get("left_out") or {}
+    return ", ".join(f"{n} {LEFT_OUT.get(why, why)}" for why, n in sorted(causes.items())) or "the network behind"
+
+
 def describe(stats):
     decoded = stats["capture_to_decoded"]
     sent = stats["capture_to_sent"]
     return (f"{stats['shown']} fps, lost {stats['lost']}; capture to decoded {decoded[0]:.1f} ms "
             f"(90%: {decoded[1]:.1f}, max {decoded[2]:.1f}); of which capture to sent "
             f"{sent if sent is None else round(sent, 1)} ms, first packet to decoded {stats['whole_to_decoded'][0]:.1f} ms"
-            + (f"; {stats['skipped']} not encoded (the network behind)" if stats.get("skipped") else "")
+            + (f"; {stats['skipped']} not encoded ({_left_out(stats)})" if stats.get("skipped") else "")
             + (f"; {stats['kbps']} kbit/s" if "kbps" in stats else "")
             + (f"; {stats['keyframes']} keyframe{'s' if stats['keyframes'] > 1 else ''}" if stats.get("keyframes") else ""))
 

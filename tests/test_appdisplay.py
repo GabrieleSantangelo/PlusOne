@@ -330,13 +330,11 @@ def test_the_pen_is_made_as_the_desktop_comes_up():
     buffer = types.SimpleNamespace(get_size=lambda: 3, extract_dup=lambda at, size: b"abc",
                                    has_flags=lambda flags: False)
     sink = types.SimpleNamespace(emit=lambda signal: types.SimpleNamespace(get_buffer=lambda: buffer))
-    streamer = types.SimpleNamespace(_captured=collections.deque(), channel=types.SimpleNamespace(send=lambda d: None),
-                                     _frame=0, _keyframes=0, _encoded=[], _state_lock=threading.Lock(), shown=True,
-                                     active=True,
-                                     gated=False, _capture=lambda: None, force_keyframe=lambda: None,
-                                     on_visible=lambda shown: None,
-                                     input=types.SimpleNamespace(prepare=lambda: prepared.append(1),
-                                                                 let_go=lambda: None))
+    streamer = streamer_on(FakeLink(budget=None))
+    streamer.__dict__.update(_state_lock=threading.Lock(), shown=True, active=True, gated=False,
+                             _captured=collections.deque(), _encoded=[], _frame=0, _keyframes=0,
+                             _capture=lambda: None, on_visible=lambda shown: None,
+                             input=types.SimpleNamespace(prepare=lambda: prepared.append(1), let_go=lambda: None))
     for _ in range(3):
         appdisplay.AppStreamer._send(streamer, sink)
     assert prepared == [1]
@@ -394,26 +392,73 @@ def test_the_bitrate_follows_the_network():
 
 def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
     rate = appdisplay.RateControl(20000)
-    assert rate.report(60, 0, 30, 20, budget=10000, now=0) == 8500  # a share of it
-    assert rate.report(55, 3, 30, 20, budget=10000, now=1) is None  # a frame lost: no cut
+    assert rate.report(60, 0, 30, 20, budget=10000, now=0) is None  # over it: a second first (frames left out)
+    assert rate.report(60, 0, 30, 20, budget=10000, now=1) == 8500  # a share of it
+    assert rate.report(55, 3, 30, 20, budget=10000, now=2) is None  # a frame lost: no cut
     assert rate.report(60, 0, 30, 20, budget=10300, now=9) is None  # a few percent: no change
     assert rate.report(60, 0, 30, 20, budget=40000, now=9) == 20000  # never past the one set
-    assert rate.report(60, 0, 30, 20, budget=500, now=9) == appdisplay.MIN_KBPS  # nor below the least
+    assert rate.report(60, 0, 30, 20, budget=500, now=9) is None
+    assert rate.report(60, 0, 30, 20, budget=500, now=10) == appdisplay.MIN_KBPS  # nor below the least
 
 
 def test_each_change_is_a_keyframe_so_the_bitrate_changes_seldom():
     rate = appdisplay.RateControl(20000)
+    rate.budget(10000, now=-1)
     assert rate.budget(10000, now=0) == 8500
     assert rate.budget(9000, now=0.1) is None  # a cut it still fits in: no keyframe for it
-    assert rate.budget(8000, now=0.2) == 6800  # past it: down at once, whenever the last change
-    assert rate.budget(9000, now=3) is None  # up by less than UP: not worth a keyframe
-    assert rate.budget(10000, now=3) == 8500  # by UP and more...
-    assert rate.budget(14000, now=4) is None  # ...but UP_AFTER after the last change
-    assert rate.budget(14000, now=5) == 11900
+    assert rate.budget(8000, now=0.2) is None  # past it: a second first...
+    assert rate.tick(now=1.2) == 6800  # ...then down, whenever the last change
+    assert rate.budget(9000, now=4) is None  # up by less than UP: not worth a keyframe
+    assert rate.budget(10000, now=4) == 8500  # by UP and more...
+    assert rate.budget(14000, now=5) is None  # ...but UP_AFTER after the last change
+    assert rate.budget(14000, now=6) == 11900
     rate.kbps, rate.changed_at = 18500, 0
     assert rate.budget(40000, now=9) == 20000  # the last few percent to the most
     rate.kbps = 9000
     assert rate.report(55, 3, 30, 20) == 6000  # no budget (a TCP path): a frame lost cuts, as before
+
+
+class FakeLink:
+    """LinkPackets as the streamer uses it: what waits, the budget, the
+    others' share, the round trip; what was sent."""
+
+    def __init__(self, budget=10000, queued=0, others=0, rtt=None):
+        self.budget, self.waiting, self.others, self.round_trip = budget, queued, others, rtt
+        self.sent = []
+
+    def queued(self):
+        return self.waiting
+
+    def budget_kbps(self):
+        return self.budget
+
+    def others_kbps(self):
+        return self.others
+
+    def rtt(self):
+        return self.round_trip
+
+    def send(self, body):
+        self.sent.append(body)
+
+
+class FakeEncoder:
+    def __init__(self):
+        self.props = {}
+
+    def set_property(self, name, value):
+        self.props[name] = value
+
+    def find_property(self, name):
+        return None
+
+
+def streamer_on(link, bitrate=20000, fps=60):
+    """A streamer of what decides its frames and bitrate, no pipeline."""
+    streamer = object.__new__(appdisplay.AppStreamer)
+    streamer._rates(link, fps, bitrate)
+    streamer.enc, streamer.input = FakeEncoder(), None
+    return streamer
 
 
 class FakeWatchedLink:
@@ -453,20 +498,30 @@ def test_the_links_budget_is_followed_as_it_changes():
     assert link.asked == 1  # told: never asked again
     packets.close()
     assert link.closed
-    # The streamer: the new budget at once, between the reports.
+
+
+
+def test_the_streamer_follows_the_budget_between_the_reports(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    link = FakeLink(budget=None)
+    streamer = streamer_on(link)
     bitrates = []
-    others = [0]
-    streamer = types.SimpleNamespace(rate=appdisplay.RateControl(20000), _rate_lock=threading.Lock(), _running=True,
-                                     _bitrate=lambda kbps, why: bitrates.append(kbps),
-                                     channel=types.SimpleNamespace(others_kbps=lambda: others[0]))
-    appdisplay.AppStreamer._budget(streamer, 10000)
-    appdisplay.AppStreamer._budget(streamer, 10300)  # a few percent: no change
-    appdisplay.AppStreamer._budget(streamer, None)
-    others[0] = 1700  # the speakers play: the screen leaves them theirs
-    appdisplay.AppStreamer._budget(streamer, 10000)
+    streamer._bitrate = lambda kbps, why: bitrates.append(kbps)
+    streamer._budget(10000)  # over it: frames left out, a second first
+    streamer._budget(10300)  # a few percent: no change
+    assert streamer.allowance.kbps == 10300 * 0.95
+    streamer._budget(None)  # a path of no controller of its own: no hold, no limit
+    assert streamer.allowance.kbps is None
+    clock.now += 2
+    streamer._tick()
+    link.others = 1700  # the speakers play: the screen leaves them theirs
+    streamer._budget(10000)
+    clock.now += 1
+    streamer._tick()
     streamer._running = False
-    appdisplay.AppStreamer._budget(streamer, 4000)
-    assert bitrates == [8500, 6800]
+    streamer._budget(4000)
+    assert bitrates == [6800]
 
 
 def test_every_change_of_the_bitrate_is_said_with_its_cause(monkeypatch):
@@ -474,13 +529,16 @@ def test_every_change_of_the_bitrate_is_said_with_its_cause(monkeypatch):
     # nothing (13 said of 51 in 10 minutes), and each is a keyframe.
     said = []
     monkeypatch.setattr(appdisplay, "log", lambda *args: said.append(" ".join(map(str, args))))
-    enc = types.SimpleNamespace(set_property=lambda *_: None, find_property=lambda _: None)
-    streamer = types.SimpleNamespace(rate=appdisplay.RateControl(20000), _rate_lock=threading.Lock(), _running=True,
-                                     kbps=20000, enc=enc, fps=60, channel=types.SimpleNamespace(others_kbps=lambda: 1700))
-    streamer._bitrate = lambda kbps, why: appdisplay.AppStreamer._bitrate(streamer, kbps, why)
-    appdisplay.AppStreamer._budget(streamer, 10000)
-    appdisplay.AppStreamer._budget(streamer, 9800)  # no change: nothing said
-    assert said == ["app display: 20000 -> 6800 kbit/s, as the network takes (the budget 10000 kbit/s, the others' 1700)"]
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    streamer = streamer_on(FakeLink(budget=None, others=1700))
+    streamer._budget(10000)
+    clock.now += 0.5
+    streamer._budget(9800)  # no change: nothing said
+    clock.now += 0.5
+    streamer._tick()
+    assert said == ["app display: 20000 -> 6630 kbit/s, as the network takes "
+                    "(the budget 9800 kbit/s, the others' 1700; under it for 1.0 s)"]
     rate = appdisplay.RateControl(20000)
     rate.report(55, 3, 30, 20)
     assert rate.why == "3 frames lost"
@@ -497,17 +555,70 @@ def test_every_change_of_the_bitrate_is_said_with_its_cause(monkeypatch):
 def test_on_quic_a_frame_is_left_out_before_the_link_would_drop_it():
     # A 10 Mbit/s budget: QUEUE_MS of it is 75 KB; the link drops realtime
     # past 100 ms of it (125 KB). Of the bitrate (20 Mbit/s), it was 225 KB.
-    queued = [90 << 10]
-    streamer = types.SimpleNamespace(channel=types.SimpleNamespace(queued=lambda: queued[0]), skipped=0,
-                                     rate=appdisplay.RateControl(20000), _budget_kbps=10000)
-    assert appdisplay.AppStreamer._frame_in(streamer, None, None) == appdisplay.Gst.PadProbeReturn.DROP
-    assert streamer.skipped == 1
-    streamer._budget_kbps = None  # no budget (TCP): the bitrate's, the kernel's bytes as before
-    queued[0] = 200 << 10
+    link = FakeLink(budget=10000, queued=90 << 10)
+    streamer = streamer_on(link)
+    assert streamer._frame_in(None, None) == appdisplay.Gst.PadProbeReturn.DROP
+    assert streamer.skipped == {"queue": 1}
+    streamer._budget(None)  # no budget (TCP): the bitrate's, the kernel's bytes as before
+    link.waiting = 200 << 10
     streamer._captured = []
     pad = types.SimpleNamespace(get_sticky_event=lambda *_: None)
     info = types.SimpleNamespace(get_buffer=lambda: types.SimpleNamespace(pts=0))
-    assert appdisplay.AppStreamer._frame_in(streamer, pad, info) == appdisplay.Gst.PadProbeReturn.OK
+    assert streamer._frame_in(pad, info) == appdisplay.Gst.PadProbeReturn.OK
+
+
+def test_a_single_cut_is_absorbed_without_a_change_of_bitrate():
+    # GCC cut by 30 % six times a minute on a good Wi-Fi, most taken back
+    # within the second; each bitrate change was a keyframe at the worst time.
+    rate = appdisplay.RateControl(20000)
+    rate.kbps = 8500  # fits in 10000
+    assert rate.budget(7000, now=10) is None  # cut: it no longer fits...
+    assert rate.tick(now=10.5) is None
+    assert rate.budget(10000, now=10.8) is None  # ...taken back within the second
+    assert rate.tick(now=12) is None and rate.kbps == 8500
+    assert rate.budget(7000, now=20) is None  # a cut that holds...
+    assert rate.budget(7200, now=20.5) is None  # (still under: the second goes on)
+    assert rate.tick(now=20.9) is None
+    assert rate.tick(now=21.0) == 6120  # ...a second: down to the share of the budget now
+    assert rate.tick(now=22) is None  # once
+
+
+def offer_frames(streamer, clock, seconds, fps=60, keyframe_every=None):
+    """Frames into the encoder each 1/fps for seconds, those let in sent at
+    the bitrate's average size (a keyframe VBV_FRAMES of them): (frames
+    sent, bytes sent)."""
+    frames = sent = 0
+    for i in range(int(seconds * fps)):
+        clock.now += 1 / fps
+        if streamer._left_out(clock.now):
+            continue
+        keyframe = keyframe_every is not None and frames % keyframe_every == 0
+        size = streamer.kbps * 125 // fps * (appdisplay.media.VBV_FRAMES if keyframe else 1)
+        packets = -(-size // appdisplay.PAYLOAD)
+        streamer.allowance.take(size + packets * appdisplay.PACKET_EXTRA, clock.now)
+        frames, sent = frames + 1, sent + size + packets * appdisplay.PACKET_EXTRA
+    return frames, sent
+
+
+def test_under_a_cut_whole_frames_are_left_out_within_the_budget(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    link = FakeLink(budget=10000)
+    streamer = streamer_on(link, bitrate=8500)
+    streamer.rate.kbps = 8500
+    # Fitting the budget: every frame goes, a keyframe each second too.
+    assert offer_frames(streamer, clock, 2, keyframe_every=60)[0] == 120
+    # A cut to 7000: the bitrate stays for the second, the frames do not.
+    streamer._budget(7000)
+    frames, sent = offer_frames(streamer, clock, 1)
+    allowed = 7000 * appdisplay.RateControl.FITS * 125
+    assert sent <= allowed + streamer.allowance._depth(7000 * 0.95)  # never past the budget
+    assert 40 <= frames <= 50 and streamer.kbps == 8500  # 48 of 60
+    # Said each second, by why.
+    assert appdisplay.describe({"shown": 48, "lost": 0, "capture_to_decoded": [20, 30, 40],
+                                "whole_to_decoded": [10, 12, 14], "capture_to_sent": 5, "skipped": 13,
+                                "left_out": {"budget": 12, "queue": 1}, "kbps": 8500}).endswith(
+        "; 13 not encoded (12 over the budget, 1 the link's queue); 8500 kbit/s")
 
 
 def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():

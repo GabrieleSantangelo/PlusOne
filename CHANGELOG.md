@@ -2,6 +2,14 @@
 
 ## Unreleased (1.0)
 
+- **Fewer stutters on a Wi-Fi that hiccups**: the link's congestion
+  control cuts its rate by 30 % now and then on a Wi-Fi's jitter alone,
+  and takes it back within the second. Each cut lowered the desktop's
+  bitrate at once, a keyframe on Intel's encoder just when the network
+  took less: frames late, lost, keyframes asked for, more bitrate
+  changes. A cut now leaves out whole frames for as long as it lasts, so
+  that what goes stays within it; the bitrate goes down only if the cut
+  holds for a second.
 - **What carries the desktop**: the pill bottom left on the tablet says
   it too ("PC screen · QUIC · Wi-Fi", "PC screen · TCP · Wi-Fi Direct";
   a cable or Bluetooth has no transport to say), bright for 4 s when the
