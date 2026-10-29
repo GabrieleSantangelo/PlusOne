@@ -9,7 +9,9 @@
   took less: frames late, lost, keyframes asked for, more bitrate
   changes. A cut now leaves out whole frames for as long as it lasts, so
   that what goes stays within it; the bitrate goes down only if the cut
-  holds for a second.
+  holds for a second. And no keyframe goes after another still on its
+  way: the tablet's asks for one meanwhile are left (it asks again if it
+  still needs one), a change of bitrate waits for it to go out.
 - **What carries the desktop**: the pill bottom left on the tablet says
   it too ("PC screen · QUIC · Wi-Fi", "PC screen · TCP · Wi-Fi Direct";
   a cable or Bluetooth has no transport to say), bright for 4 s when the

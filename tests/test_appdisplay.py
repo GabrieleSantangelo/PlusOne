@@ -694,19 +694,89 @@ def test_what_is_still_to_go_out_is_known():
 
 
 def test_keyframes_asked_again_wait_for_the_last_to_come(monkeypatch):
-    clock, asked = [100.0], []
-    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
-    streamer = types.SimpleNamespace(channel=types.SimpleNamespace(rtt=lambda: 0.2), fps=60, _last_keyframe=0.0,
-                                     keyframes=types.SimpleNamespace(request=lambda: asked.append(clock[0])))
+    clock, asked = Clock(), []
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    streamer = streamer_on(FakeLink(rtt=0.2))
+    streamer.keyframes = types.SimpleNamespace(request=lambda: asked.append(clock.now))
     for t in (100.0, 100.3, 100.4):  # a round trip and a half, and the keyframe's own 4/60 s: 0.367 s
-        clock[0] = t
-        appdisplay.AppStreamer.force_keyframe(streamer)
+        clock.now = t
+        streamer.force_keyframe()
     assert asked == [100.0, 100.4]
     streamer.channel = types.SimpleNamespace()  # the link of before: no round trip known
     for t in (101.0, 101.2, 101.3):
-        clock[0] = t
-        appdisplay.AppStreamer.force_keyframe(streamer)
+        clock.now = t
+        streamer.force_keyframe()
     assert asked[2:] == [101.0, 101.3]
+
+
+def keyframe_streamer(monkeypatch, restarts=True):
+    """A streamer on a 10 Mbit/s budget, its encoder's every change of
+    bitrate a keyframe (Intel's), the keyframes asked of it and what it said."""
+    clock, asked, said = Clock(), [], []
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock,
+                                                                   monotonic_ns=lambda: int(clock.now * 1e9)))
+    monkeypatch.setattr(appdisplay, "log", lambda *args: said.append(" ".join(map(str, args))))
+    link = FakeLink(budget=10000)
+    streamer = streamer_on(link, bitrate=8500)
+    streamer.rate.kbps, streamer._restarts = 8500, restarts
+    streamer.keyframes = types.SimpleNamespace(request=lambda: asked.append(clock.now))
+    return streamer, link, clock, asked, said
+
+
+PAD = types.SimpleNamespace(get_sticky_event=lambda *_: None)
+INFO = types.SimpleNamespace(get_buffer=lambda: types.SimpleNamespace(pts=0))
+
+
+def frame_in(streamer, clock, size=15000):
+    """The next frame (1/60 s on) into the encoder: whether it went in; in,
+    out to the link at once, of size."""
+    clock.now += 1 / 60
+    if streamer._frame_in(PAD, INFO) != appdisplay.Gst.PadProbeReturn.OK:
+        return False
+    streamer._out(bytes(size), False, 0)
+    return True
+
+
+def test_no_keyframe_asked_for_while_the_last_still_waits_to_go_out(monkeypatch):
+    streamer, link, clock, asked, _said = keyframe_streamer(monkeypatch)
+    streamer._out(bytes(40000), True, 0)  # a keyframe (a bitrate change's, say)
+    clock.now += 0.3  # past the gap since it went (0.25 s: no round trip known)...
+    link.waiting = 41000 + 15000  # ...still in the link's queue, and a frame after it
+    assert frame_in(streamer, clock)
+    streamer.force_keyframe()  # the app asks (it lost a frame before it)
+    assert asked == [] and streamer._asks_held == 1  # not another into the queue the first waits in
+    link.waiting = 15000  # out: what waits now went after it
+    assert frame_in(streamer, clock)
+    streamer.force_keyframe()
+    assert asked == [clock.now]
+
+
+def test_a_keyframe_sent_answers_the_app_s_asks_for_a_while(monkeypatch):
+    streamer, link, clock, asked, _said = keyframe_streamer(monkeypatch)
+    streamer._out(bytes(60000), True, 0)  # a bitrate change's keyframe, out at once
+    clock.now += 0.1
+    assert frame_in(streamer, clock)
+    streamer.force_keyframe()  # the app's ask crossed it on the way
+    assert asked == []
+
+
+def test_a_bitrate_change_waits_for_the_last_keyframe_to_go_out(monkeypatch):
+    streamer, link, clock, _asked, said = keyframe_streamer(monkeypatch)
+    streamer._out(bytes(60000), True, 0)  # a keyframe
+    link.waiting = 61000
+    streamer._bitrate(6800, "the budget")  # a change: on Intel's, another keyframe
+    assert frame_in(streamer, clock) and frame_in(streamer, clock)  # frames go, as they are
+    assert "bitrate" not in streamer.enc.props and said == []
+    link.waiting = 20000  # the keyframe out: what waits went after it
+    assert frame_in(streamer, clock)  # the change with this one
+    assert streamer.enc.props["bitrate"] == 6800 and streamer.kbps == 6800
+    assert said == ["app display: 8500 -> 6800 kbit/s, as the network takes (the budget)"]
+    # NVENC, x264: a change is no keyframe, made at once.
+    streamer, link, clock, _asked, said = keyframe_streamer(monkeypatch, restarts=False)
+    streamer._out(bytes(60000), True, 0)
+    link.waiting = 61000
+    streamer._bitrate(6800, "the budget")
+    assert streamer.enc.props["bitrate"] == 6800
 
 
 APP = "abcd" * 4

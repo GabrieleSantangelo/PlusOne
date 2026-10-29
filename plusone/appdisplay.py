@@ -35,6 +35,10 @@ VIDEO_HEADER = struct.Struct("!BBIHHq")  # kind, flags, frame, index, count, cap
 # H.264 per packet: with the header, nonce and tag, one Ethernet frame.
 PAYLOAD = 1472 - VIDEO_HEADER.size - NONCE.size - TAG
 MIN_KEYFRAME_GAP = 0.25  # seconds; the app asks again until one comes
+# A keyframe counts as still on its way this long at most (s): realtime waits
+# 100 ms at most in the link (quic.rs LATE); past it what waits is not its
+# (a transfer's backlog, on the stream).
+KEY_FLYING_MOST = 0.5
 STATS_FORMAT = struct.Struct("!BII6H")
 FINGER = struct.Struct("!BHH")  # id, x, y (0..65535 of the screen)
 PEN_SAMPLE = 9                  # the S Pen's report after its ID (DisplayInput.kt)
@@ -783,10 +787,7 @@ class AppStreamer:
         enc = self.enc = self.pipeline.get_by_name("enc")
         media.cap_keyframes(enc, bitrate, fps)
         self._rates(channel, fps, bitrate)
-        # When each frame going into the encoder was captured, in order: one
-        # comes out per one in (no B frames), and a flush drops those held.
-        # (Its output timestamps could not be traced back after a flush.)
-        self._captured = collections.deque()
+        self._restarts = enc.get_factory().get_name() in media.RESTARTS
         self.keyframes = media.Keyframes(enc, on_flush=self._captured.clear)
         self._in_pad = enc.get_static_pad("sink")
         self._in_probe = self._in_pad.add_probe(Gst.PadProbeType.BUFFER, self._frame_in)
@@ -795,7 +796,6 @@ class AppStreamer:
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         self._bus_handler = bus.connect("message::error", self._failed)
-        self._encoded = []  # ms from capture to sent, since the last stats
         self._feedback = threading.Thread(target=self._listen, daemon=True)
         to = f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams) else "the link"
         log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {to}")
@@ -806,7 +806,12 @@ class AppStreamer:
         self.channel, self.fps = channel, fps
         self.rate = RateControl(bitrate)
         self.kbps = bitrate  # the encoder's
-        self._rate_lock = threading.Lock()  # the stats' thread and the link's budget events
+        # The stats' thread, the link's budget events, the streaming thread
+        # (a bitrate change made with the next frame in).
+        self._rate_lock = threading.RLock()
+        self._restarts = False  # each change of the bitrate is a keyframe (media.RESTARTS)
+        self._pending = None  # a bitrate decided, (kbit/s, why), not made yet
+        self._others = 0  # what else of ours goes to the tablet (kbit/s), as last asked
         self.skipped = collections.Counter()  # frames not encoded, by why (LEFT_OUT)
         # The path's budget (kbit/s), if its controller is its own (QUIC's):
         # what waits counts against it, and in bytes as they are.
@@ -815,8 +820,17 @@ class AppStreamer:
         if self._budget_kbps:
             self.allowance.follow(RateControl.allowed(self._budget_kbps))
         self._frame = 0
-        self._last_keyframe = 0.0
+        self._last_keyframe = 0.0  # one asked for, or sent
         self._keyframes = 0  # sent since the last stats
+        self._key_at = None  # when the last keyframe went to the link (time.monotonic())
+        self._after_key = 0  # bytes sent since
+        self._key_flying = False  # it still waits to go out, as of the last frame in
+        self._asks_held = 0  # the app's asks not answered for one on its way, since the last stats
+        self._encoded = []  # ms from capture to sent, since the last stats
+        # When each frame going into the encoder was captured, in order: one
+        # comes out per one in (no B frames), and a flush drops those held.
+        # (Its output timestamps could not be traced back after a flush.)
+        self._captured = collections.deque()
         self._running = True
 
     def start(self):
@@ -837,7 +851,7 @@ class AppStreamer:
                 self.rate.unbudgeted()
                 self.allowance.follow(None)
             return
-        others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
+        others = self._others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
         with self._rate_lock:
             self.allowance.follow(RateControl.allowed(kbps, others))
             changed = self.rate.budget(kbps, others)
@@ -853,13 +867,27 @@ class AppStreamer:
                 self._bitrate(changed, self.rate.why)
 
     def _bitrate(self, kbps, why):
-        """The encoder's bitrate changed, and said (each change, from the
-        budget's events too: the live tests count them, and each is a
-        keyframe on Intel's encoders)."""
-        log(f"app display: {self.kbps} -> {kbps} kbit/s, as the network takes ({why})")
-        self.kbps = kbps
-        self.enc.set_property("bitrate", kbps)
-        media.cap_keyframes(self.enc, kbps, self.fps)
+        """The encoder's bitrate to change. On an encoder whose every change
+        is a keyframe (RESTARTS), with the next frame in once the last
+        keyframe is out (_frame_in): one into the queue the last still waits
+        in made the frames behind it late, and the app asked again."""
+        with self._rate_lock:
+            self._pending = (kbps, why)
+            if not self._restarts:
+                self._make_bitrate()
+
+    def _make_bitrate(self):
+        """The bitrate decided, made now, and said (each change, from the
+        budget's events too: the live tests count them)."""
+        with self._rate_lock:
+            pending, self._pending = self._pending, None
+            if pending is None or pending[0] == self.kbps:
+                return
+            kbps, why = pending
+            log(f"app display: {self.kbps} -> {kbps} kbit/s, as the network takes ({why})")
+            self.kbps = kbps
+            self.enc.set_property("bitrate", kbps)
+            media.cap_keyframes(self.enc, kbps, self.fps)
 
     def stop(self):
         self._running = False
@@ -884,6 +912,8 @@ class AppStreamer:
         if why:
             self.skipped[why] += 1
             return Gst.PadProbeReturn.DROP
+        if self._pending is not None and not self._key_flying:
+            self._make_bitrate()  # its keyframe with this frame
         # pipewiresrc and a live test source stamp buffers with the running
         # time at capture, and the pipeline's clock is the monotonic one.
         buf = info.get_buffer()
@@ -907,13 +937,25 @@ class AppStreamer:
         frames after are broken.
         "budget": over the budget's allowance (Allowance)."""
         budget = self._budget_kbps
+        queued = self.channel.queued()
+        self._key_flying = self._flying(queued, now)
         most = (min(self.rate.kbps, budget) * QUEUE_MS // 8 if budget
                 else self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
-        if self.channel.queued() > max(64 << 10, most):
+        if queued > max(64 << 10, most):
             return "queue"
         if not self.allowance.allows(now):
             return "budget"
         return None
+
+    def _flying(self, queued, now):
+        """Whether the last keyframe still waits to go out: more waits than
+        went after it (ours, and the others' at their rate; the kernel's
+        count of a packet with its buffers, off the link), for
+        KEY_FLYING_MOST at most."""
+        if self._key_at is None or now - self._key_at >= KEY_FLYING_MOST:
+            return False
+        after = self._after_key + self._others * 125 * (now - self._key_at)
+        return queued > after * (1 if self._budget_kbps else TRUESIZE)
 
     def _send(self, appsink):
         """Streaming thread: one frame, out at once."""
@@ -923,7 +965,12 @@ class AppStreamer:
         buf = sample.get_buffer()
         data = buf.extract_dup(0, buf.get_size())
         captured = self._captured.popleft() if self._captured else time.monotonic_ns()
-        keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        self._out(data, not buf.has_flags(Gst.BufferFlags.DELTA_UNIT), captured)
+        return Gst.FlowReturn.OK
+
+    def _out(self, data, keyframe, captured):
+        """An encoded frame to the link, as it came."""
+        now = time.monotonic()
         payload = getattr(self.channel, "payload", PAYLOAD)
         count = -(-len(data) // payload)
         number = self._frame = self._frame + 1
@@ -935,9 +982,14 @@ class AppStreamer:
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
             self.channel.send(header + data[index * payload:(index + 1) * payload])
-        self.allowance.take(len(data) + count * PACKET_EXTRA, time.monotonic())
+        size = len(data) + count * PACKET_EXTRA
+        self.allowance.take(size, now)
+        if keyframe:  # whatever made it (asked, a bitrate change, the periodic one): it answers the app
+            self._key_at, self._after_key = now, 0
+            self._last_keyframe = max(self._last_keyframe, now)
+        else:
+            self._after_key += size
         self._encoded.append((time.monotonic_ns() - captured) / 1e6)
-        return Gst.FlowReturn.OK
 
     def _listen(self):
         while self._running:
@@ -975,8 +1027,9 @@ class AppStreamer:
                 left_out, self.skipped = self.skipped, collections.Counter()
                 skipped = sum(left_out.values())
                 budget = self.channel.budget_kbps() if hasattr(self.channel, "budget_kbps") else None
-                others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
+                others = self._others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
                 keyframes, self._keyframes = self._keyframes, 0
+                asks_held, self._asks_held = self._asks_held, 0
                 with self._rate_lock:
                     if budget:
                         self.allowance.follow(RateControl.allowed(budget, others))  # the others' share moves
@@ -988,7 +1041,7 @@ class AppStreamer:
                                "whole_to_decoded": [v / 10 for v in ms[3:]],
                                "capture_to_sent": encoded[len(encoded) // 2] if encoded else None,
                                "skipped": skipped, "left_out": dict(left_out), "kbps": self.rate.kbps,
-                               "keyframes": keyframes})
+                               "keyframes": keyframes, "asks_held": asks_held})
 
     def visible(self, shown):
         """The app shows the desktop, or not: nothing is captured or encoded
@@ -1031,7 +1084,13 @@ class AppStreamer:
         # own time on the way (a keyframe is up to VBV_FRAMES frames' worth).
         # The app asks at each frame it cannot decode; each answered was one
         # more keyframe into the queue the first one waits in (seen on a slow
-        # home Wi-Fi: lost, asked, more lost, asked again every second).
+        # home Wi-Fi: lost, asked, more lost, asked again every second). Nor
+        # while the last one, whatever made it, still waits to go out (a
+        # bitrate change's, say: tonight's live test asked within 3 s of a
+        # cut 67 times of 73); the app asks again if it still needs one.
+        if self._key_flying:
+            self._asks_held += 1
+            return
         now = time.monotonic()
         rtt = self.channel.rtt() if hasattr(self.channel, "rtt") else None
         gap = max(MIN_KEYFRAME_GAP, 1.5 * rtt + media.VBV_FRAMES / self.fps) if rtt else MIN_KEYFRAME_GAP
@@ -1054,7 +1113,8 @@ def describe(stats):
             f"{sent if sent is None else round(sent, 1)} ms, first packet to decoded {stats['whole_to_decoded'][0]:.1f} ms"
             + (f"; {stats['skipped']} not encoded ({_left_out(stats)})" if stats.get("skipped") else "")
             + (f"; {stats['kbps']} kbit/s" if "kbps" in stats else "")
-            + (f"; {stats['keyframes']} keyframe{'s' if stats['keyframes'] > 1 else ''}" if stats.get("keyframes") else ""))
+            + (f"; {stats['keyframes']} keyframe{'s' if stats['keyframes'] > 1 else ''}" if stats.get("keyframes") else "")
+            + (f"; {stats['asks_held']} asked while one was on its way" if stats.get("asks_held") else ""))
 
 
 class AppDisplay:
