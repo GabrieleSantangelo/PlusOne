@@ -41,16 +41,10 @@ const MAX_SEALED: usize = crate::session::MAX_DATAGRAM + crate::seal::OVERHEAD;
 /// its newest (a group not among them is long late): more than may be open
 /// at once (MAX_STREAMS), and those waiting for their turn.
 const HISTORY: usize = 2 * MAX_STREAMS as usize;
-/// Groups count as going this long after their last message: quinn's send
-/// window keeps room for them meanwhile (quic.rs send_window).
-const GOING: Duration = Duration::from_millis(500);
 /// The session's stream lets a group's message waiting for room in quinn's
 /// send window go first, this long at most (quic.rs bridge): the window is
-/// one for all streams, and the bulk, handed a little over its share, keeps
-/// it full.
+/// one for all streams (quic.rs send_window leaves the groups theirs).
 pub(crate) const YIELD: Duration = Duration::from_millis(20);
-/// How often the writer has quinn's send window follow the rate.
-const WINDOW_EVERY: Duration = Duration::from_millis(10);
 
 /// A QUIC connection's groups so far (each connection has its own).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,9 +129,13 @@ pub(crate) struct Shared {
     /// newest last; told as a group begins.
     begun: Mutex<HashMap<u16, VecDeque<Begun>>>,
     began: Notify,
-    /// When a group's message was last written (µs since EPOCH; 0: never).
-    written_us: AtomicU64,
-    /// Bytes handed over and not written yet.
+    /// Bytes written on group streams not all acknowledged yet nor reset
+    /// (a stream's count until it is): quinn's send window holds them on
+    /// top of the session stream's share (quic.rs send_window), so a
+    /// group's message never waits for room the bulk took.
+    unacked: AtomicU64,
+    /// Bytes handed over, and not written yet.
+    handed: AtomicU64,
     queued: AtomicU64,
     groups: AtomicU64,
     late: AtomicU64,
@@ -149,16 +147,15 @@ pub(crate) struct Shared {
     stream_bytes: AtomicU64,
 }
 
-fn now_us() -> u64 {
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
-}
-
 impl Shared {
-    /// Groups went within GOING.
-    pub(crate) fn going(&self) -> bool {
-        let last = self.written_us.load(Ordering::Relaxed);
-        last != 0 && now_us().saturating_sub(last) < GOING.as_micros() as u64
+    /// Bytes on group streams not all acknowledged yet (unacked).
+    pub(crate) fn unacked(&self) -> u64 {
+        self.unacked.load(Ordering::Relaxed)
+    }
+
+    /// Bytes handed over to groups so far.
+    pub(crate) fn handed(&self) -> u64 {
+        self.handed.load(Ordering::Relaxed)
     }
 
     fn wait(&self, on: bool) {
@@ -265,6 +262,7 @@ impl Groups {
         framed.extend_from_slice(sealed);
         let length = framed.len() as u64;
         self.shared.queued.fetch_add(length, Ordering::Relaxed);
+        self.shared.handed.fetch_add(length, Ordering::Relaxed);
         if writer.try_send(Piece { channel, group, last, key, framed: framed.into() }).is_err() {
             self.shared.queued.fetch_sub(length, Ordering::Relaxed);
             self.shared.dropped.fetch_add(1, Ordering::Relaxed);
@@ -285,6 +283,8 @@ struct Writing {
     /// Its stream; None once finished or over, or if it never began (its
     /// messages that still come are dropped).
     stream: Option<SendStream>,
+    /// Bytes written on it (counted in Shared::unacked until it is all
+    /// acknowledged or reset).
     bytes: u64,
 }
 
@@ -300,20 +300,28 @@ impl Writing {
             if let Err(why) = until_over(&shared, channel, group, acknowledged).await {
                 shared.over(why, Some(&mut stream), bytes);
             }
+            shared.unacked.fetch_sub(bytes, Ordering::Relaxed);
         });
+    }
+
+    /// Over before its last message: its stream reset (counted), its bytes
+    /// no longer held.
+    fn over(&mut self, why: Over, shared: &Shared) {
+        if let Some(mut stream) = self.stream.take() {
+            shared.over(why, Some(&mut stream), self.bytes);
+            shared.unacked.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
     }
 }
 
 /// The writer of a connection's groups (on its runtime), until the
 /// connection's Groups is gone: each message to its group's stream, a
 /// stream opened for each new group (the one before finished). rate: the
-/// controller's; realtime: bytes of realtime sent, which the session's
-/// stream leaves room for (quic.rs bridge).
+/// controller's (quinn's send window follows it).
 pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, shared: Arc<Shared>,
-                          rate: Arc<AtomicU64>, realtime: Arc<AtomicU64>) {
+                          rate: Arc<AtomicU64>) {
     let mut writing: HashMap<u16, Writing> = HashMap::new();
     let mut opened = 0u32;
-    let mut windowed: Option<Instant> = None;
     while let Some(piece) = pieces.recv().await {
         let (channel, group) = (piece.channel, piece.group);
         let length = piece.framed.len() as u64;
@@ -363,28 +371,24 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
             Some(until) if until <= Instant::now() => Err(Over::Late),
             _ => Ok(()),
         });
-        if let (Err(why), Some(stream)) = (over, w.stream.as_mut()) {
-            shared.over(why, Some(stream), w.bytes);
-            w.stream = None;
+        if let Err(why) = over {
+            w.over(why, &shared);
         }
         let Some(stream) = w.stream.as_mut() else {
             shared.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        shared.written_us.store(now_us(), Ordering::Relaxed);
-        if windowed.is_none_or(|at| at.elapsed() >= WINDOW_EVERY) {
-            conn.set_send_window(crate::quic::send_window(rate.load(Ordering::Relaxed), conn.rtt(), true));
-            windowed = Some(Instant::now());
-        }
+        // Room for it in quinn's send window, on top of the session
+        // stream's share.
+        w.bytes += length;
+        let unacked = shared.unacked.fetch_add(length, Ordering::Relaxed) + length;
+        conn.set_send_window(crate::quic::send_window(rate.load(Ordering::Relaxed), conn.rtt(), unacked));
         if let Err(why) = write_all(stream, &piece.framed, channel, group, &shared).await {
-            shared.over(why, w.stream.as_mut(), w.bytes);
-            w.stream = None;
+            w.over(why, &shared);
             shared.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        w.bytes += length;
         shared.stream_bytes.fetch_add(length, Ordering::Relaxed);
-        realtime.fetch_add(length, Ordering::Relaxed);
         if piece.last {
             w.finish(channel, &shared);
         }

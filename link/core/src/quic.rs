@@ -125,12 +125,12 @@ pub struct Quic {
     peer_groups: bool,
 }
 
-/// quinn's send window, all streams': the rate's worth of a round trip and
-/// AHEAD (the bulk ahead of the rate: bridge), and LATE's worth more while
-/// groups go (a group waits for room no longer than that: groups.rs).
-pub(crate) fn send_window(rate: u64, rtt: Duration, groups: bool) -> u64 {
-    let ahead = rtt + AHEAD + if groups { LATE } else { Duration::ZERO };
-    ((rate as f64 * ahead.as_secs_f64()) as u64).max(2 * BRIDGE_CHUNK as u64)
+/// quinn's send window, all streams': the session stream's share, the
+/// rate's worth of a round trip and AHEAD (the bulk ahead of the rate:
+/// bridge), and the groups' bytes not all acknowledged yet (groups: they
+/// never wait for room the bulk took; their own deadlines bound them).
+pub(crate) fn send_window(rate: u64, rtt: Duration, groups: u64) -> u64 {
+    ((rate as f64 * (rtt + AHEAD).as_secs_f64()) as u64).max(2 * BRIDGE_CHUNK as u64) + groups
 }
 
 impl Quic {
@@ -168,10 +168,12 @@ impl Quic {
 
     /// A sealed message of channel's group (key: a key group; last: the
     /// group's last) to the group's stream (groups.rs): false if dropped.
+    /// (Counted as realtime once handed over: the bulk leaves room for what
+    /// the groups want, not only for what they could write.)
     pub(crate) fn send_in_group(&self, channel: u16, group: u32, key: bool, last: bool, sealed: &[u8]) -> bool {
+        self.realtime.fetch_add((sealed.len() + 2) as u64, Ordering::Relaxed);
         self.groups.send(channel, group, key, last, sealed, |pieces| {
-            let writing = groups::write(self.conn.clone(), pieces, self.groups.shared.clone(), self.cc.rate.clone(),
-                                        self.realtime.clone());
+            let writing = groups::write(self.conn.clone(), pieces, self.groups.shared.clone(), self.cc.rate.clone());
             runtime().spawn(writing);
         })
     }
@@ -179,7 +181,7 @@ impl Quic {
     /// The groups so far, and the controller's losses and cuts.
     pub(crate) fn group_stats(&self) -> groups::Stats {
         let mut stats = self.groups.shared.stats();
-        stats.datagram_bytes = self.realtime.load(Ordering::Relaxed).saturating_sub(stats.stream_bytes);
+        stats.datagram_bytes = self.realtime.load(Ordering::Relaxed).saturating_sub(self.groups.shared.handed());
         stats.lost_bytes = self.cc.losses.lost.load(Ordering::Relaxed);
         stats.lost_after_cut = self.cc.losses.after_cut.load(Ordering::Relaxed);
         stats.cuts = self.cc.losses.cuts.load(Ordering::Relaxed);
@@ -422,7 +424,7 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
                     loop {
                         let now = tokio::time::Instant::now();
                         if now.duration_since(windowed) >= WINDOW_EVERY {
-                            conn.set_send_window(send_window(rate.load(Ordering::Relaxed), conn.rtt(), groups.going()));
+                            conn.set_send_window(send_window(rate.load(Ordering::Relaxed), conn.rtt(), groups.unacked()));
                             windowed = now;
                         }
                         let elapsed = now.duration_since(refilled).as_secs_f64();
@@ -634,6 +636,12 @@ mod tests {
         assert_eq!((stats.groups, stats.late, stats.dropped, stats.stream_bytes), (1, 0, 0, 200 * 1006));
         assert_eq!(quic.conn.stats().frame_tx.datagram, 0, "a group's message as a datagram");
         assert_eq!(quic.queued(), 0);
+        // All acknowledged: no room held for it in quinn's send window.
+        let started = Instant::now();
+        while quic.groups.shared.unacked() > 0 {
+            assert!(started.elapsed() < Duration::from_secs(3), "{} bytes held", quic.groups.shared.unacked());
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The other side takes no group streams for a while (all MAX_STREAMS
@@ -645,6 +653,12 @@ mod tests {
         quic.set_groups(true);
         for group in 0..groups::MAX_STREAMS {
             assert!(quic.send_in_group(5, group, false, true, &group.to_be_bytes()));
+        }
+        // All of them on their streams (a loaded machine is slow to).
+        let started = Instant::now();
+        while quic.group_stats().groups < groups::MAX_STREAMS as u64 || quic.queued() > 0 {
+            assert!(started.elapsed() < Duration::from_secs(5), "{}", quic.group_stats());
+            std::thread::sleep(Duration::from_millis(10));
         }
         let held = groups::MAX_STREAMS;
         assert!(quic.send_in_group(5, held, false, true, b"held up"));
