@@ -34,6 +34,7 @@ object LinkStatus {
     fun current(device: String? = null): Pc? = device?.let { pcs[it] } ?: pcs.values.firstOrNull()
 
     /** From the core's events thread. */
+    @Synchronized
     fun event(event: JSONObject) {
         val id = event.optString("device").ifEmpty { return }
         val before = pcs[id]
@@ -48,6 +49,16 @@ object LinkStatus {
         }
         pcs = pcs.toMutableMap().apply { if (now == null) remove(id) else put(id, now) }
         if (before != now) main.post { for (listener in listeners) listener(before, now) }
+    }
+
+    /** The core stopped (the service did): no PC has a session with it, and
+     * none is shown with one, whatever its events said last (it says no
+     * more once closed). */
+    @Synchronized
+    fun clear() {
+        val before = pcs.values.toList()
+        pcs = emptyMap()
+        if (before.isNotEmpty()) main.post { for (pc in before) for (listener in listeners) listener(pc, null) }
     }
 
     fun icon(path: String?): Int = when (path) {

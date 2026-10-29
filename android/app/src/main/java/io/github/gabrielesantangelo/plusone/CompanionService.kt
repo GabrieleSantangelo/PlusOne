@@ -183,6 +183,8 @@ class CompanionService : Service(), LinkServer.Host {
         linkAnnouncer?.stop()
         bluetooth?.stop()
         link?.close()
+        // Its PCs with it: the main screen says "Connected" by them.
+        io.github.gabrielesantangelo.plusone.link.LinkStatus.clear()
         super.onDestroy()
     }
 

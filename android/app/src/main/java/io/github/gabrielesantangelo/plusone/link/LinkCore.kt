@@ -112,13 +112,14 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
                 }, "link-${channel.feature}").start()
             } else {
                 Log.i(TAG, "link: ${event.optString("event")} ${event.optString("name", event.optString("device").take(8))}")
-                onEvent?.invoke(event)
+                synchronized(this) { if (!stopped) onEvent?.invoke(event) }
             }
         }
     }
 
+    /** Its sessions end; no event is given to onEvent once this returns. */
     override fun close() {
-        stopped = true
+        synchronized(this) { stopped = true }
         nativeStop(handle)
     }
 

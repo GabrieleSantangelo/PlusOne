@@ -284,6 +284,10 @@
   asked for them over the new link (every 10 s while it played) left a
   socket open in the app, for as long as it ran; a channel the PC opens
   for a session that does not take it now closes with that session.
+- Fixed: once Plus One stopped on the tablet (not always ready, and
+  nothing used for a while), its main screen still said it was connected
+  to the PC it had a session with over the new link, by the path it had;
+  it says it is not now.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.
