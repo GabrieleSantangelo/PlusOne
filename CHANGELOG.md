@@ -161,6 +161,8 @@
   link, closed the tablet's app; only its channel closes now.
 - Fixed: the tablet's keystore failing to sign a connection closed the
   app; only that connection fails now.
+- Fixed: at the app's very first start, two of its parts asking for the
+  tablet's key at once could each make one; it is made once.
 
 ## 0.10.0
 

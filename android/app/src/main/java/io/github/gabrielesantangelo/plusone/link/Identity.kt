@@ -34,8 +34,10 @@ object Identity {
             return keyStore.getKey(ALIAS, null) as java.security.PrivateKey
         }
 
+    /** Made at the first start, once: threads asking at the same time get
+     * the same key, not one each. */
     val certificate: X509Certificate
-        get() {
+        @Synchronized get() {
             if (!keyStore.containsAlias(ALIAS)) create()
             return keyStore.getCertificate(ALIAS) as X509Certificate
         }
