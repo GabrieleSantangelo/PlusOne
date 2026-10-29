@@ -64,6 +64,7 @@ class ApHandler(private val service: CompanionService) : Handler {
             link.refuse("not allowed")
             return false
         }
+        val session = Any()
         var bound = false
         try {
             val network = try { joined.get(JOIN + 2_000, TimeUnit.MILLISECONDS) } catch (e: Exception) { null }
@@ -74,7 +75,9 @@ class ApHandler(private val service: CompanionService) : Handler {
             // Its own Wi-Fi left, the PC's network is the only one, but not
             // the default: what the app opens goes there (the link's UDP
             // socket among it, else realtime fell back on its TCP).
-            if (!alongside) bound = connectivity.bindProcessToNetwork(network)
+            // The binding this session's from now on: the one before, ending,
+            // leaves it be.
+            if (!alongside) bound = process.take(session) { connectivity.bindProcessToNetwork(network) }
             val address = connectivity.getLinkProperties(network)?.linkAddresses
                 ?.map { it.address }?.firstOrNull { it is Inet4Address }?.hostAddress
             Log.i(CompanionService.TAG, "ap: on $ssid, at $address${if (alongside) "" else ", its own Wi-Fi left"}")
@@ -83,13 +86,16 @@ class ApHandler(private val service: CompanionService) : Handler {
             link.send(JSONObject().put("type", "ap-up").put("address", address.orEmpty()))
             link.hold()
         } finally {
-            if (bound) connectivity.bindProcessToNetwork(null)
+            if (bound) process.letGo(session) { connectivity.bindProcessToNetwork(null) }
             connectivity.unregisterNetworkCallback(callback)
         }
         return false
     }
 
     companion object {
+        /** The network the process is bound to: one at a time, whichever
+         * session bound it; unbound as it ends. */
+        private val process = Newest()
         const val JOIN = 85_000L  // ms: Android's question to the user, the first time, included
     }
 }

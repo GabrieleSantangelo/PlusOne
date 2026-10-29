@@ -42,12 +42,15 @@ class P2pHandler(private val service: CompanionService) : Handler {
             return false
         }
         val channel = manager.initialize(service, Looper.getMainLooper(), null)
+        val session = Any()
         try {
             val own = CompletableFuture<WifiP2pDevice?>()
             manager.requestDeviceInfo(channel) { own.complete(it) }
             val me = own.get(WAIT, TimeUnit.MILLISECONDS)
             // A group or a connection of before (another session's): gone, so
-            // this one starts clean (else Android answers "busy").
+            // this one starts clean (else Android answers "busy"). This
+            // session's from now on: the one before, ending, leaves it be.
+            wifiDirect.take(session)
             done { manager.cancelConnect(channel, it) }
             done { manager.removeGroup(channel, it) }
             done { manager.discoverPeers(channel, it) }
@@ -99,9 +102,11 @@ class P2pHandler(private val service: CompanionService) : Handler {
                 .put("owner", group?.first ?: false))
             link.hold()
         } finally {
-            manager.removeGroup(channel, null)
-            manager.cancelConnect(channel, null)
-            manager.stopPeerDiscovery(channel, null)
+            wifiDirect.letGo(session) {
+                manager.removeGroup(channel, null)
+                manager.cancelConnect(channel, null)
+                manager.stopPeerDiscovery(channel, null)
+            }
             channel.close()
         }
         return false
@@ -159,6 +164,9 @@ class P2pHandler(private val service: CompanionService) : Handler {
     }
 
     companion object {
+        /** The tablet's group (and connecting, looking for peers): one at a
+         * time, whichever session made it; removed as it ends. */
+        private val wifiDirect = Newest()
         const val WAIT = 5_000L   // ms for the system to answer
         const val FIND = 20_000L  // ms to see the PC
         const val GROUP = 60_000L // ms for the group to be up (the PC's NetworkManager tries for 55 s)

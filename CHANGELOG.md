@@ -288,6 +288,10 @@
   nothing used for a while), its main screen still said it was connected
   to the PC it had a session with over the new link, by the path it had;
   it says it is not now.
+- Fixed: when the PC asked for the Wi-Fi Direct path again, or for its
+  own access point's, while the last one was still ending, the last one
+  ending removed the new group, or took the tablet's app off the new
+  network; it lets go only of what is still its own now.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.
