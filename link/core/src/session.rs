@@ -833,16 +833,23 @@ impl Session {
         let (answer, answered) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, answer);
         self.send_message(json!({"t": "open", "id": id, "feature": feature, "channel": name, "class": class.name()}));
-        let result = answered.recv_timeout(OPEN_WAIT).unwrap_or_else(|_| Err("no answer".into()));
+        let result = answered.recv_timeout(OPEN_WAIT);
         self.pending.lock().unwrap().remove(&id);
         match result {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 self.pump(end);
                 Ok(Channel { fd: theirs, id, class, feature: feature.into(), name: name.into() })
             }
-            Err(e) => {
-                self.channels.lock().unwrap().remove(&id);
+            // Refused (or the session over): the other side has none.
+            Ok(Err(e)) => {
+                self.close_channel(id, false);
                 Err(format!("{feature}/{name}: {e}"))
+            }
+            // No answer (the path lost meanwhile, say): the open may still
+            // reach the other side, and the close goes after it.
+            Err(_) => {
+                self.close_channel(id, true);
+                Err(format!("{feature}/{name}: no answer"))
             }
         }
     }

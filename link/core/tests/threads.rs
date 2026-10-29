@@ -95,3 +95,27 @@ fn a_session_over_leaves_no_thread_or_socket_behind() {
     pc.close();
     tablet.close();
 }
+
+#[test]
+fn an_open_refused_leaves_no_thread_or_socket_behind() {
+    // Each control channel refused (or unanswered) kept its inbox's thread
+    // and its socket, as long as the session lasted.
+    let _one = one_at_a_time();
+    let (pc, tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    // Every thread of the session's up first, on both sides (UDP too).
+    let started = Instant::now();
+    while session.rtt().is_none() || tablet.sessions().first().and_then(|s| s.rtt()).is_none() {
+        assert!(started.elapsed() < Duration::from_secs(5), "UDP never proven");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let before = (threads("link-").len(), descriptors());
+    for _ in 0..20 {
+        assert!(session.open("not served", "x", Class::Control).is_err());
+    }
+    let after = back_to(before);
+    assert!(after.0 <= before.0 && after.1 <= before.1,
+            "the link's threads and the descriptors: {before:?} before 20 opens refused, {after:?} after them");
+    pc.close();
+    tablet.close();
+}

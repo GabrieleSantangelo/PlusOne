@@ -52,7 +52,10 @@
 - **Nothing left behind by a session's channels**: each control channel
   still open as a session ended (a PDF on its way, the desktop's) kept a
   thread and a socket in plus-one-link and in the tablet's app, for as
-  long as they ran; they go with the session now.
+  long as they ran, and so did each one refused for as long as the
+  session lasted; they go with the session or the refusal now. And a
+  channel the PC gave up opening while the network was away no longer
+  opens on the tablet once it is back, with no one on the PC's side.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

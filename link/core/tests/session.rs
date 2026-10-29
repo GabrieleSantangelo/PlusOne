@@ -916,6 +916,61 @@ fn a_channel_opens_ahead_of_a_transfer_on_a_slow_path() {
     let _ = draining.join();
 }
 
+/// A TCP proxy to address (its own address), and what cuts it: both of its
+/// connections shut down, as when the network is lost.
+fn proxy(address: SocketAddr) -> (SocketAddr, impl FnOnce()) {
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let via = listener.local_addr().unwrap();
+    let joined = std::thread::spawn(move || {
+        let (near, _) = listener.accept().unwrap();
+        let far = TcpStream::connect(address).unwrap();
+        for (mut from, mut to) in [(near.try_clone().unwrap(), far.try_clone().unwrap()),
+                                   (far.try_clone().unwrap(), near.try_clone().unwrap())] {
+            std::thread::spawn(move || std::io::copy(&mut from, &mut to));
+        }
+        (near, far)
+    });
+    let cut = move || {
+        let (near, far) = joined.join().unwrap();
+        let _ = near.shutdown(Shutdown::Both);
+        let _ = far.shutdown(Shutdown::Both);
+    };
+    (via, cut)
+}
+
+#[test]
+fn an_open_given_up_while_away_is_closed_on_the_other_side_too() {
+    // The path lost, an open goes unanswered and the PC gives it up; it
+    // went once the path came back, and the tablet took it: the channel is
+    // closed there too (it was left open, with no one on the PC's side, as
+    // long as the session lasted).
+    let (pc, tablet, address) = pair();
+    let (told, heard) = mpsc::channel();
+    tablet.serve("late", 1, move |incoming| {
+        let _ = told.send("opened");
+        let mut buf = [0u8; 64];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+        }
+        let _ = told.send("closed");
+    });
+    let (via, cut) = proxy(address);
+    let session = pc.connect(via, Duration::from_secs(2)).unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|s| s.path().is_some()));
+    cut();
+    until("the path lost", || session.path().is_none());
+    assert!(session.open("late", "x", Class::Control).err().unwrap().contains("no answer"));
+    let again = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
+    assert_eq!(heard.recv_timeout(Duration::from_secs(5)), Ok("opened"));
+    assert_eq!(heard.recv_timeout(Duration::from_secs(5)), Ok("closed"), "the tablet's channel left open");
+    until("no channel on the tablet", || tablet.sessions().first().is_some_and(|s| s.channels() == 0));
+    assert_eq!(session.channels(), 0);
+}
+
 #[test]
 fn the_sixty_fifth_channel_is_refused() {
     let (pc, _tablet, address) = pair();
