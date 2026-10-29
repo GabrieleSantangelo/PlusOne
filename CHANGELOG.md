@@ -2,6 +2,12 @@
 
 ## Unreleased (1.0)
 
+- **No more black minute after a burst of losses**: on a Wi-Fi whose
+  queue overflowed, the link's QUIC read the lost packets as a path that
+  carries smaller ones, and for a minute no packet of the desktop fitted:
+  none went, the picture stood still. A local network carries 1500-byte
+  packets; the link keeps them so, and where they do not pass it stays on
+  TCP.
 - **Low latency Wi-Fi**: Ubuntu keeps the Wi-Fi's power saving on, and
   the radio sleeping between beacons delayed every packet to and from the
   tablet by 15-30 ms. At the first start Plus One says so and offers to

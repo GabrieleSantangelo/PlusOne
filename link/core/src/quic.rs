@@ -25,8 +25,13 @@ use tokio::io::AsyncWriteExt;
 
 /// ALPN: no other QUIC service taken for ours, nor ours for one.
 const ALPN: &[u8] = b"plus-one-link/1";
-/// The MTU from the first packet: a local network's 1500 less IP and UDP
-/// (quinn lowers it where packets that big are lost).
+/// The MTU from the first packet on, and never less: a local network's
+/// 1500 less IPv6 and UDP. quinn's black hole detection took a full
+/// queue's lost tails for a smaller path and went down to 1200 for a
+/// minute, where no realtime datagram of MAX_DATAGRAM fitted: all dropped,
+/// the video's whole frames 0 % on an emulated ADSL. A path that does not
+/// carry it fails the handshake (its Initials are this big), and the
+/// session stays on TCP.
 const LOCAL_MTU: u16 = 1452;
 /// Realtime that would wait longer than this for the window: dropped.
 const LATE: Duration = Duration::from_millis(100);
@@ -73,6 +78,7 @@ fn transport(rate: Arc<AtomicU64>) -> TransportConfig {
     t.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("a timeout")));
     t.keep_alive_interval(Some(Duration::from_secs(2)));
     t.initial_mtu(LOCAL_MTU);
+    t.min_mtu(LOCAL_MTU);
     t.stream_receive_window((8u32 << 20).into());
     t.receive_window((16u32 << 20).into());
     t.send_window(SEND_WINDOW);

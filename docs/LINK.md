@@ -238,7 +238,7 @@ on all of them).
 | Queue standing | past 20 ms (least round trip of 500 ms over the least of 10 s): cut; only with packets in 6 of its 10 buckets of 50 ms | the design's emergency cut (architecture §3.11); the windows chosen; idle, a Wi-Fi asleep lengthened the keepalives' round trips: 17 cuts to the least |
 | Window | rate × (round trip + 5 ms), 4 packets at least | chosen; QUIC's least is 2 (RFC 9002) |
 | Start | 10 Mbit/s, doubling a round trip until the first overuse | chosen |
-| MTU on a local network | 1452 bytes | derived: 1500 less IP and UDP |
+| MTU on a local network | 1452 bytes, from the first packet, never less | derived: 1500 less IPv6 and UDP; never less measured: quinn's black hole detection read a full queue's losses as a smaller path, 1200 bytes for a minute, and every full realtime datagram was dropped (video 0 % whole on an emulated ADSL) |
 | Realtime late (`quic.rs` `LATE`) | 100 ms | chosen; to be each channel's own deadline |
 | Bulk handed ahead of the rate | 30 ms (32 KiB at least) | chosen; as `TCP_NOTSENT_LOWAT` on TCP |
 | Bulk's share | 1.25 × rate − 1.2 × realtime's | chosen |
