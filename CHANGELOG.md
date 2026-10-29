@@ -138,6 +138,14 @@
   signed on the tablet, or with the cable plugged in and nothing in use,
   that moment went by unnoticed, and the update waited for the desktop
   or the speakers; it no longer does.
+- **The speakers sound right over Bluetooth**: with the tablet reached by
+  Bluetooth alone, the link told Plus One nothing of how much it carries,
+  and the PC's sound went as it is, 1.7 Mbit/s, on a link that carries
+  about 1: much of it was dropped on the way. The link now says what
+  Bluetooth carries (0.9 Mbit/s until measured), and the sound goes in
+  Opus on it at once, as on a weak Wi-Fi. The desktop, if it is shown
+  over Bluetooth, goes down to its least bitrate within a second, not
+  by the frames it loses.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

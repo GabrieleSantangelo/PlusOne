@@ -14,7 +14,8 @@
 //!                                QUIC one), transport ("quic", "tcp",
 //!                                "stream": a cable's, Bluetooth's; null
 //!                                with no path), rate_kbps (its
-//!                                controller's), dropped, paths (each:
+//!                                controller's, or what Bluetooth's stream
+//!                                drains), dropped, paths (each:
 //!                                id, kind, transport, state "active",
 //!                                "suspect" or "failed", rtt_ms,
 //!                                silent_ms, budget_bps, budget_from)
@@ -50,8 +51,9 @@
 //!                                {"event": "budget", "device", "kbps"}: what
 //!                                its path's congestion controller allows,
 //!                                as it moves (past 10 %, a cut at once:
-//!                                architecture §3.11), null on a path with
-//!                                none of its own (TCP, a cable); and
+//!                                architecture §3.11; on Bluetooth what its
+//!                                stream drains), null on a path with none
+//!                                of its own (TCP, a cable); and
 //!                                {"event": "path", "device", ...} as a
 //!                                path's state changes (as devices' paths)
 //! A connection that served or watched carries only events after that.
@@ -380,19 +382,21 @@ impl Daemon {
     }
 
     fn event(self: &Arc<Self>, event: Event) {
-        // On a path with no controller of its own: no budget (the apps
-        // follow their own way); on QUIC its controller tells it soon.
-        let no_budget = |session: &plusone_link::Session| {
-            (!session.by_quic()).then(|| json!({"event": "budget", "device": session.peer, "kbps": null}))
+        // Not on QUIC, whose controller tells it soon: the path's budget
+        // now (Bluetooth's: what its stream drains, its prior until
+        // measured), or none (TCP, a cable: the apps follow their own way).
+        let budget = |session: &plusone_link::Session| {
+            (!session.by_quic()).then(|| json!({"event": "budget", "device": session.peer,
+                                               "kbps": session.rate().map(|rate| rate * 8 / 1000)}))
         };
         let (message, also) = match event {
             Event::Up(session) => (json!({"event": "up", "device": session.peer, "name": session.name,
                                           "features": session.features(), "path": session.path(),
                                           "transport": session.transport()}),
-                                   no_budget(&session)),
+                                   budget(&session)),
             Event::Moved(session) => (json!({"event": "moved", "device": session.peer, "path": session.path(),
                                              "transport": session.transport()}),
-                                      no_budget(&session)),
+                                      budget(&session)),
             Event::Budget(session, rate) => {
                 (json!({"event": "budget", "device": session.peer, "kbps": rate * 8 / 1000}), None)
             }
@@ -834,6 +838,26 @@ mod tests {
         assert_eq!(listed.as_array().map(Vec::len), Some(1), "{devices}");
         assert_eq!((&listed[0]["id"], &listed[0]["kind"], &listed[0]["state"]), (&json!(1), &json!("bt"), &json!("active")));
         assert!(listed[0]["silent_ms"].is_u64() && listed[0]["budget_from"].is_string(), "{listed}");
+        daemon.node.close();
+        tablet.close();
+    }
+
+    #[test]
+    fn a_bluetooth_path_has_a_budget() {
+        // What its stream drains, its prior (0.9 Mbit/s) until measured,
+        // not null as on a path with no controller of its own: the
+        // speakers go in Opus on it, not PCM's 1.7 Mbit/s.
+        let (daemon, tablet) = paired_daemon("budget");
+        let (watching, _watched) = app(&daemon);
+        assert_eq!(ask(&watching, json!({"op": "watch"}))["ok"], true);
+        by_bluetooth(&daemon, &tablet);
+        let told = events_until(&watching, &["up", "budget"]);
+        assert_eq!(told["budget"]["kbps"], 900, "{}", told["budget"]);
+        let (app, _served) = app(&daemon);
+        let device = &ask(&app, json!({"op": "devices"}))["devices"][0];
+        assert_eq!(device["rate_kbps"], 900, "{device}");
+        let path = &device["paths"][0];
+        assert_eq!((&path["budget_bps"], &path["budget_from"]), (&json!(900_000), &json!("prior")), "{path}");
         daemon.node.close();
         tablet.close();
     }

@@ -63,8 +63,8 @@ const STANDING_BUCKETS: usize = 6;
 /// The budget told the application (architecture §3.11): when the rate
 /// moved past this share of the last told, going up at most every
 /// PUBLISH_EVERY, going down at once.
-const PUBLISH_CHANGE: f64 = 0.10;
-const PUBLISH_EVERY: Duration = Duration::from_millis(100);
+pub(crate) const PUBLISH_CHANGE: f64 = 0.10;
+pub(crate) const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Default)]
 pub struct GccConfig {

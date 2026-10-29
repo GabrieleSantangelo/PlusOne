@@ -852,6 +852,14 @@ fn a_session_by_quic_alone() {
 /// session on it.
 fn slow_session() -> (Node, Node, Arc<plusone_link::Session>) {
     let (pc, tablet, _address) = pair();
+    let session = bluetooth(&pc, &tablet, 100_000);
+    (pc, tablet, session)
+}
+
+/// A Bluetooth path from pc to tablet, a stream that takes bytes a second
+/// in pieces of about RFCOMM's frames (what goes back as fast as it
+/// comes): the session on it.
+fn bluetooth(pc: &Node, tablet: &Node, bytes: u64) -> Arc<plusone_link::Session> {
     let (cable, far) = std::os::unix::net::UnixStream::pair().unwrap();
     cable.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let (mut reading, mut writing) = (cable.try_clone().unwrap(), cable);
@@ -864,14 +872,57 @@ fn slow_session() -> (Node, Node, Arc<plusone_link::Session>) {
         },
         move |data| {
             use std::io::Write;
-            std::thread::sleep(Duration::from_micros(data.len() as u64 * 10));
+            std::thread::sleep(Duration::from_micros(data.len() as u64 * 1_000_000 / bytes));
             writing.write_all(data)
         },
-        4096).unwrap();
+        1024).unwrap();
     let accepter = tablet.clone();
     std::thread::spawn(move || accepter.accept_stream(Box::new(far), "bt").map(|_| ()));
-    let session = pc.connect_stream(Box::new(pcs_end), "bt").unwrap();
-    (pc, tablet, session)
+    pc.connect_stream(Box::new(pcs_end), "bt").unwrap()
+}
+
+#[test]
+fn a_bluetooth_paths_budget_is_what_its_stream_drains() {
+    // Its prior (0.9 Mbit/s) told as it begins; a transfer filling it, what
+    // it drains told within 2 s, within a quarter: 1 Mbit/s, and 0.4 (under
+    // the prior: never more than the path drains).
+    for rate in [125_000u64, 50_000] {
+        let (pc, tablet, _address) = pair();
+        tablet.serve("sink", 1, |incoming| {
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let (tell, told) = mpsc::channel();
+        pc.on_event(move |event| {
+            if let Event::Budget(_, rate) = event {
+                let _ = tell.send(rate);
+            }
+        });
+        let session = bluetooth(&pc, &tablet, rate);
+        // From the moment it is there (plus-one-link tells it with up).
+        assert_eq!(session.rate(), Some(900_000 / 8));
+        assert_eq!(told.recv_timeout(Duration::from_secs(5)), Ok(900_000 / 8), "its prior, as it began");
+        let sink = session.open("sink", "bulk", Class::Control).unwrap();
+        let begun = Instant::now();
+        let sending = std::thread::spawn(move || {
+            let chunk = vec![7u8; 32 << 10];
+            while begun.elapsed() < Duration::from_secs(3) && sink.send(&chunk).is_ok() {}
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        let path = session.paths().pop().expect("no path");
+        let near = |bytes: u64| bytes * 4 >= rate * 3 && bytes * 4 <= rate * 5;
+        let measured = path.budget_bps.unwrap_or(0) / 8;
+        assert!(path.budget_from == "drain" && near(measured), "{rate} B/s: {path:?}");
+        let last = told.try_iter().last().unwrap_or(900_000 / 8);
+        assert!(near(last), "{rate} B/s: {last} B/s told last");
+        sending.join().unwrap();
+        pc.close();
+        tablet.close();
+    }
 }
 
 #[test]

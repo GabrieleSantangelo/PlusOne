@@ -30,8 +30,9 @@ pub enum Event {
     Detached(Arc<Session>),
     /// On another path now (session.path()).
     Moved(Arc<Session>),
-    /// Its QUIC path's budget moved (architecture §3.11; bytes a second):
-    /// what realtime and bulk may use now.
+    /// Its path's budget moved (architecture §3.11; bytes a second): what
+    /// realtime and bulk may use now, as a QUIC path's controller allows,
+    /// or a Bluetooth path's stream drains (told as it begins too).
     Budget(Arc<Session>, u64),
     /// One of its paths changed state (session::PathState): taken (active,
     /// with Up or Moved), suspect, active again, failed (before Detached,

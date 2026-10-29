@@ -2,6 +2,7 @@
 import json
 import socket
 import struct
+import threading
 import time
 import types
 
@@ -140,5 +141,44 @@ def test_an_app_that_plays_no_opus_gets_the_sound_as_it_is():
         assert watched == [] and sender.codec == "pcm"
         until(lambda: len(sent) >= 10)
         assert {body[0] for body in sent} == {pcm.PCM}
+    finally:
+        sender.close()
+
+
+@pytest.mark.parametrize("asked, told", [(900, None), (None, 900)])
+def test_on_bluetooth_s_budget_the_sound_goes_in_opus(asked, told):
+    # plus-one-link's budget on a Bluetooth path: what its stream drains,
+    # 0.9 Mbit/s until measured, asked as the speakers start (devices) or
+    # told after (an event). It said none (null) before, and the speakers
+    # sent PCM's 1.7 Mbit/s on a link of about 1.
+    channels = pytest.importorskip("plusone.link.channels")
+    device = "6a2665bc" * 8
+    watches = []
+
+    class Link:
+        def devices(self):
+            return [{"id": device, "rate_kbps": asked,
+                     "paths": [{"id": 1, "kind": "bt", "transport": "stream", "state": "active",
+                                "budget_bps": asked and asked * 1000, "budget_from": "prior"}]}]
+
+        def watch(self, on_event):
+            watches.append(on_event)
+            ended = threading.Event()
+            return types.SimpleNamespace(thread=types.SimpleNamespace(join=ended.wait), close=ended.set)
+
+    budget = channels.Budget(Link(), device)
+    sent = []
+    sender = pcm.PcmSender("audiotestsrc wave=sine is-live=true samplesperbuffer=240")
+    sender.channel = types.SimpleNamespace(send=sent.append, budget=budget, receive=lambda timeout: time.sleep(0.05),
+                                           close=budget.close)
+    sender._over_link = True
+    try:
+        sender.answer(json.dumps({"codecs": ["pcm", "opus"]}))
+        if told:
+            assert sender.codec == "pcm"  # none yet: PCM
+            watches[0]({"event": "budget", "device": device, "kbps": told})
+        assert sender.codec == "opus"
+        until(lambda: len(sent) >= 20)
+        assert {body[0] for body in sent[-10:]} == {pcm.OPUS}
     finally:
         sender.close()
