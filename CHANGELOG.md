@@ -295,6 +295,9 @@
 - Fixed: two updates of the tablet's app coming at once (from two PCs,
   say) were written to the same file, each over the other, and one
   ending deleted it under the other; each has a file of its own now.
+- Fixed: a PDF to sign sent again by the PC while the first upload of it
+  was still on its way was written over the first, and the job left in
+  the queue lost its PDF; the second is refused now, the first goes on.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.

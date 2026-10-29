@@ -9,6 +9,7 @@ import org.json.JSONObject
 import java.io.File
 import java.security.DigestOutputStream
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -27,6 +28,8 @@ class SignHandler(private val service: CompanionService) : Handler {
     // An upload's bytes and slot, from before it starts until it is a job.
     private val incoming = AtomicLong()
     private val arriving = AtomicInteger()
+    // The jobs being uploaded, by id: until each is a job, or not.
+    private val uploading = ConcurrentHashMap.newKeySet<String>()
 
     override fun handle(link: Link, request: JSONObject, size: Long): Boolean {
         val job = request.optString("job")
@@ -54,7 +57,25 @@ class SignHandler(private val service: CompanionService) : Handler {
     private fun sign(link: Link, message: JSONObject, size: Long) {
         val job = message.optString("job")
         val file = jobFile(job)
-        require(file != null && size in 1..Wire.MAX_PAYLOAD && job !in Jobs.ids) { "bad job" }
+        require(file != null && size in 1..Wire.MAX_PAYLOAD) { "bad job" }
+        // One upload of an id at a time, and none of one queued (looked at
+        // once this one has it): another would write over its PDF, and
+        // delete it as it failed.
+        require(uploading.add(job)) { "a job of that id already" }
+        try {
+            require(job !in Jobs.ids) { "a job of that id already" }
+            upload(link, message, job, file, size)
+        } finally {
+            uploading.remove(job)
+        }
+        // Opening over whatever is on screen needs "Display over other apps";
+        // without it, the notification (the queue's) is there to tap.
+        if (Settings.canDrawOverlays(service)) service.startActivity(SignActivity.open(service, job))
+        link.send(JSONObject().put("type", "opened").put("job", job))
+    }
+
+    /** job's PDF into file, and the job into the queue (file deleted if not). */
+    private fun upload(link: Link, message: JSONObject, job: String, file: File, size: Long) {
         // Room for it: a PC, even a paired one, does not get to fill the tablet.
         // Taken before the upload, not checked then written: uploads at once
         // count each other too.
@@ -90,10 +111,6 @@ class SignHandler(private val service: CompanionService) : Handler {
             file.delete()  // half a PDF is of no use
             throw e
         }
-        // Opening over whatever is on screen needs "Display over other apps";
-        // without it, the notification (the queue's) is there to tap.
-        if (Settings.canDrawOverlays(service)) service.startActivity(SignActivity.open(service, job))
-        link.send(JSONObject().put("type", "opened").put("job", job))
     }
 
     /** Sends a job's answer (and the saved signatures, if both sides share
