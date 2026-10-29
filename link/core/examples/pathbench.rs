@@ -9,8 +9,11 @@
 //! 5 ms: its gaps) under a transfer, and beside the video; channels opened
 //! while a transfer runs (how long, how many never were). One line a test,
 //! key=value.
+//! With --chain S, only the desktop's chain after a cut, on QUIC (chain()):
+//! S seconds as appdisplay.py ran before l36 (chain_old), S as after
+//! (chain_new), on the same session.
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
-//!             [--quic] [--seconds S] [--video KBPS] [--opens N]
+//!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S]
 
 use plusone_link::session::MAX_DATAGRAM;
 use plusone_link::{Class, Identity, Node, Session};
@@ -227,6 +230,271 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
             (bytes as f64 * 8.0 / 1000.0 / seconds) as u64, mean * 8 / 1000, quantiles(latencies.lock().unwrap().clone()))
 }
 
+/// The desktop's numbers, as plusone/appdisplay.py has them (media.py's,
+/// the preset of 20 Mbit/s at 1920x1200), for chain().
+const FPS: f64 = 60.0;
+const VBV_FRAMES: f64 = 4.0;
+const GOP: u64 = 600;
+const MOST_KBPS: f64 = 20_000.0;
+const MIN_KBPS: f64 = 800.0;
+const SHARE: f64 = 0.85;
+const FITS: f64 = 0.95;
+const UP: f64 = 1.15;
+const STEADY: f64 = 0.05;
+const UP_AFTER: f64 = 2.0;
+const HOLD: f64 = 1.0;
+const QUEUE_MS: f64 = 60.0;
+const MIN_KEYFRAME_GAP: f64 = 0.25;
+const KEY_FLYING_MOST: f64 = 0.5;
+const LATE: f64 = 0.1;
+const LINK_ROOM: f64 = (512 << 10) as f64;
+const TOLD: f64 = 0.9;
+const ALONE: f64 = (8 << 10) as f64;
+const PACKET_EXTRA: f64 = 80.0;
+const ALLOWANCE_FRAMES: f64 = VBV_FRAMES + 1.0;
+/// A frame's packets' count says it is a keyframe (examples/tablet asks as
+/// DisplaySession.kt does once it sees one).
+const KEYFRAME_FLAG: u16 = 0x8000;
+
+/// The budget as plus-one-link tells it (cc.rs PUBLISH_CHANGE): past 10 %
+/// of the last told, down at once, up at most every 100 ms; kbit/s.
+struct Told {
+    kbps: f64,
+    at: f64,
+}
+
+impl Told {
+    fn update(&mut self, rate_kbps: f64, now: f64) -> f64 {
+        if self.kbps <= 0.0
+            || (rate_kbps - self.kbps).abs() > 0.1 * self.kbps && (rate_kbps < self.kbps || now - self.at >= 0.1) {
+            (self.kbps, self.at) = (rate_kbps, now);
+        }
+        self.kbps
+    }
+}
+
+/// RateControl.budget(): the bitrate to change to, if it does; fix: only
+/// after the budget has been under it for HOLD.
+struct Rate {
+    kbps: f64,
+    changed_at: f64,
+    under: Option<f64>,
+}
+
+impl Rate {
+    fn budget(&mut self, budget: f64, now: f64, fix: bool) -> Option<f64> {
+        let target = (budget * SHARE).min(MOST_KBPS).max(MIN_KBPS).floor();
+        let fits = self.kbps <= budget * FITS;
+        if fits {
+            self.under = None;
+        } else if self.under.is_none() {
+            self.under = Some(now);
+        }
+        if target < self.kbps {
+            if fits || (fix && now - self.under.unwrap_or(now) < HOLD) {
+                return None;
+            }
+        } else if target < self.kbps * UP && (target < MOST_KBPS || target < self.kbps * (1.0 + STEADY))
+            || now - self.changed_at < UP_AFTER {
+            return None;
+        }
+        self.under = None;
+        if target == self.kbps {
+            return None;
+        }
+        (self.kbps, self.changed_at) = (target, now);
+        Some(target)
+    }
+}
+
+/// The desktop after a cut, on a picture that always moves (a frame offered
+/// each 1/60 s, its size the bitrate's average, a keyframe VBV_FRAMES of
+/// them), as appdisplay.py runs it: fix false, before l36 (the bitrate
+/// down at once when it no longer fits; each change a keyframe, as on
+/// Intel's encoders; the tablet's asks answered a gap apart; frames left
+/// out past QUEUE_MS of the budget waiting, 64 KB at least; every frame
+/// sent, the link dropping what is late packet by packet); fix true, after
+/// (the bitrate down after HOLD under the budget, frames left out within
+/// it meanwhile; no keyframe while the last still waits to go out; a
+/// keyframe made once all of it fits in what the link holds; a frame that
+/// would not fit whole not sent, nor those after it until a keyframe).
+/// examples/tablet asks for a keyframe as DisplaySession.kt does (a frame
+/// whole while an older one came in part; then at each frame that is not
+/// one, 250 ms apart), and answers each frame whole. What the tablet shows:
+/// a frame whole, and every one since the last keyframe whole too.
+fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
+    let channel = session.open("frames", "chain", Class::Realtime).unwrap();
+    let reader = channel.try_clone().unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let asks = Arc::new(AtomicU64::new(0));
+    let collecting = {
+        let (done, asks) = (done.clone(), asks.clone());
+        std::thread::spawn(move || {
+            let (mut buf, mut whole) = (vec![0u8; 64], HashMap::new());
+            while !done.load(Ordering::SeqCst) {
+                match reader.recv(&mut buf, Some(Duration::from_millis(100))) {
+                    Ok(Some(4)) => {
+                        whole.insert(u32::from_be_bytes(buf[..4].try_into().unwrap()), now_ns());
+                    }
+                    Ok(Some(1)) => {
+                        asks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+            whole
+        })
+    };
+    let payload = MAX_DATAGRAM - 8;
+    let dropped = session.dropped();
+    let start = Instant::now();
+    let at = |instant: Instant| instant.duration_since(start).as_secs_f64();
+    let rate_kbps = || session.rate().map(|r| r as f64 * 8.0 / 1000.0).unwrap_or(0.0);
+    let mut told = Told { kbps: rate_kbps(), at: 0.0 };
+    let mut rate = Rate { kbps: MOST_KBPS, changed_at: f64::NEG_INFINITY, under: None };
+    let mut encoder = MOST_KBPS;
+    let (mut pending, mut key_next, mut since_key) = (None::<f64>, true, 0u64);
+    let (mut wanted, mut broken, mut key_made, mut last_keyframe) = (false, false, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let (mut key_at, mut after_key, mut flying) = (None::<f64>, 0.0f64, false);
+    let (mut level, mut level_at) = (f64::NAN, 0.0f64);
+    let (mut asks_seen, mut answered, mut held, mut changes) = (0u64, 0u64, 0u64, 0u64);
+    let (mut skipped, mut unsent, mut keyframes) = ([0u64; 3], [0u64; 2], 0u64);
+    let mut sent: Vec<(u32, bool, f64, u64)> = Vec::new();  // number, keyframe, when, ns
+    let (mut number, mut frame, mut bytes) = (0u32, 0u64, 0f64);
+    while at(Instant::now()) < seconds {
+        let due = start + Duration::from_secs_f64(frame as f64 / FPS);
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        frame += 1;
+        let now = at(Instant::now());
+        let budget = told.update(rate_kbps(), now);
+        if budget > 0.0 {
+            if let Some(kbps) = rate.budget(budget, now, fix) {
+                if fix {
+                    pending = Some(kbps);
+                } else {
+                    (encoder, key_next, changes) = (kbps, true, changes + 1);
+                }
+            }
+        }
+        // The tablet's asks since the last frame.
+        let gap = session.rtt().map_or(MIN_KEYFRAME_GAP, |rtt| (1.5 * rtt.as_secs_f64() + VBV_FRAMES / FPS).max(MIN_KEYFRAME_GAP));
+        for _ in asks_seen..asks.load(Ordering::Relaxed) {
+            asks_seen += 1;
+            if fix && flying {
+                held += 1;
+            } else if now - last_keyframe >= gap {
+                (last_keyframe, answered) = (now, answered + 1);
+                if fix { wanted = true } else { key_next = true }
+            }
+        }
+        // Into the encoder, or not.
+        let queued = session.queued() as f64;
+        let holds = (budget * 125.0 * LATE).min(LINK_ROOM) * TOLD;
+        let fits = |size: f64, queued: f64| budget <= 0.0 || queued + size <= holds || queued <= ALONE;
+        if fix {
+            flying = key_at.is_some_and(|k| now - k < KEY_FLYING_MOST && queued > after_key);
+            let most = (64.0 * 1024.0f64).max(rate.kbps.min(budget) * QUEUE_MS / 8.0);
+            let most = if budget > 0.0 { most.min(holds - encoder * 125.0 / FPS).max(ALONE) } else { most };
+            if queued > most {
+                skipped[0] += 1;
+                continue;
+            }
+            let allowed = budget * FITS * 125.0;
+            if budget > 0.0 {
+                let depth = allowed * ALLOWANCE_FRAMES / FPS;
+                level = if level.is_nan() { depth } else { (level + allowed * (now - level_at)).min(depth) };
+                level_at = now;
+                if level < 0.0 {
+                    skipped[1] += 1;
+                    continue;
+                }
+            }
+            let key_due = wanted || (broken && now - key_made >= MIN_KEYFRAME_GAP);
+            if key_due || pending.is_some() {
+                let kbps = pending.unwrap_or(encoder);
+                let size = kbps * 125.0 * VBV_FRAMES / FPS * (1.0 + PACKET_EXTRA / payload as f64);
+                if flying || !fits(size, queued) {
+                    if key_due {
+                        skipped[2] += 1;
+                        continue;
+                    }
+                } else {
+                    if let Some(kbps) = pending.take() {
+                        (encoder, key_next, changes) = (kbps, true, changes + 1);
+                    }
+                    if key_due {
+                        (wanted, key_made, key_next) = (false, now, true);
+                    }
+                }
+            }
+        } else if queued > (64.0 * 1024.0f64).max(rate.kbps.min(if budget > 0.0 { budget } else { rate.kbps }) * QUEUE_MS / 8.0) {
+            skipped[0] += 1;
+            continue;
+        }
+        // Encoded at once (measured: each frame out before the next goes in).
+        let keyframe = key_next || since_key + 1 >= GOP;
+        (key_next, since_key) = (false, if keyframe { 0 } else { since_key + 1 });
+        let size = (encoder * 125.0 / FPS * if keyframe { VBV_FRAMES } else { 1.0 }).max(1.0) as usize;
+        let count = size.div_ceil(payload);
+        let wire = size as f64 + count as f64 * PACKET_EXTRA;
+        if fix {
+            if broken && !keyframe {
+                unsent[1] += 1;
+                continue;
+            }
+            if !fits(wire, session.queued() as f64) {
+                unsent[0] += 1;
+                (broken, wanted) = (true, true);
+                continue;
+            }
+        }
+        number += 1;
+        keyframes += keyframe as u64;
+        for index in 0..count {
+            let mut packet = number.to_be_bytes().to_vec();
+            packet.extend_from_slice(&(index as u16).to_be_bytes());
+            packet.extend_from_slice(&(count as u16 | if keyframe { KEYFRAME_FLAG } else { 0 }).to_be_bytes());
+            packet.resize(8 + payload.min(size - index * payload), 0);
+            let _ = channel.send(&packet);
+        }
+        bytes += size as f64;
+        sent.push((number, keyframe, now, now_ns()));
+        if fix {
+            level -= wire;
+            if keyframe {
+                (key_at, after_key, last_keyframe, broken, wanted) = (Some(now), 0.0, last_keyframe.max(now), false, false);
+            } else {
+                after_key += wire;
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    done.store(true, Ordering::SeqCst);
+    let whole = collecting.join().unwrap();
+    // Shown: whole, with every frame since the last keyframe whole.
+    let (mut decodable, mut shown, mut latencies) = (false, vec![0u32; seconds.ceil() as usize + 1], Vec::new());
+    let mut lost = 0;
+    for &(n, keyframe, when, ns) in &sent {
+        match whole.get(&n) {
+            Some(&back) => {
+                decodable |= keyframe;
+                if decodable {
+                    shown[(when as usize).min(shown.len() - 1)] += 1;
+                    latencies.push((back - ns) as f64 / 1e6);
+                }
+            }
+            None => (lost, decodable) = (lost + 1, false),
+        }
+    }
+    let shown_frames: u32 = shown.iter().sum();
+    let frozen = shown[..seconds.floor() as usize].iter().filter(|&&n| n == 0).count();
+    format!("shown={:.1}% frozen={frozen} lost={lost} keyframes={keyframes} asks={asks_seen} answered={answered} \
+             held={held} changes={changes} skipped={} queue={} budget={} forkey={} unsent={} late={} kbps={} {}",
+            100.0 * shown_frames as f64 / frame.max(1) as f64, skipped.iter().sum::<u64>(), skipped[0], skipped[1],
+            skipped[2], unsent.iter().sum::<u64>(), session.dropped() - dropped,
+            (bytes * 8.0 / 1000.0 / seconds) as u64, quantiles(latencies))
+}
+
 /// Until what the last test left on its way is gone (each test measures
 /// itself, not the one before's queue), 30 s at most.
 fn settle(session: &Arc<Session>) {
@@ -248,6 +516,7 @@ fn main() {
     let video_kbps: Option<u64> = value("--video").and_then(|v| v.parse().ok());
     let quic = args.iter().any(|a| a == "--quic");
     let opened: usize = value("--opens").and_then(|n| n.parse().ok()).unwrap_or(20);
+    let chained: Option<f64> = value("--chain").and_then(|s| s.parse().ok());
     let node = Node::new("Bench PC", &identity, Arc::new(move |fp: &str| fp == trusted)).unwrap();
     node.upgrade_to_quic(quic);
     let session = node.connect(tablet, Duration::from_secs(5)).expect("a session");
@@ -259,6 +528,17 @@ fn main() {
         std::thread::sleep(Duration::from_millis(20));
     }
     println!("test=path transport={} path={:?}", if session.by_quic() { "quic" } else { "tcp" }, session.path());
+    if let Some(chained) = chained {
+        // The budget is a QUIC path's controller's: on TCP, nothing to follow.
+        if session.by_quic() {
+            settle(&session);
+            println!("test=chain_old {}", chain(&session, chained, false));
+            settle(&session);
+            println!("test=chain_new {}", chain(&session, chained, true));
+        }
+        println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
+        return;
+    }
     println!("test=rt_idle {}", realtime(&session, seconds));
     settle(&session);
     println!("test=up mbs={:.2}", transfer(&session, "sink", seconds));
