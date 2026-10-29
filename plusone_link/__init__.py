@@ -23,6 +23,7 @@ import os
 import select
 import socket
 import threading
+import traceback
 
 CONTROL, INPUT, REALTIME = "control", "input", "realtime"
 REQUEST = 64 << 10
@@ -142,7 +143,10 @@ class _Events:
                 event, fd = _receive(self.sock)
             except (OSError, ValueError, LinkError):
                 return
-            self._on_event(event, fd)
+            try:
+                self._on_event(event, fd)
+            except Exception:  # noqa: BLE001 - said, and the next events still come
+                traceback.print_exc()
 
     def close(self):
         """No more events (what was served, no longer)."""

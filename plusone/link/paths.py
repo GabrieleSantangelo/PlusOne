@@ -7,6 +7,8 @@ import threading
 
 from gi.repository import GLib
 
+from .. import log
+
 try:
     import plusone_link
 except ImportError:  # a Plus One without the link
@@ -74,6 +76,7 @@ class Paths:
         # While plus-one-link is not there: looked for again now and then
         # (it may start later, socket-activated or by hand).
         while not self._stopped.is_set():
+            link = None
             try:
                 link = plusone_link.Link()
                 self.on_link(link)
@@ -84,11 +87,18 @@ class Paths:
                 link.close()
                 # Until plus-one-link goes (its events' connection ends): no waking meanwhile.
                 self._watcher.thread.join()
-                self._watcher = None
-                for device in list(self._paths):
-                    self._set(device, None, gone=True)
             except (OSError, ValueError, plusone_link.LinkError):
                 pass
+            except Exception as e:  # noqa: BLE001 - looked for again all the same
+                log("link paths:", repr(e))
+            finally:
+                if link is not None:
+                    link.close()
+                if self._watcher is not None:
+                    self._watcher.close()
+                    self._watcher = None
+                for device in list(self._paths):
+                    self._set(device, None, gone=True)
             self._stopped.wait(AGAIN)
 
     def stop(self):

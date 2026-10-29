@@ -276,3 +276,24 @@ def test_events_plus_one_link_does_not_answer_fail_in_time(daemon, monkeypatch):
     monkeypatch.setattr(plusone_link, "ANSWER_WAIT", 0.2)
     error = in_time(lambda: plusone_link._Events("fake", {"op": "watch"}, lambda event, fd: None, "test-watch"), 3)
     assert isinstance(error, OSError) and plusone_link._connect("fake").fileno() == -1
+
+
+def test_an_event_its_handler_fails_on_does_not_end_the_events(daemon, monkeypatch):
+    monkeypatch.setattr(plusone_link, "ANSWER_WAIT", 0.1)
+    daemon.send(b'{"ok": true}')
+    got = []
+
+    def on_event(event, fd):
+        got.append(event["n"])
+        if event["n"] == 1:
+            raise KeyError("a bug")
+    events = plusone_link._Events("fake", {"op": "watch"}, on_event, "test-watch")
+    daemon.send(b'{"n": 1}')
+    time.sleep(0.3)  # longer than its first answer may take: events come whenever they come
+    daemon.send(b'{"n": 2}')
+    for _ in range(100):
+        if len(got) == 2:
+            break
+        time.sleep(0.02)
+    assert got == [1, 2] and events.thread.is_alive()
+    events.close()
