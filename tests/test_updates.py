@@ -149,9 +149,50 @@ def test_by_cable_alone_the_link_says_the_version(monkeypatch):
     app = App(None)
     app.tablets.targets = lambda t: []
     monkeypatch.setattr(updates.channels, "app_version", lambda app_id: code - 1)
-    monkeypatch.setattr(updates.channels, "connected", lambda app_id: True)
     _tablet, sent = run(app)
     assert sent == [([], "00ff", "/nowhere/app.apk", code)]
+
+
+def test_plus_one_link_is_asked_off_the_main_loop(tmp_path, monkeypatch):
+    # Not announced with a version (by cable; or an app whose record is
+    # tagged says none): plus-one-link is asked, and the window and D-Bus
+    # do not wait for its answer.
+    import json
+    import socket
+    import threading
+    import time
+    path = str(tmp_path / "link")
+    monkeypatch.setenv("PLUSONE_LINK_SOCKET", path)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(path)
+    server.listen(4)
+    code, go = updates.version_code(__version__), threading.Event()
+
+    def serve():
+        connection, _ = server.accept()
+        with connection:
+            connection.recv(1 << 16)
+            go.wait(5)  # a plus-one-link slow to answer
+            connection.send(json.dumps({"ok": True, "devices": [
+                {"id": "00ff" + "0" * 60, "connected": True, "features": {"update": code - 1}}]}).encode())
+    threading.Thread(target=serve, daemon=True).start()
+    app = App(None)
+    app.tablets.targets = lambda t: []
+    sent = []
+    tablet = updates.TabletUpdates(app, folder="/nowhere", fetch=lambda version, folder: "/nowhere/app.apk",
+                                   send=lambda targets, app_id, apk, version: sent.append(app_id))
+    started = time.monotonic()
+    tablet.check()
+    assert time.monotonic() - started < 0.5 and tablet.working
+    tablet.check()  # asked once at a time
+    go.set()
+    from gi.repository import GLib
+    deadline = time.monotonic() + 5
+    while not sent and time.monotonic() < deadline:
+        GLib.MainContext.default().iteration(False)
+        time.sleep(0.005)
+    assert sent == ["00ff"]
+    server.close()
 
 
 def test_off_there_is_not_asked_again(monkeypatch):

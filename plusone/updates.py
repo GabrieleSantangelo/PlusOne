@@ -120,26 +120,47 @@ class TabletUpdates:
         self.working = False
 
     def check(self):
-        """On the main loop, whenever the tablet or what is in use changed."""
+        """On the main loop, whenever the tablet or what is in use changed:
+        its app's version where it is announced, else plus-one-link's (its
+        session's: by cable, no address), asked on a thread of its own."""
         if self.working or not self.app.settings.update_tablet or self.app.busy():
             return
         tablet = self.app.tablets.active()
         if tablet is None:
             return
-        # Where it is announced; else over the link (by cable, no address).
-        version = self.app.discovery.app_version(tablet.app_id) or channels.app_version(tablet.app_id)
+        version = self.app.discovery.app_version(tablet.app_id)
+        if version:
+            self._found(tablet, version)
+            return
+        self.working = True
+
+        def ask():
+            found = channels.app_version(tablet.app_id)
+            GLib.idle_add(once(self._asked, tablet, found))
+        threading.Thread(target=ask, name="plusone-updates", daemon=True).start()
+
+    def _asked(self, tablet, version):
+        """plus-one-link's word on the tablet's app: its version while it has
+        a session with it (reached then, by cable too), else None."""
+        self.working = False
+        if (version and self.app.settings.update_tablet and not self.app.busy()
+                and self.app.tablets.active() == tablet):
+            self._found(tablet, version)
+
+    def _found(self, tablet, version):
+        """The tablet's app is at version: brought to this PC's if older (an
+        app announced is reached where it is; one plus-one-link knows of,
+        over its session)."""
         # 0: an app before 0.8, which cannot take one (installed by hand once).
-        if not version or version >= self.code or self.refused.get(tablet.app_id) == version:
+        if version >= self.code or self.refused.get(tablet.app_id) == version:
             return
         tried = self.tried.get(tablet.app_id)
         if tried and tried[0] == version and time.monotonic() - tried[1] < TRY_AGAIN:
             return
-        targets = self.app.tablets.targets(tablet)
-        if not targets and not channels.connected(tablet.app_id):
-            return
         self.tried[tablet.app_id] = (version, time.monotonic())
         self.working = True
-        threading.Thread(target=self._update, args=(tablet, targets, version), daemon=True).start()
+        threading.Thread(target=self._update, args=(tablet, self.app.tablets.targets(tablet), version),
+                         daemon=True).start()
 
     def _update(self, tablet, targets, version):
         try:
