@@ -2,6 +2,11 @@
 
 ## Unreleased (1.0)
 
+- **The tablet's speakers no longer fall silent in the middle of a video**:
+  Chrome makes a new stream after a pause or an ad and closes the old one
+  a moment later, both with the same name. Plus One took the old one going
+  for the new one too, and stopped the speakers while the video played on,
+  until another program made a sound.
 - **A steadier picture on a shared network**: the link judged how much
   goes through on the last fifth of a second, which one big frame of the
   desktop fills; it now takes half a second. With a download beside on

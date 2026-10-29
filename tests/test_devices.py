@@ -1,4 +1,5 @@
 """The tablet's camera and microphone as the PC's: who uses them, and the tablet asked only then."""
+import collections
 import threading
 import time
 import types
@@ -28,6 +29,21 @@ def test_links_from_pw_link():
         ("+", ("plusone_mic:capture_MONO", "Chrome:input_MONO"))
     assert parse("- plusone_mic:capture_MONO -> Chrome:input_MONO")[0] == "-"
     assert parse("garbage") is None
+
+
+def test_two_streams_of_one_program_are_two_links():
+    # Chrome's new stream linked before its old one goes: the same ports' names.
+    links = collections.Counter()
+    chrome = ("Google Chrome:output_FL", devices.SPEAKERS_NAME + ":playback_FL")
+    devices.counted(links, "=", chrome)
+    devices.counted(links, "+", chrome)
+    devices.counted(links, "-", chrome)
+    assert links  # the new one's, still playing
+    devices.counted(links, "-", chrome)
+    devices.counted(links, "-", chrome)  # one never seen made: none, not less
+    assert not links
+    devices.counted(links, "+", chrome)
+    assert links
 
 
 def test_level_meters_do_not_record():

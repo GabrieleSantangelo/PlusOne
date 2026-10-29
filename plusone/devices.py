@@ -7,6 +7,7 @@ then the tablet in use is asked for it, over WebRTC (rtc.py) for the camera
 and the microphone, as plain PCM (pcm.py) for the speakers, and lets go of it
 when the program does.
 """
+import collections
 import ctypes
 import functools
 import importlib.util
@@ -634,7 +635,7 @@ class AudioDevice(Device):
     def __init__(self, app, kind):
         super().__init__(app, kind)
         self.module = None
-        self.links = set()
+        self.links = collections.Counter()  # ours (), by ports: counted()
         self.watch = None
         self.pauses = None  # pactl subscribe, when WATCH_PAUSES
         self._asked = 0  # the last look at who uses it (pw-dump), its number
@@ -756,7 +757,7 @@ class AudioDevice(Device):
         if changed:
             sign, link = changed
             if self.ours(link):
-                (self.links.add if sign in "=+" else self.links.discard)(link)
+                counted(self.links, sign, link)
                 self._look_again()
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line, watch)
 
@@ -777,7 +778,7 @@ class AudioDevice(Device):
             names = self.users_of(pw_objects(out))
         except (GLib.Error, ValueError, TypeError, AttributeError) as e:
             log(f"{self.kind}: who uses it, not known:", repr(e))
-            names = ["?"] * len(self.links)  # as if each were a program's
+            names = ["?"] * sum(self.links.values())  # as if each were a program's
         if asked == (self.watch, self._asked):
             self._users(sorted(set(n for n in names if n != "?")))
             self._used(bool(names))
@@ -990,7 +991,7 @@ def _bluez_call(path, method, uuid):
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         bus.call("org.bluez", path, "org.bluez.Device1", method, GLib.Variant("(s)", (uuid,)), None,
-                 Gio.DBusCallFlags.NONE, 20000, None, lambda b, r: _bluez_done(b, r, method), None)
+                 Gio.DBusCallFlags.NONE, 20000, None, lambda b, r, _data: _bluez_done(b, r, method), None)
     except GLib.Error as e:
         log(f"speakers: Bluetooth {method}: {e.message}")
 
@@ -1097,6 +1098,21 @@ def players(objects):
             props = node.get("props") or {}
             found.append(str(props.get("application.name") or props.get("node.name") or "?"))
     return found
+
+
+def counted(links, sign, link):
+    """A link made ("=", "+") or removed ("-"), counted in links (a
+    Counter, by its ports' names): two streams of one program have ports
+    of the same names (Chrome makes a new one after a pause or an ad, and
+    drops the old one later). In a set the old one's link took the new
+    one's with it: the speakers stopped while the video played on, until
+    another program made a sound."""
+    if sign in "=+":
+        links[link] += 1
+    elif links[link] > 1:
+        links[link] -= 1
+    else:
+        links.pop(link, None)
 
 
 class LinkParser:
