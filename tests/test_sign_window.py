@@ -156,6 +156,24 @@ def test_the_pdf_shown_is_signed_after_the_original_went(window):
     assert results == [str(src).replace(".pdf", "-signed.pdf")]
 
 
+def test_the_overview_is_left_alone_while_no_tile_waits(window, monkeypatch):
+    # The page drawn small stands in for tiles still to render: brought to
+    # the marks at every frame all the same, it took a pass of poppler more
+    # at each frame of an eraser or an undo (twice the work on a scan).
+    win, _results, _src = window
+    area = win.area
+    assert spin(lambda: area._raster is not None and not area._overview_shown)  # every tile there
+    frames, overviews = [], []
+    page_raster, overview_raster = sign.PageArea._page_raster, sign.PageArea._overview_raster
+    monkeypatch.setattr(sign.PageArea, "_page_raster", lambda self, scale: frames.append(1) or page_raster(self, scale))
+    monkeypatch.setattr(sign.PageArea, "_overview_raster", lambda self: overviews.append(1) or overview_raster(self))
+    win.add_mark(Stroke([(200, 600, 0.9), (260, 640, 0.9)]))
+    assert spin(lambda: frames)
+    win._undo()
+    assert spin(lambda: len(frames) >= 2)
+    assert overviews == []
+
+
 def test_no_way_out_while_saving(window):
     # Cancel, Escape or the window manager closing the window while the copy
     # is written would report nothing although the file appears.

@@ -126,6 +126,11 @@
   replaced by another document of its name, the marks went on that one.
   The window signs a copy taken as it opens now, as the tablet does; the
   signed copy still goes next to the original.
+- **Erasing on a scanned page takes half the work**: at each frame of the
+  eraser, an undo or a selection, the signing window drew the changed
+  part of the page twice, once for the small picture of the whole page
+  that stands in for parts not yet drawn at the current zoom, shown or
+  not. It is brought up to date only when it shows now.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

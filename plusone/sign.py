@@ -922,7 +922,6 @@ class PageArea(Gtk.Widget):
         # whole page drawn small shows this frame, and the next renders them
         # all in one pass (one per tile, a few per frame, made a scanned page
         # take a second of frames).
-        overview = self._overview_raster()
         keys = raster.tile_boxes(visible)
         missing = [key for key in keys if key not in raster.rendered]
         # Fingers zooming out: tiles at the old, bigger zoom would be thrown
@@ -934,6 +933,9 @@ class PageArea(Gtk.Widget):
         waiting = bool(missing)
         ready = [raster.tile(*key) for key in keys if key in raster.rendered]
         if waiting:
+            # Brought to the marks only now: at each frame of an eraser or an
+            # undo it was one more pass of poppler, for nothing shown.
+            overview = self._overview_raster()
             ko = v.zoom / overview.scale
             for key in overview.tile_boxes():
                 tile, (x0, y0, x1, y1) = overview.tile(*key)
