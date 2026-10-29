@@ -11,6 +11,7 @@ mod cc;
 pub use cc::fuzz as fuzz_controller;
 pub mod frame;
 mod gate;
+pub mod groups;
 pub mod identity;
 pub mod mdns;
 pub mod node;
@@ -37,6 +38,16 @@ pub enum Class {
     Input,
     /// Unreliable; late is lost (sound, video).
     Realtime,
+    /// Realtime in groups (a video's frames): each message the feature
+    /// writes starts with session::grouped::HEAD's bytes (the group, whether
+    /// it is a key one and whether this is its last: Channel::send_in_group),
+    /// which the link takes off. On a QUIC path whose other side reads groups
+    /// (its hello), a group goes on a QUIC stream of its own: what is lost is
+    /// sent again within the controller's rate, and the group is reset once
+    /// late or superseded (groups.rs); else each message as Realtime. The
+    /// other side's end is a Realtime one: its feature sees the messages as
+    /// they were written.
+    Video,
 }
 
 impl Class {
@@ -45,6 +56,16 @@ impl Class {
             Class::Control => "control",
             Class::Input => "input",
             Class::Realtime => "realtime",
+            Class::Video => "video",
+        }
+    }
+
+    /// What the other side is told the channel is: Video is Realtime to it
+    /// (a peer from before groups knows no other).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Class::Video => "realtime",
+            other => other.name(),
         }
     }
 
@@ -53,6 +74,7 @@ impl Class {
             "control" => Some(Class::Control),
             "input" => Some(Class::Input),
             "realtime" => Some(Class::Realtime),
+            "video" => Some(Class::Video),
             _ => None,
         }
     }

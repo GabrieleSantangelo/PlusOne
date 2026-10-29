@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+pub mod grouped;
+
 /// A ping each this long, on the stream and over UDP.
 pub const PING_EVERY: Duration = Duration::from_secs(1);
 /// Nothing from the other side on a path this long (its stream and its
@@ -495,8 +497,10 @@ impl Established {
         &self.kind
     }
 
-    /// The connection under the stream is QUIC's: its datagrams carry ours.
-    pub(crate) fn set_quic(&mut self, quic: crate::quic::Quic) {
+    /// The connection under the stream is QUIC's: its datagrams carry ours
+    /// (and Video's groups its streams, if the other side reads them).
+    pub(crate) fn set_quic(&mut self, mut quic: crate::quic::Quic) {
+        quic.set_groups(self.hello["groups"].as_u64() == Some(1));
         self.quic = Some(quic);
     }
 
@@ -901,7 +905,7 @@ impl Session {
         self.inbox(&end);
         let (answer, answered) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, answer);
-        self.send_message(json!({"t": "open", "id": id, "feature": feature, "channel": name, "class": class.name()}));
+        self.send_message(json!({"t": "open", "id": id, "feature": feature, "channel": name, "class": class.wire()}));
         let result = answered.recv_timeout(OPEN_WAIT);
         self.pending.lock().unwrap().remove(&id);
         match result {
@@ -930,7 +934,9 @@ impl Session {
         let handler = self.node.upgrade().and_then(|node| node.handler(&feature));
         // With its id as it came, whatever it is.
         let refuse = |reason: &str| self.send_message(json!({"t": "refuse", "id": message["id"], "reason": reason}));
-        let Some(class) = message["class"].as_str().and_then(Class::parse) else { return refuse("unknown class") };
+        let Some(class) = message["class"].as_str().and_then(Class::parse).filter(|c| *c != Class::Video) else {
+            return refuse("unknown class");
+        };
         let Some(handler) = handler else { return refuse("not served") };
         let Ok(id) = channel_id(message) else { return refuse("bad id") };
         if id == DATAGRAM_PATH || id % 2 == self.next_id.load(Ordering::Relaxed) % 2
@@ -981,6 +987,7 @@ impl Session {
                         me.wait_for_room(end.id);
                         me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
                     }
+                    Class::Video => me.send_grouped(end.id, &buf[..length], &mut sealed),
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
                 }
             }
