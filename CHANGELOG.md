@@ -275,6 +275,11 @@
   app; only that connection fails now.
 - Fixed: at the app's very first start, two of its parts asking for the
   tablet's key at once could each make one; it is made once.
+- Fixed: a PC that stopped taking what the tablet's app sent it over the
+  new link (a signed PDF's answer, say) held that channel in the app, and
+  whatever else was to go on it, for as long as the session lasted; the
+  channel closes after 30 s now, and the answer waits for the PC to ask
+  for it again.
 - Security: the app's cable entry, which Android leaves open to other
   apps, goes on only for Plus One's accessory just plugged in; anything
   else sent there starts nothing.

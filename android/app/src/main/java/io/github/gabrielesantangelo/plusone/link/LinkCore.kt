@@ -143,8 +143,8 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
 /** A channel's end: a message socket. [receive] -1 nothing in time, 0 its
  * end (closed by the PC, or the session over), else one message's length.
  * A served feature's handler owns the channels it is given. */
-class LinkChannel(fd: Int, val device: String, val feature: String, val name: String, val kind: String,
-                  val id: Int) : Closeable {
+class LinkChannel(fd: Int, override val device: String, val feature: String, val name: String, val kind: String,
+                  val id: Int) : Closeable, MessageChannel {
     private val socket = ParcelFileDescriptor.adoptFd(fd)
     val fd: java.io.FileDescriptor get() = socket.fileDescriptor
 
@@ -153,23 +153,34 @@ class LinkChannel(fd: Int, val device: String, val feature: String, val name: St
         Os.write(fd, data, offset, length)
     }
 
+    override fun send(data: ByteArray, offset: Int, length: Int, timeoutMs: Int): Boolean {
+        if (!ready(OsConstants.POLLOUT, timeoutMs)) return false
+        send(data, offset, length)
+        return true
+    }
+
     fun send(buffer: ByteBuffer) {
         Os.write(fd, buffer)
     }
 
-    fun receive(buffer: ByteArray, timeoutMs: Int = -1): Int {
-        if (timeoutMs >= 0) {
-            val poll = arrayOf(StructPollfd().apply { this.fd = this@LinkChannel.fd; events = OsConstants.POLLIN.toShort() })
-            if (Os.poll(poll, timeoutMs) == 0) return -1
-        }
+    override fun receive(buffer: ByteArray, timeoutMs: Int): Int {
+        if (!ready(OsConstants.POLLIN, timeoutMs)) return -1
         return Os.read(fd, buffer, 0, buffer.size)
+    }
+
+    /** Whether the socket is ready for events within timeoutMs (-1: not
+     * asked, the call itself waits). */
+    private fun ready(events: Int, timeoutMs: Int): Boolean {
+        if (timeoutMs < 0) return true
+        val poll = arrayOf(StructPollfd().apply { this.fd = this@LinkChannel.fd; this.events = events.toShort() })
+        return Os.poll(poll, timeoutMs) > 0
     }
 
     fun receive(buffer: ByteBuffer): Int = Os.read(fd, buffer)
 
     /** Its end, now: whoever waits in receive() gets 0 (a close alone would
      * not wake it). */
-    fun shutdown() {
+    override fun shutdown() {
         try { Os.shutdown(fd, OsConstants.SHUT_RDWR) } catch (e: android.system.ErrnoException) { /* closed already */ }
     }
 
