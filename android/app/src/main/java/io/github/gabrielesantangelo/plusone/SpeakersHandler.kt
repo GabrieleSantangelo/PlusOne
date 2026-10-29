@@ -5,11 +5,13 @@ import io.github.gabrielesantangelo.plusone.link.Datagrams
 import io.github.gabrielesantangelo.plusone.link.Handler
 import io.github.gabrielesantangelo.plusone.link.LinkPackets
 import io.github.gabrielesantangelo.plusone.link.Link
+import org.json.JSONArray
 import org.json.JSONObject
 
 /** The PC's sound on the speakers (PcmPlayback), while one of its programs
  * plays and the user lets it (Plus One → For the PC). The request's "sdp"
- * is the session's key and the PC's port (JSON; plusone/pcm.py). */
+ * is the session's key and the PC's port (JSON; plusone/pcm.py); the answer
+ * says the codecs it plays besides PCM (Opus, while the link's budget is low). */
 class SpeakersHandler(private val service: CompanionService) : Handler {
     override val types = setOf("speakers")
 
@@ -42,7 +44,10 @@ class SpeakersHandler(private val service: CompanionService) : Handler {
         try {
             playback.start()
             link.send(JSONObject().put("type", "answer")
-                .put("sdp", JSONObject().apply { datagrams?.let { put("port", it.port) } }.toString()))
+                .put("sdp", JSONObject().apply {
+                    datagrams?.let { put("port", it.port) }
+                    put("codecs", JSONArray().put("pcm").apply { if (OpusDecoder.available()) put("opus") })
+                }.toString()))
             service.showSessions()
             service.lowLatency(true)
             link.hold()

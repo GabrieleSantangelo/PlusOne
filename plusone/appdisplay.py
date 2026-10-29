@@ -508,8 +508,7 @@ class LinkPackets:
         self.payload = plusone_link.MAX_DATAGRAM - VIDEO_HEADER.size
         self._open = [media, input]
         self.errors = set()
-        self._budget = None  # plus-one-link's last word on it: kbit/s, 0 for none (not a QUIC path)
-        self._watch = None
+        self.budget = channels.Budget(connection, device)
 
     def send(self, body):
         try:
@@ -532,11 +531,8 @@ class LinkPackets:
 
     def budget_kbps(self):
         """What the path's congestion controller allows now (kbit/s): a
-        QUIC path's (GCC), else None (the stream of before has none). As
-        plus-one-link last told it (watch_budget()), else asked."""
-        if self._budget is not None:
-            return self._budget or None
-        return self._device().get("rate_kbps") or None
+        QUIC path's (GCC), else None (the stream of before has none)."""
+        return self.budget.kbps()
 
     def others_kbps(self):
         """What else of ours goes to the tablet now (kbit/s): the speakers'."""
@@ -544,16 +540,8 @@ class LinkPackets:
 
     def watch_budget(self, on_budget):
         """on_budget(kbit/s, or None: no controller of its own) each time
-        plus-one-link says the path's budget changed (past 10 %, at once
-        for a cut: architecture §3.11), on its events' thread; until close()."""
-        def event(event):
-            if event.get("event") == "budget" and event.get("device") == self.device:
-                self._budget = int(event.get("kbps") or 0)
-                on_budget(self._budget or None)
-        try:
-            self._watch = self.connection.watch(event)
-        except (OSError, ValueError, plusone_link.LinkError) as e:
-            log("app display: the link's budget not watched:", e)
+        plus-one-link says the path's budget changed (channels.Budget)."""
+        self.budget.watch(on_budget)
 
     def _device(self):
         try:
@@ -580,8 +568,7 @@ class LinkPackets:
         return None
 
     def close(self):
-        if self._watch is not None:
-            self._watch.close()
+        self.budget.close()
         for channel in (self.control, self.media, self.input):
             channel.close()
         self.connection.close()

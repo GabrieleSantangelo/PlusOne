@@ -2,6 +2,8 @@
 import json
 import socket
 import struct
+import time
+import types
 
 import pytest
 
@@ -85,3 +87,58 @@ def test_the_app_s_reports_of_each_version_are_read():
     assert pcm.app_report(report[:13]) == (1920, 2, 3, 0, 0, 0)
     assert pcm.app_report(report[:17]) is None
     assert pcm.app_report(b"\x07" + report[1:]) is None and pcm.app_report(None) is None
+
+
+def opus_sender(codecs, kbps):
+    """A sender over the link (its channel faked), its app playing codecs, the link's budget kbps."""
+    sender = pcm.PcmSender("audiotestsrc wave=sine is-live=true samplesperbuffer=240")
+    sent, watched = [], []
+    budget = types.SimpleNamespace(kbps=lambda: kbps, watch=watched.append)
+    sender.channel = types.SimpleNamespace(send=sent.append, budget=budget, receive=lambda timeout: time.sleep(0.05),
+                                           close=lambda: None)
+    sender._over_link = True
+    sender.answer(json.dumps({"codecs": codecs}))
+    return sender, sent, watched
+
+
+def until(condition, seconds=5):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "never"
+        time.sleep(0.01)
+
+
+def test_under_a_low_budget_the_sound_goes_in_opus_and_as_it_is_again_after():
+    sender, sent, watched = opus_sender(["pcm", "opus"], 5000)
+    try:
+        assert sender.codec == "opus" and watched == [sender.follow]
+        until(lambda: len(sent) >= 40)
+        assert {body[0] for body in sent} == {pcm.OPUS}
+        assert all(len(body) < 200 for body in sent)  # 160 kbit/s: about 100 bytes each, not 965
+        numbers = [pcm.HEADER.unpack_from(body)[1] for body in sent]
+        assert numbers == list(range(numbers[0], numbers[0] + len(numbers)))
+        # The budget up: PCM again only once it held PCM_AFTER.
+        sender.follow(15000)
+        time.sleep(0.2)
+        assert sender.codec == "opus"
+        sender._pcm_at = time.monotonic()  # (as if it held that long already)
+        until(lambda: sent[-1][0] == pcm.PCM)
+        first = next(i for i, body in enumerate(sent) if body[0] == pcm.PCM)
+        assert all(body[0] == pcm.PCM and len(body) == pcm.HEADER.size + pcm.BYTES for body in sent[first:])
+        numbers = [pcm.HEADER.unpack_from(body)[1] for body in sent]
+        assert numbers == list(range(numbers[0], numbers[0] + len(numbers)))  # one count, whatever the codec
+        # Down again: Opus at once.
+        sender.follow(4000)
+        assert sender.codec == "opus"
+    finally:
+        sender.close()
+
+
+def test_an_app_that_plays_no_opus_gets_the_sound_as_it_is():
+    sender, sent, watched = opus_sender(None, 2000)
+    try:
+        assert watched == [] and sender.codec == "pcm"
+        until(lambda: len(sent) >= 10)
+        assert {body[0] for body in sent} == {pcm.PCM}
+    finally:
+        sender.close()

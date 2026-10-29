@@ -14,10 +14,19 @@ the session's key and ports (JSON) where WebRTC's carry SDP; failed(),
 losses() (here: the sound captured) and close(). Over the link
 (plus-one-link, docs/LINK.md) the packets go on its "pcm" channel instead
 (use_link), and the offer carries no key nor port.
+
+PCM is 1.7 Mbit/s on the network: half of a weak phone's hotspot. Over the
+link, while its budget is under OPUS_UNDER (its congestion controller's,
+told as it moves), the same 5 ms packets go in Opus instead (OPUS_KBPS, its
+low-delay mode), to an app that says it plays it; PCM again once the
+budget held over PCM_OVER for PCM_AFTER (architecture: PCM where the
+bandwidth abounds, the cable, Wi-Fi Direct). The encoder runs only then (a
+valve before it): nothing spent on it otherwise.
 """
 import json
 import struct
 import threading
+import time
 
 from gi.repository import Gst
 
@@ -25,6 +34,11 @@ from . import log
 from .link import Datagrams
 
 PCM = 7                  # the packets' kind (after appdisplay's)
+OPUS = 8                 # the same 5 ms, in Opus
+OPUS_KBPS = 160
+OPUS_UNDER = 8000        # kbit/s of the link's budget: PCM would be a fifth of it and more
+PCM_OVER = 12000         # kbit/s...
+PCM_AFTER = 10.0         # ...held this long (s): PCM again
 STATS = 5                # the app's report (appdisplay.STATS's number, its own layout)
 RATE, CHANNELS = 48000, 2
 FRAMES = 240             # per packet: 5 ms
@@ -60,18 +74,30 @@ class PcmSender:
         self._quiet = 0       # packets of silence in a row
         self._pending = b""
         self._running = True
+        # Both branches in the source's thread (nothing in them waits): the
+        # sound as it is, and Opus behind a valve, shut while PCM goes.
         self.pipeline = Gst.parse_launch(
             f"{source} ! audioconvert ! audioresample "
-            f"! audio/x-raw,format=S16LE,rate={RATE},channels={CHANNELS},layout=interleaved "
-            f"! appsink name=out emit-signals=true sync=false max-buffers=0")
+            f"! audio/x-raw,format=S16LE,rate={RATE},channels={CHANNELS},layout=interleaved ! tee name=t "
+            f"t. ! appsink name=out emit-signals=true sync=false async=false max-buffers=0 "
+            f"t. ! valve name=opus-on drop=true "
+            f"! opusenc frame-size={FRAMES * 1000 // RATE} bitrate={OPUS_KBPS * 1000} audio-type=restricted-lowdelay "
+            f"! appsink name=opus emit-signals=true sync=false async=false max-buffers=0")
         self._sink = self.pipeline.get_by_name("out")
         self._handler = self._sink.connect("new-sample", self._send)
+        self._opus_sink = self.pipeline.get_by_name("opus")
+        self._opus_handler = self._opus_sink.connect("new-sample", self._send_opus)
+        self._valve = self.pipeline.get_by_name("opus-on")
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._over_link = False
+        self.codecs = {"pcm"}  # what the app plays (its answer)
+        self.codec = "pcm"
+        self._pcm_at = None   # when PCM goes again (the budget high since)
 
     def use_link(self, tablet):
         """The packets on the link's "pcm" channel (tablet: a
-        channels.ChannelLink), not this session's own UDP socket."""
+        channels.ChannelLink), not this session's own UDP socket; Opus or
+        PCM after its budget."""
         self.channel.close()
         self.channel = tablet.packets("pcm")
         self._over_link = True
@@ -83,15 +109,41 @@ class PcmSender:
                            "channels": CHANNELS, "frames": FRAMES})
 
     def answer(self, text):
-        """The app's answer: its port (JSON), over the link of before."""
+        """The app's answer: its port (JSON), over the link of before; the
+        codecs it plays besides PCM."""
+        reply = json.loads(text) if text else {}
         if not self._over_link:
-            reply = json.loads(text)
             port = int(reply["port"])
             if not self.peer or not 0 < port < 65536:
                 raise ValueError("the app's answer is not one")
             self.channel.app = (self.peer, port)
+        codecs = reply.get("codecs")
+        self.codecs = {"pcm"} | ({c for c in codecs if isinstance(c, str)} if isinstance(codecs, list) else set())
+        budget = getattr(self.channel, "budget", None)
+        if budget is not None and "opus" in self.codecs:
+            self.follow(budget.kbps())
+            budget.watch(self.follow)
         self.pipeline.set_state(Gst.State.PLAYING)
         self._listener.start()
+
+    def follow(self, kbps, now=None):
+        """The link's budget (kbit/s; None: a path with no controller of its
+        own, a cable's): Opus at once under OPUS_UNDER, PCM again once over
+        PCM_OVER (or none) for PCM_AFTER."""
+        now = time.monotonic() if now is None else now
+        if kbps and kbps < OPUS_UNDER:
+            self._pcm_at = None
+            self._use("opus")
+        elif self.codec == "opus" and (not kbps or kbps >= PCM_OVER):
+            self._pcm_at = self._pcm_at or now + PCM_AFTER
+        else:
+            self._pcm_at = None
+
+    def _use(self, codec):
+        if codec != self.codec:
+            log(f"speakers: in {codec.upper()} now")
+            self.codec = codec
+            self._valve.set_property("drop", codec != "opus")
 
     def _send(self, appsink):
         """Streaming thread: the sound cut into 5 ms packets, out at once."""
@@ -100,6 +152,9 @@ class PcmSender:
             return Gst.FlowReturn.EOS
         buf = sample.get_buffer()
         self.captured += 1
+        if self._pcm_at is not None and time.monotonic() >= self._pcm_at:
+            self._pcm_at = None
+            self._use("pcm")
         data = self._pending + buf.extract_dup(0, buf.get_size())
         whole = len(data) - len(data) % BYTES
         for at in range(0, whole, BYTES):
@@ -110,9 +165,22 @@ class PcmSender:
                 continue
             else:
                 self._quiet += 1
-            self.channel.send(HEADER.pack(PCM, self.sent & 0xFFFFFFFF) + packet)
-            self.sent += 1
+            if self.codec == "pcm":
+                self.channel.send(HEADER.pack(PCM, self.sent & 0xFFFFFFFF) + packet)
+                self.sent += 1
         self._pending = data[whole:]
+        return Gst.FlowReturn.OK
+
+    def _send_opus(self, appsink):
+        """Streaming thread: an Opus packet of 5 ms, out at once (unless the
+        sound has been silence for a second: as PCM's)."""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.EOS
+        if self.codec == "opus" and self._quiet < QUIET_AFTER:
+            buf = sample.get_buffer()
+            self.channel.send(HEADER.pack(OPUS, self.sent & 0xFFFFFFFF) + buf.extract_dup(0, buf.get_size()))
+            self.sent += 1
         return Gst.FlowReturn.OK
 
     def _listen(self):
@@ -155,6 +223,7 @@ class PcmSender:
         self._running = False
         self.pipeline.set_state(Gst.State.NULL)
         self._sink.disconnect(self._handler)
+        self._opus_sink.disconnect(self._opus_handler)
         if self._listener.is_alive():
             self._listener.join(timeout=2)
         self.channel.close()

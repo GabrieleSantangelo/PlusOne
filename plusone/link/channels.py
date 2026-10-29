@@ -53,6 +53,41 @@ def _forget(sent, now):
         sent.popleft()
 
 
+class Budget:
+    """What the path to device's congestion controller allows (kbit/s):
+    plus-one-link's word on it, asked once (kbps()), then as it tells it
+    moved (watch(): past 10 %, a cut at once; architecture §3.11). None on
+    a path with no controller of its own (TCP, a cable)."""
+
+    def __init__(self, connection, device):
+        self.connection, self.device = connection, device
+        self._told = None  # the last told: kbit/s, 0 for none
+        self._watch = None
+
+    def kbps(self):
+        if self._told is not None:
+            return self._told or None
+        try:
+            return next((d for d in self.connection.devices() if d["id"] == self.device), {}).get("rate_kbps") or None
+        except (OSError, ValueError, plusone_link.LinkError):
+            return None
+
+    def watch(self, on_budget):
+        """on_budget(kbit/s or None) as it moves, on the events' thread, until close()."""
+        def event(event):
+            if event.get("event") == "budget" and event.get("device") == self.device:
+                self._told = int(event.get("kbps") or 0)
+                on_budget(self._told or None)
+        try:
+            self._watch = self.connection.watch(event)
+        except (OSError, ValueError, plusone_link.LinkError) as e:
+            log("the link's budget not watched:", e)
+
+    def close(self):
+        if self._watch is not None:
+            self._watch.close()
+
+
 def connect(app_id, feature):
     """The feature's session with the paired tablet whose id starts with
     app_id, over the link: a ChannelLink, or None (plus-one-link not running,
@@ -219,6 +254,7 @@ class ChannelPackets:
         self.payload = plusone_link.MAX_DATAGRAM
         self.errors = set()
         self._ended = False
+        self.budget = Budget(connection, device)
 
     def send(self, body):
         try:
@@ -254,4 +290,5 @@ class ChannelPackets:
             return 0
 
     def close(self):
+        self.budget.close()
         self.channel.close()

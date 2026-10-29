@@ -12,7 +12,9 @@ import io.github.gabrielesantangelo.plusone.link.Packets
  * The PC's sound on the speakers as it is (plusone/pcm.py): 16-bit stereo PCM
  * at 48 kHz, no codec, in sealed packets of 5 ms, played with a plain media
  * AudioTrack, as the tablet's own players do. (libwebrtc played it before:
- * made for calls, its jitter buffer stretched and squeezed the music.)
+ * made for calls, its jitter buffer stretched and squeezed the music.) While
+ * the link's budget is low the same packets come in Opus (OpusDecoder),
+ * decoded as they come: from there on all is the same.
  *
  * PREFILL packets wait before it starts, against the Wi-Fi's unevenness. The
  * two clocks drift apart (the PC's and the tablet's sound chip, tens of parts
@@ -71,6 +73,8 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
         .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT), bytes * 4))
         .build()
+    private var opus: OpusDecoder? = null  // the receiver's, from the first Opus packet
+    private var opusBroken = false
     private val receiver = Thread(::receive, "plusone-speakers-in")
     private val player = Thread(::play, "plusone-speakers-out")
 
@@ -92,35 +96,64 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
     }
 
     private fun receive() {
-        while (running) {
-            val body = try {
-                datagrams.receive()
-            } catch (e: Exception) {
-                break
-            }
-            if (body.size != 5 + bytes || body[0] != PCM) continue
-            val number = ByteBuffer.wrap(body, 1, 4).int
-            synchronized(lock) {
-                if (started && number - next < 0) {
-                    late++
-                } else {
-                    // Full (the Wi-Fi held back more than a second): the oldest
-                    // go, they are the most out of date.
-                    if (packets.size >= MAX_HELD) {
-                        packets.remove(oldest())
-                        late++
-                    }
-                    packets[number] = body.copyOfRange(5, body.size)
-                    val now = SystemClock.uptimeMillis()
-                    if (now - arrived >= STALL_MS) {
-                        burstAt = now
-                        burst = 0
-                    }
-                    if (now - burstAt <= BURST_MS) burst++
-                    arrived = now
-                    lock.notifyAll()
+        try {
+            while (running) {
+                val body = try {
+                    datagrams.receive()
+                } catch (e: Exception) {
+                    break
+                }
+                if (body.size < 5) continue
+                val number = ByteBuffer.wrap(body, 1, 4).int
+                when {
+                    body[0] == PCM && body.size == 5 + bytes -> came(number, body.copyOfRange(5, body.size))
+                    body[0] == OPUS -> for ((decoded, sound) in decode(body, number)) came(decoded, sound)
                 }
             }
+        } finally {
+            opus?.release()
+        }
+    }
+
+    /** An Opus packet's sound, each packet's the decoder gave (none if it
+     * failed: then no more tries, nor a log line each 5 ms). */
+    private fun decode(body: ByteArray, number: Int): List<Pair<Int, ByteArray>> {
+        if (opusBroken) return emptyList()
+        return try {
+            val decoder = opus ?: OpusDecoder(rate, CHANNELS).also { opus = it }
+            // Whole packets of sound: a shorter one padded with silence, a longer one cut.
+            decoder.decode(body, 5, body.size - 5, number).map { (n, sound) -> n to sound.copyOf(bytes) }
+        } catch (e: Exception) {
+            Log.w(CompanionService.TAG, "speakers: Opus not decoded: $e")
+            opus?.release()
+            opus = null
+            opusBroken = true
+            emptyList()
+        }
+    }
+
+    /** A packet's sound came, numbered number. */
+    private fun came(number: Int, sound: ByteArray) {
+        synchronized(lock) {
+            if (started && number - next < 0) {
+                late++
+                return
+            }
+            // Full (the Wi-Fi held back more than a second): the oldest
+            // go, they are the most out of date.
+            if (packets.size >= MAX_HELD) {
+                packets.remove(oldest())
+                late++
+            }
+            packets[number] = sound
+            val now = SystemClock.uptimeMillis()
+            if (now - arrived >= STALL_MS) {
+                burstAt = now
+                burst = 0
+            }
+            if (now - burstAt <= BURST_MS) burst++
+            arrived = now
+            lock.notifyAll()
         }
     }
 
@@ -342,6 +375,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
 
     companion object {
         const val PCM: Byte = 7
+        const val OPUS: Byte = 8
         const val STATS: Byte = 5
         const val CHANNELS = 2
         const val PREFILL = 8         // packets of 5 ms: 40 ms

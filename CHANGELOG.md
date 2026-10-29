@@ -51,6 +51,11 @@
   a still screen no longer takes the picture down to a few Mbit/s; on the
   link's QUIC paths the picture follows the link's congestion controller,
   at once as it moves (plus-one-link tells the apps), not once a second.
+- **The tablet's speakers on a weak network**: over the link, while its
+  budget is under 8 Mbit/s, the PC's sound goes in Opus (160 kbit/s, its
+  low-delay mode) instead of as it is (1.7 Mbit/s: half of a weak phone's
+  hotspot), to an app that plays it; as it is again once the budget held
+  over 12 Mbit/s for 10 s. The screen leaves the speakers their share.
 - **Post-quantum key exchange**: the link's TLS uses the hybrid
   X25519MLKEM768 between this PC and the app (X25519 with a version from
   before).
