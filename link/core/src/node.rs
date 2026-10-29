@@ -306,7 +306,12 @@ impl Node {
                 if node.closed.load(Ordering::SeqCst) {
                     break;
                 }
-                let Ok(tcp) = tcp else { continue };
+                let Ok(tcp) = tcp else {
+                    // Out of descriptors, say: the connection waits, and so
+                    // does this, not spinning meanwhile.
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
                 // Anyone on the network can connect: the gate says who may
                 // now (dropped unanswered).
                 let Some(handshake) = tcp.peer_addr().ok().and_then(|from| node.gate.start(from.ip())) else { continue };
