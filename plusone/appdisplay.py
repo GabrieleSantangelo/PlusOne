@@ -85,8 +85,20 @@ TRUESIZE = 3 / 2
 # A packet's bytes on the way past its H.264: our header, the link's seal,
 # quinn's own count of a datagram (or UDP's and IP's).
 PACKET_EXTRA = 80
+# What the link holds of realtime before it drops it, late: LATE of its
+# controller's rate, never more than quinn's room for datagrams (quic.rs
+# LATE, DATAGRAM_SEND_BUFFER); of the budget as told, TOLD (told past 10 %
+# of a move: the rate may be that much under it).
+LATE = 0.1
+LINK_ROOM = 512 << 10
+TOLD = 0.9
+# A frame bigger than all that goes once no more than this waits before it
+# (on a budget too low for its bitrate it would never go).
+ALONE = 8 << 10
 # A frame not encoded, by why (the stats' line says how many of each).
-LEFT_OUT = {"queue": "the link's queue", "budget": "over the budget"}
+LEFT_OUT = {"queue": "the link's queue", "budget": "over the budget", "keyframe": "for a keyframe to fit"}
+# An encoded frame not sent, by why.
+DROPPED = {"late": "would not have fitted", "broken": "after one dropped"}
 
 
 # Widths offered for the desktop in the app, each at the tablet's proportions
@@ -826,6 +838,11 @@ class AppStreamer:
         self._after_key = 0  # bytes sent since
         self._key_flying = False  # it still waits to go out, as of the last frame in
         self._asks_held = 0  # the app's asks not answered for one on its way, since the last stats
+        self._key_wanted = False  # a keyframe to make, once the whole of it fits in the link (_keyframe_in)
+        self._key_made = -math.inf  # when one was last made (time.monotonic())
+        self._broken = False  # a frame was dropped: the next ones are of no use until a keyframe
+        self._queued = 0  # what waited in the link at the last frame in (bytes)
+        self.dropped = collections.Counter()  # encoded frames not sent, by why (DROPPED)
         self._encoded = []  # ms from capture to sent, since the last stats
         # When each frame going into the encoder was captured, in order: one
         # comes out per one in (no B frames), and a flush drops those held.
@@ -908,12 +925,11 @@ class AppStreamer:
         self.on_error(f"{message.src.get_name()}: {error.message}")
 
     def _frame_in(self, pad, info):
-        why = self._left_out(time.monotonic())
+        now = time.monotonic()
+        why = self._left_out(now) or self._keyframe_in(pad, now)
         if why:
             self.skipped[why] += 1
             return Gst.PadProbeReturn.DROP
-        if self._pending is not None and not self._key_flying:
-            self._make_bitrate()  # its keyframe with this frame
         # pipewiresrc and a live test source stamp buffers with the running
         # time at capture, and the pipeline's clock is the monotonic one.
         buf = info.get_buffer()
@@ -937,14 +953,51 @@ class AppStreamer:
         frames after are broken.
         "budget": over the budget's allowance (Allowance)."""
         budget = self._budget_kbps
-        queued = self.channel.queued()
+        queued = self._queued = self.channel.queued()
         self._key_flying = self._flying(queued, now)
-        most = (min(self.rate.kbps, budget) * QUEUE_MS // 8 if budget
-                else self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
-        if queued > max(64 << 10, most):
+        if budget:
+            # And room left for an average frame under what the link holds
+            # (on a low budget, the 64 KB let in frames the link cut).
+            most = max(64 << 10, min(self.rate.kbps, budget) * QUEUE_MS // 8)
+            most = max(ALONE, min(most, self._holds(budget) - self.kbps * 125 // self.fps))
+        else:
+            most = max(64 << 10, self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
+        if queued > most:
             return "queue"
         if not self.allowance.allows(now):
             return "budget"
+        return None
+
+    @staticmethod
+    def _holds(budget):
+        """What the link holds of realtime before it drops it as late (bytes),
+        on a path with a budget (kbit/s)."""
+        return min(budget * 125 * LATE, LINK_ROOM) * TOLD
+
+    def _fits(self, size, queued, budget):
+        """Whether a frame of size goes to the link whole: none of it late."""
+        return not budget or queued + size <= self._holds(budget) or queued <= ALONE
+
+    def _keyframe_in(self, pad, now):
+        """A keyframe with this frame if one is due (asked for, or the stream
+        broken; a bitrate change on Intel's is one too), once the last is out
+        (_flying) and the whole of it fits in the link: VBV_FRAMES frames at
+        its bitrate. "keyframe" if the frame is left out meanwhile: the app
+        waits for one, and a frame that is not one is of no use to it (the
+        queue empties sooner); else None."""
+        due = self._key_wanted or (self._broken and now - self._key_made >= MIN_KEYFRAME_GAP)
+        change = self._pending is not None
+        if not (due or change):
+            return None  # (a keyframe made and not out yet: the frames after it go behind it)
+        kbps = self._pending[0] if change else self.kbps
+        size = kbps * 125 * media.VBV_FRAMES / self.fps * (1 + PACKET_EXTRA / PAYLOAD)
+        if self._key_flying or not self._fits(size, self._queued, self._budget_kbps):
+            return "keyframe" if due else None
+        if change:
+            self._make_bitrate()  # its keyframe with this frame
+        if due:
+            self._key_wanted, self._key_made = False, now
+            self.keyframes.now(pad)
         return None
 
     def _flying(self, queued, now):
@@ -969,10 +1022,30 @@ class AppStreamer:
         return Gst.FlowReturn.OK
 
     def _out(self, data, keyframe, captured):
-        """An encoded frame to the link, as it came."""
+        """An encoded frame to the link whole, or not at all. The link drops
+        realtime that would wait past LATE packet by packet: a frame's tail
+        lost, a keyframe's above all, and every frame after it broken. A
+        frame that would not fit whole is dropped here, and those after it
+        until a keyframe (decoded against one the app never had, they would
+        show garbage: it sees no frame missing that never came at all); the
+        keyframe is made as soon as it fits (_keyframe_in). The app keeps
+        the last picture meanwhile, and its frame numbers run on."""
         now = time.monotonic()
         payload = getattr(self.channel, "payload", PAYLOAD)
         count = -(-len(data) // payload)
+        size = len(data) + count * PACKET_EXTRA
+        if self._broken and not keyframe:
+            self.dropped["broken"] += 1
+            return
+        budget = self._budget_kbps
+        if budget:
+            # What waited as it went in, if that leaves room to spare (the
+            # frame comes out before the next goes in); else asked again.
+            clear = self._queued + size + ALONE <= self._holds(budget)
+            if not self._fits(size, self._queued if clear else self.channel.queued(), budget):
+                self.dropped["late"] += 1
+                self._broken = self._key_wanted = True
+                return
         number = self._frame = self._frame + 1
         if number == 1 and self.input is not None:
             # The monitor is Mutter's now (the pen is mapped onto it): the
@@ -982,11 +1055,11 @@ class AppStreamer:
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
             self.channel.send(header + data[index * payload:(index + 1) * payload])
-        size = len(data) + count * PACKET_EXTRA
         self.allowance.take(size, now)
         if keyframe:  # whatever made it (asked, a bitrate change, the periodic one): it answers the app
             self._key_at, self._after_key = now, 0
             self._last_keyframe = max(self._last_keyframe, now)
+            self._broken = self._key_wanted = False
         else:
             self._after_key += size
         self._encoded.append((time.monotonic_ns() - captured) / 1e6)
@@ -1030,6 +1103,7 @@ class AppStreamer:
                 others = self._others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
                 keyframes, self._keyframes = self._keyframes, 0
                 asks_held, self._asks_held = self._asks_held, 0
+                dropped, self.dropped = self.dropped, collections.Counter()
                 with self._rate_lock:
                     if budget:
                         self.allowance.follow(RateControl.allowed(budget, others))  # the others' share moves
@@ -1041,7 +1115,7 @@ class AppStreamer:
                                "whole_to_decoded": [v / 10 for v in ms[3:]],
                                "capture_to_sent": encoded[len(encoded) // 2] if encoded else None,
                                "skipped": skipped, "left_out": dict(left_out), "kbps": self.rate.kbps,
-                               "keyframes": keyframes, "asks_held": asks_held})
+                               "keyframes": keyframes, "asks_held": asks_held, "dropped": dict(dropped)})
 
     def visible(self, shown):
         """The app shows the desktop, or not: nothing is captured or encoded
@@ -1097,12 +1171,16 @@ class AppStreamer:
         if now - self._last_keyframe < gap:
             return
         self._last_keyframe = now
-        self.keyframes.request()
+        self._key_wanted = True  # with the first frame in that it fits with
 
 
 def _left_out(stats):
     causes = stats.get("left_out") or {}
     return ", ".join(f"{n} {LEFT_OUT.get(why, why)}" for why, n in sorted(causes.items())) or "the network behind"
+
+
+def _dropped(stats):
+    return ", ".join(f"{n} {DROPPED.get(why, why)}" for why, n in sorted(stats["dropped"].items()))
 
 
 def describe(stats):
@@ -1114,7 +1192,8 @@ def describe(stats):
             + (f"; {stats['skipped']} not encoded ({_left_out(stats)})" if stats.get("skipped") else "")
             + (f"; {stats['kbps']} kbit/s" if "kbps" in stats else "")
             + (f"; {stats['keyframes']} keyframe{'s' if stats['keyframes'] > 1 else ''}" if stats.get("keyframes") else "")
-            + (f"; {stats['asks_held']} asked while one was on its way" if stats.get("asks_held") else ""))
+            + (f"; {stats['asks_held']} asked while one was on its way" if stats.get("asks_held") else "")
+            + (f"; {sum(stats['dropped'].values())} encoded not sent ({_dropped(stats)})" if stats.get("dropped") else ""))
 
 
 class AppDisplay:
@@ -1308,7 +1387,8 @@ class AppDisplay:
         self._reports += 1
         # Each second something went wrong, or a keyframe went (the live
         # tests follow the chain: a cut, frames not encoded, lost, asked for).
-        if stats["lost"] or stats.get("skipped") or stats.get("keyframes") or self._reports % STATS_EVERY == 1:
+        if (stats["lost"] or stats.get("skipped") or stats.get("keyframes") or stats.get("dropped")
+                or self._reports % STATS_EVERY == 1):
             log("app display:", describe(stats))
 
     def _scale(self, tries):

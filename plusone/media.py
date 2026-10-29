@@ -72,6 +72,15 @@ class Keyframes:
         s = Gst.Structure.new_from_string("GstForceKeyUnit, all-headers=(boolean)true")
         self.pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_DOWNSTREAM, s))
 
+    def now(self, pad):
+        """A keyframe with the frame going into the encoder now: from a probe
+        on its input (pad), on the streaming thread."""
+        if self.flush:
+            self.wanted = True
+            self._before_frame(pad, None)
+        else:
+            self.request()
+
     def _before_frame(self, pad, _info):
         if self.wanted:
             self.wanted = False

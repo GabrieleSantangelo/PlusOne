@@ -693,20 +693,37 @@ def test_what_is_still_to_go_out_is_known():
     assert channel.queued() == 0  # closed: nothing
 
 
+class FakeKeyframes:
+    """media.Keyframes: when each was made (the frame going in made one)."""
+
+    def __init__(self, clock):
+        self.clock, self.made, self.coming = clock, [], False
+
+    def now(self, pad):
+        self.made.append(self.clock.now)
+        self.coming = True
+
+    def request(self):  # made at once, wherever from (before: an ask answered at once)
+        self.now(None)
+
+
 def test_keyframes_asked_again_wait_for_the_last_to_come(monkeypatch):
-    clock, asked = Clock(), []
-    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock, monotonic_ns=lambda: 0))
     streamer = streamer_on(FakeLink(rtt=0.2))
-    streamer.keyframes = types.SimpleNamespace(request=lambda: asked.append(clock.now))
+    streamer.keyframes = FakeKeyframes(clock)
     for t in (100.0, 100.3, 100.4):  # a round trip and a half, and the keyframe's own 4/60 s: 0.367 s
         clock.now = t
         streamer.force_keyframe()
-    assert asked == [100.0, 100.4]
-    streamer.channel = types.SimpleNamespace()  # the link of before: no round trip known
+        streamer._frame_in(PAD, INFO)  # made with the next frame in
+    assert streamer.keyframes.made == [100.0, 100.4]
+    link = streamer.channel
+    streamer.channel = types.SimpleNamespace(queued=link.queued)  # the link of before: no round trip known
     for t in (101.0, 101.2, 101.3):
         clock.now = t
         streamer.force_keyframe()
-    assert asked[2:] == [101.0, 101.3]
+        streamer._frame_in(PAD, INFO)
+    assert streamer.keyframes.made[2:] == [101.0, 101.3]
 
 
 def keyframe_streamer(monkeypatch, restarts=True):
@@ -719,8 +736,8 @@ def keyframe_streamer(monkeypatch, restarts=True):
     link = FakeLink(budget=10000)
     streamer = streamer_on(link, bitrate=8500)
     streamer.rate.kbps, streamer._restarts = 8500, restarts
-    streamer.keyframes = types.SimpleNamespace(request=lambda: asked.append(clock.now))
-    return streamer, link, clock, asked, said
+    streamer.keyframes = FakeKeyframes(clock)
+    return streamer, link, clock, streamer.keyframes.made, said
 
 
 PAD = types.SimpleNamespace(get_sticky_event=lambda *_: None)
@@ -729,11 +746,13 @@ INFO = types.SimpleNamespace(get_buffer=lambda: types.SimpleNamespace(pts=0))
 
 def frame_in(streamer, clock, size=15000):
     """The next frame (1/60 s on) into the encoder: whether it went in; in,
-    out to the link at once, of size."""
+    out to the link at once, of size (a keyframe if one was made with it:
+    VBV_FRAMES times that)."""
     clock.now += 1 / 60
     if streamer._frame_in(PAD, INFO) != appdisplay.Gst.PadProbeReturn.OK:
         return False
-    streamer._out(bytes(size), False, 0)
+    keyframe, streamer.keyframes.coming = streamer.keyframes.coming, False
+    streamer._out(bytes(size * (appdisplay.media.VBV_FRAMES if keyframe else 1)), keyframe, 0)
     return True
 
 
@@ -748,7 +767,7 @@ def test_no_keyframe_asked_for_while_the_last_still_waits_to_go_out(monkeypatch)
     link.waiting = 15000  # out: what waits now went after it
     assert frame_in(streamer, clock)
     streamer.force_keyframe()
-    assert asked == [clock.now]
+    assert frame_in(streamer, clock) and asked == [clock.now]  # with the next frame in
 
 
 def test_a_keyframe_sent_answers_the_app_s_asks_for_a_while(monkeypatch):
@@ -840,3 +859,49 @@ def test_the_app_refusing_over_the_link_says_why(monkeypatch):
         display._run_over_the_link(packets, reply)
     assert engine.why_not(refused.value, "Tab") == ("On {name}, let Plus One display over other apps, or open it",
                                                     {"name": "Tab"})
+
+
+def test_a_frame_that_would_not_fit_whole_is_dropped_whole_and_those_after_until_a_keyframe(monkeypatch):
+    # A 10 Mbit/s budget: the link holds 125 KB of realtime (100 ms), 112.5 KB
+    # of the budget told; past it, it drops packets one by one: a frame's tail.
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    streamer._out(bytes(40000), True, 0)
+    sent = len(link.sent)
+    link.waiting = 60000
+    clock.now += 1 / 60
+    assert streamer._frame_in(PAD, INFO) == appdisplay.Gst.PadProbeReturn.OK  # it fits as it goes in...
+    streamer._budget(7000)  # ...the controller cuts by 30 %: the link holds 30 % less at once
+    streamer._out(bytes(20000), False, 0)  # 60 KB waiting and 20 more: its tail would be cut
+    assert len(link.sent) == sent and streamer.dropped == {"late": 1}  # none of it
+    link.waiting = 0
+    streamer._out(bytes(15000), False, 0)  # decoded against the one dropped: garbage
+    assert len(link.sent) == sent and streamer.dropped == {"late": 1, "broken": 1}
+    assert frame_in(streamer, clock, size=15000)  # a keyframe with the next frame in: it fits
+    assert made == [clock.now] and not streamer._broken
+    keyframe = appdisplay.VIDEO_HEADER.unpack_from(link.sent[sent])
+    assert keyframe[1] == 1 and keyframe[2] == 2  # whole, and numbered on (the app sees nothing missing)
+    assert frame_in(streamer, clock) and len(link.sent) > sent + keyframe[4]  # the frames after it go
+    assert appdisplay.describe({"shown": 40, "lost": 0, "capture_to_decoded": [20, 30, 40],
+                                "whole_to_decoded": [10, 12, 14], "capture_to_sent": 5, "kbps": 8500,
+                                "dropped": {"late": 1, "broken": 1}}).endswith(
+        "; 2 encoded not sent (1 after one dropped, 1 would not have fitted)")
+
+
+def test_a_keyframe_is_made_only_once_the_whole_of_it_fits(monkeypatch):
+    streamer, link, clock, made, _said = keyframe_streamer(monkeypatch)
+    streamer.force_keyframe()  # the app asks
+    link.waiting = 60000  # under QUEUE_MS: a frame would go; a keyframe (4 x 17.7 KB) would not fit
+    assert not frame_in(streamer, clock)  # left out: no use to the app, which waits for a keyframe
+    assert made == [] and streamer.skipped == {"keyframe": 1}
+    link.waiting = 30000
+    assert frame_in(streamer, clock) and made == [clock.now]
+
+
+def test_on_a_low_budget_no_frame_goes_in_that_the_link_would_cut():
+    # 3 Mbit/s: the link holds 37.5 KB of realtime; 64 KB waiting let frames in.
+    link = FakeLink(budget=3000, queued=40000)
+    streamer = streamer_on(link, bitrate=2550)
+    streamer.rate.kbps = 2550
+    assert streamer._left_out(100.0) == "queue"
+    link.waiting = 20000
+    assert streamer._left_out(100.1) is None
