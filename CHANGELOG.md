@@ -12,6 +12,11 @@
   tablet the Bluetooth path was named and drawn as Wi-Fi, and on the PC
   it was "bt".
 
+- **The tablet is found over Bluetooth again after Bluetooth is turned off
+  and on**: the app listened for the PC on Bluetooth only as it started,
+  and once Bluetooth went off the PC found no Plus One on the tablet until
+  the app started again; it now listens each time Bluetooth comes back on,
+  and as soon as the app is allowed Bluetooth.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

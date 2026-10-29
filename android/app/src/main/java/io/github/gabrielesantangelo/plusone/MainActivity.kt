@@ -77,6 +77,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         CompanionService.start(this)  // ready now (for a while, if not always)
         CompanionService.instance?.elevate()  // in front: camera and microphone for the PC, if let
+        CompanionService.instance?.bluetooth?.start()  // Bluetooth, if allowed since the service started
         Jobs.listen(queueChanged)
         io.github.gabrielesantangelo.plusone.link.LinkStatus.listen(pathChanged)
         refresh()

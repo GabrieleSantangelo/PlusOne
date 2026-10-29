@@ -37,7 +37,9 @@ class CompanionService : Service(), LinkServer.Host {
     /** Both links' announcers: announced again as their tags change (announce()). */
     private val announcers = java.util.concurrent.CopyOnWriteArrayList<MdnsAnnouncer>()
     private var announced: Pair<Long, Boolean>? = null  // the tags' epoch, pairing open: as last announced
-    private var bluetooth: BtListener? = null
+    /** Listening on Bluetooth: started again by the app (Bluetooth allowed since). */
+    var bluetooth: BtListener? = null
+        private set
     private val pairedChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         link?.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         announce(force = true)
