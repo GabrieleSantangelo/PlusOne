@@ -99,6 +99,11 @@
   round for ever, a core at 100 %: on the PC the signing window could no
   longer be closed, and signed on the tablet Plus One never let go of
   it. Its signed copy is saved now, as any other's.
+- **A signed copy is saved beside a broken link of its name**: a link to
+  a file no longer there, named as the signed copy would be
+  ("contract-signed.pdf"), made the saving try that name again and again,
+  for ever. The next name is taken now ("contract-signed-2.pdf"), the
+  link left as it is.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

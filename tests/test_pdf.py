@@ -60,6 +60,41 @@ def test_output_path_never_overwrites(tmp_path):
     assert output_path(str(src)) == str(tmp_path / "contract-signed-2.pdf")
 
 
+def test_a_link_to_nothing_named_as_the_copy_is_left_as_it_is(tmp_path, monkeypatch):
+    # exists() says no for it, link() says it is there: tried again and
+    # again, for ever.
+    src = tmp_path / "contract.pdf"
+    make_pdf(src)
+    os.symlink(str(tmp_path / "gone.pdf"), str(tmp_path / "contract-signed.pdf"))
+    tried, link = [], os.link
+
+    def counted(a, b):
+        tried.append(b)
+        if len(tried) > 100:
+            raise RuntimeError("the same name tried again and again")
+        return link(a, b)
+    monkeypatch.setattr(os, "link", counted)
+    done = save_signed(str(src), {0: [blob(100, 100)]})
+    assert done == str(tmp_path / "contract-signed-2.pdf") and os.path.isfile(done)
+    assert os.path.islink(tmp_path / "contract-signed.pdf")
+
+
+def test_a_name_taken_meanwhile_is_passed_by(tmp_path, monkeypatch):
+    src = tmp_path / "contract.pdf"
+    make_pdf(src)
+    tried, link = [], os.link
+
+    def taken_first(a, b):
+        tried.append(b)
+        if len(tried) > 100:
+            raise RuntimeError("the same name tried again and again")
+        if b.endswith("contract-signed.pdf"):
+            raise FileExistsError(17, "File exists")  # appeared since output_path() looked (it stays unseen)
+        return link(a, b)
+    monkeypatch.setattr(os, "link", taken_first)
+    assert save_signed(str(src), {0: [blob(100, 100)]}) == str(tmp_path / "contract-signed-2.pdf")
+
+
 def test_text_kept_and_marks_added(tmp_path):
     src = tmp_path / "doc.pdf"
     make_pdf(src)

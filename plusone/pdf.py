@@ -174,11 +174,12 @@ def display_to_user(page):
     return (1, 0, 0, 1, x0, y0)
 
 
-def output_path(src):
-    """name-signed.pdf next to src, never an existing file."""
+def output_path(src, taken=()):
+    """name-signed.pdf next to src, never an existing file (a link to none
+    is one) nor one of taken."""
     base, ext = os.path.splitext(src)
     candidate, n = f"{base}-signed{ext or '.pdf'}", 2
-    while os.path.exists(candidate):
+    while os.path.lexists(candidate) or candidate in taken:
         candidate, n = f"{base}-signed-{n}{ext or '.pdf'}", n + 1
     return candidate
 
@@ -330,14 +331,15 @@ def save_signed(src, marks_by_page, dst=None, like=None):
             os.replace(tmp, dst)
             return dst
         # A name nobody took: link() fails rather than replace what appeared
-        # since output_path() looked.
+        # since output_path() looked, and the next one is tried.
+        taken = set()
         while True:
-            dst = output_path(like)
+            dst = output_path(like, taken)
             try:
                 os.link(tmp, dst)
                 break
             except FileExistsError:
-                continue
+                taken.add(dst)
             except OSError:
                 os.replace(tmp, dst)  # no hard links there (some mounts): as before
                 return dst
