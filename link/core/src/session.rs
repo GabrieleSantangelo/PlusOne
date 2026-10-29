@@ -33,7 +33,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// A ping each this long, on the stream and over UDP.
@@ -105,9 +105,6 @@ const REALTIME_GOING: Duration = Duration::from_millis(500);
 /// The path's pings this often while realtime and bulk go together
 /// (pace.rs's samples), not each PING_EVERY.
 const PROBE_BUSY: Duration = Duration::from_millis(40);
-/// How often a control message waiting for room looks again: only while
-/// a transfer is ahead of the path.
-const ROOM_POLL: Duration = Duration::from_millis(2);
 /// Reliable frames taken since the last ping that make one go at once.
 const ACK_AFTER: u64 = 32;
 /// Reliable bytes sent and not yet acknowledged, at most: past it no more
@@ -198,12 +195,14 @@ struct End {
     fd: OwnedFd,
     /// Input: the newest datagram's counter handed on, plus one (0: none).
     newest: AtomicU64,
-    /// Closed: a pump waiting for credit gives up.
+    /// Closed: a pump waiting for credit gives up (End::gone).
     gone: AtomicBool,
     /// Flow (control, with a peer that has it): bytes sent on it, and the
-    /// other side's running total taken by its feature.
+    /// other side's running total taken by its feature; a pump waiting for
+    /// credit sleeps on credit until that moves, or the channel goes.
     sent: AtomicU64,
-    granted: AtomicU64,
+    granted: Mutex<u64>,
+    credit: Condvar,
     /// Flow: what comes for it, to its feature in order on a thread of its
     /// own (None: the channel's end, after what came before it); bytes
     /// come, and taken by the feature.
@@ -215,8 +214,16 @@ struct End {
 impl End {
     fn new(id: u16, class: Class, fd: OwnedFd) -> End {
         End { id, class, fd, newest: AtomicU64::new(0), gone: AtomicBool::new(false), sent: AtomicU64::new(0),
-              granted: AtomicU64::new(0), inbox: Mutex::new(None), received: AtomicU64::new(0),
+              granted: Mutex::new(0), credit: Condvar::new(), inbox: Mutex::new(None), received: AtomicU64::new(0),
               taken: AtomicU64::new(0) }
+    }
+
+    /// Closed (by either side, or with the session): its pump, if it waits
+    /// for credit, gives up.
+    fn gone(&self) {
+        self.gone.store(true, Ordering::Relaxed);
+        let _granted = self.granted.lock().unwrap();
+        self.credit.notify_all();
     }
 }
 
@@ -264,6 +271,9 @@ struct Outbox {
     /// The channel whose turn comes next.
     turn: u16,
     reliable_bytes: usize,
+    /// A channel's queue went under CONTROL_BACKLOG since the last look:
+    /// its pump may wait for that (Session::room).
+    made_room: bool,
 }
 
 impl Outbox {
@@ -307,6 +317,7 @@ impl Outbox {
         let id = self.channels.range(self.turn..).chain(self.channels.range(..self.turn)).map(|(id, _)| *id).next()?;
         let (frames, bytes) = self.channels.get_mut(&id)?;
         let waiting = frames.pop_front()?;
+        self.made_room |= *bytes > CONTROL_BACKLOG && *bytes - waiting.size() <= CONTROL_BACKLOG;
         *bytes -= waiting.size();
         if frames.is_empty() {
             self.channels.remove(&id);
@@ -424,6 +435,9 @@ pub struct Session {
     /// How much urgent may wait on the stream before realtime is dropped.
     stream_budget: std::sync::atomic::AtomicUsize,
     outbox: Mutex<Outbox>,
+    /// A channel's queue under CONTROL_BACKLOG again, or the session over:
+    /// a pump waiting for room (on the outbox's lock) goes on.
+    room: Condvar,
     reliable: Mutex<Reliable>,
     wake: Wake,
     path: Mutex<Option<Arc<Path>>>,
@@ -642,6 +656,7 @@ impl Session {
             pace: Mutex::new(crate::pace::Pace::new(Instant::now())),
             stream_budget: std::sync::atomic::AtomicUsize::new(STREAM_BUDGET),
             outbox: Mutex::default(),
+            room: Condvar::new(),
             reliable: Mutex::new(Reliable { next: 1, ..Default::default() }),
             wake: Wake::new()?,
             path: Mutex::default(),
@@ -793,7 +808,11 @@ impl Session {
             // wait for it for ever (and keep its socket).
             end.inbox.lock().unwrap().take();
             sys::shutdown(end.fd.as_raw_fd());
+            end.gone();
         }
+        // Under the outbox's lock: a pump looks at closed under it, then waits.
+        drop(self.outbox.lock().unwrap());
+        self.room.notify_all();
         if let Some(node) = self.node.upgrade() {
             node.gone(self, reason);
         }
@@ -923,18 +942,19 @@ impl Session {
 
     /// Until the other side's window has room for length more bytes on
     /// end (then counted as sent); false if the channel or the session is
-    /// over meanwhile.
+    /// over meanwhile. Asleep until a credit comes or the channel goes.
     fn wait_for_credit(&self, end: &End, length: u64) -> bool {
+        let mut granted = end.granted.lock().unwrap();
         loop {
             if self.is_closed() || end.gone.load(Ordering::Relaxed) {
                 return false;
             }
             let sent = end.sent.load(Ordering::Relaxed);
-            if sent.saturating_add(length) <= end.granted.load(Ordering::Relaxed).saturating_add(WINDOW) {
+            if sent.saturating_add(length) <= granted.saturating_add(WINDOW) {
                 end.sent.store(sent + length, Ordering::Relaxed);
                 return true;
             }
-            std::thread::sleep(ROOM_POLL);
+            granted = end.credit.wait(granted).unwrap();
         }
     }
 
@@ -967,16 +987,17 @@ impl Session {
 
     /// Until the channel's own queue is under CONTROL_BACKLOG, or the
     /// session is over (the channels go in turn: one's backlog holds up no
-    /// other).
+    /// other). Asleep until the session's thread takes it under (room).
     fn wait_for_room(&self, id: u16) {
-        while !self.is_closed() && self.outbox.lock().unwrap().channel_len(id) > CONTROL_BACKLOG {
-            std::thread::sleep(ROOM_POLL);
+        let mut outbox = self.outbox.lock().unwrap();
+        while !self.is_closed() && outbox.channel_len(id) > CONTROL_BACKLOG {
+            outbox = self.room.wait(outbox).unwrap();
         }
     }
 
     fn close_channel(&self, id: u16, tell: bool) {
         let Some(end) = self.channels.lock().unwrap().remove(&id) else { return };
-        end.gone.store(true, Ordering::Relaxed);
+        end.gone();
         match end.inbox.lock().unwrap().take() {
             // Closed by the other side: what it sent before goes to the feature first.
             Some(inbox) if !tell => {
@@ -1289,7 +1310,14 @@ impl Session {
                     let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
                     if room && pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
                 };
-                let (mut out, fresh, taken) = self.outbox.lock().unwrap().take(reliable);
+                let (mut out, fresh, taken, made_room) = {
+                    let mut outbox = self.outbox.lock().unwrap();
+                    let (out, fresh, taken) = outbox.take(reliable);
+                    (out, fresh, taken, std::mem::take(&mut outbox.made_room))
+                };
+                if made_room {
+                    self.room.notify_all();
+                }
                 if !fresh.is_empty() {
                     self.number(fresh, &mut out);
                 }
@@ -1473,8 +1501,11 @@ impl Session {
             "bye" => self.end("closed by the other side"),
             "features" => *self.features.lock().unwrap() = message["features"].clone(),
             "credit" => {
-                if let (Some(end), Some(taken)) = (self.channels.lock().unwrap().get(&id), message["taken"].as_u64()) {
-                    end.granted.fetch_max(taken, Ordering::Relaxed);
+                let end = self.channels.lock().unwrap().get(&id).cloned();
+                if let (Some(end), Some(taken)) = (end, message["taken"].as_u64()) {
+                    let mut granted = end.granted.lock().unwrap();
+                    *granted = (*granted).max(taken);
+                    end.credit.notify_all();
                 }
             }
             other => log!("{}: a message of type {other:?}", self.label()),
