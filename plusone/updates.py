@@ -106,9 +106,16 @@ def app_apk(version, folder, get=_get):
 
 
 class TabletUpdates:
-    """The tablet in use's app brought to this PC's version, when it is on the
-    network, older, and nothing is in use. app: the application (its
-    settings, tablets, nearby, busy() and notify())."""
+    """The tablet in use's app brought to this PC's version, when it is older
+    and nothing is in use. Its version: where it is announced on the network
+    (an app from before tags says it), else plus-one-link's, while it has a
+    session with the tablet. An app idle on the network that says none is
+    not woken for it: it is updated at its next session (the desktop, the
+    speakers, a PDF to sign), once nothing is in use while it lasts, or by
+    one that comes up with nothing in use (the cable plugged in). check()
+    runs then: as a session comes or goes, and as what was in use ends.
+    app: the application (its settings, tablets, discovery, busy() and
+    notify())."""
 
     def __init__(self, app, folder=None, fetch=app_apk, send=update_app):
         self.app = app

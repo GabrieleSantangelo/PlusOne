@@ -248,6 +248,7 @@ class Signing:
         except OSError:
             pass
         self.app.release()
+        self.app.signing_changed()  # its session's use over: the tablet's update may come now
 
     def _answer(self, path, token, sent, result, error):
         """What the tablet's app answered for one PDF: True while its signed
@@ -384,6 +385,7 @@ class Signing:
     def _done(self, window, path, result):
         if window in self.windows:
             self.windows.remove(window)
+            self.app.signing_changed()
         if result:
             from .pdf import digitally_signed
             self._read(lambda: digitally_signed(path), lambda certified: self._signed(result, bool(certified)))

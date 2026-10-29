@@ -203,3 +203,43 @@ def test_off_there_is_not_asked_again(monkeypatch):
     tablet.tried.clear()  # long after
     tablet.check()
     assert len(sent) == 1
+
+
+def test_a_tagged_app_is_updated_at_its_next_session(monkeypatch):
+    # Its record says no version (tagged): nothing woken for it while it is
+    # idle on the network. A session coming up with nothing in use, or what
+    # used one ending while it lasts, is when plus-one-link tells the
+    # version, and the update goes.
+    from gi.repository import GLib
+    from plusone import app as plus_one
+    code, session, busy, sent = updates.version_code(__version__), [], [False], []
+    monkeypatch.setattr(updates.channels, "app_version", lambda app_id: code - 1 if session else None)
+    app = App(0)
+    app.busy = lambda: busy[0]
+    app.tablet_updates = updates.TabletUpdates(app, folder="/nowhere", fetch=lambda version, folder: "/nowhere/app",
+                                               send=lambda targets, app_id, apk, version: sent.append(app_id))
+    app.self_update = types.SimpleNamespace(when_idle=lambda: None)
+    app.started, app.devices, app.listeners = True, types.SimpleNamespace(apply=lambda: None), []
+    app._emit_properties, app._idle = (lambda: None), (lambda: plus_one.PlusOneApp._idle(app))
+
+    def settled():
+        for _ in range(3):
+            while app.tablet_updates.working or GLib.MainContext.default().pending():
+                GLib.MainContext.default().iteration(True)
+    app.tablet_updates.check()  # on the network, idle: plus-one-link has no session to say it
+    settled()
+    assert sent == []
+    session.append(1)
+    plus_one.PlusOneApp._path_changed(app)  # a session up with nothing in use (the cable plugged in)
+    settled()
+    assert sent == ["00ff"]
+    sent.clear()
+    app.tablet_updates.tried.clear()  # (long after)
+    busy[0] = True  # the desktop, say: its session coming up meanwhile
+    plus_one.PlusOneApp._path_changed(app)
+    settled()
+    assert sent == []  # not while it is in use
+    busy[0] = False
+    plus_one.PlusOneApp.signing_changed(app)  # what used it ended (as _on_state's, devices_changed's)
+    settled()
+    assert sent == ["00ff"]

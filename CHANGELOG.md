@@ -131,6 +131,12 @@
   part of the page twice, once for the small picture of the whole page
   that stands in for parts not yet drawn at the current zoom, shown or
   not. It is brought up to date only when it shows now.
+- **The tablet's app updated at its next session**: an app idle on the
+  network is not woken for its update (no radio for it meanwhile): it
+  takes it at its next session, once nothing is in use. After a PDF
+  signed on the tablet, or with the cable plugged in and nothing in use,
+  that moment went by unnoticed, and the update waited for the desktop
+  or the speakers; it no longer does.
 - **Fewer stutters when the network slows down**: each change of the
   desktop's bitrate made Intel's hardware encoder start over with a
   keyframe, a burst four frames big, just when the network took less, and

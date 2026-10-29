@@ -466,11 +466,14 @@ class PlusOneApp(Adw.Application):
             threading.Thread(target=tell, daemon=True).start()
 
     def _path_changed(self):
-        # The speakers come and go with the tablet's session too (the cable's);
-        # not from a second Plus One of a moment (Sign with Plus One): the
+        # The speakers come and go with the tablet's session too (the cable's),
+        # and one up with nothing in use may take the tablet's update; not
+        # from a second Plus One of a moment (Sign with Plus One): the
         # first's are the speakers.
         if self.started:
             self.devices.apply()
+            if not self.busy():
+                self._idle()
         self._emit_properties()
         for listener in list(self.listeners):
             listener()
@@ -491,6 +494,12 @@ class PlusOneApp(Adw.Application):
         return bool(self.controller.running or signing.windows or signing.in_app or signing.reading
                     or any(getattr(self.devices, kind).state == "in use"
                            for kind in ("camera", "microphone", "speakers")))
+
+    def signing_changed(self):
+        """A PDF signed, or given up (signing.py): what waited for nothing
+        in use, if nothing is now."""
+        if not self.busy():
+            self._idle()
 
     def _idle(self):
         """What waited for nothing to be in use: updates, both sides."""

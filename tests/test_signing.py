@@ -78,13 +78,16 @@ class FakeApp:
     def save_settings(self):
         pass
 
-    held = 0
+    held = changed = 0
 
     def hold(self):
         self.held += 1
 
     def release(self):
         self.held -= 1
+
+    def signing_changed(self):
+        self.changed += 1
 
 
 class FakeWindow:
@@ -194,6 +197,7 @@ def test_the_tablets_app_signs_when_it_is_on_the_network(monkeypatch, tmp_path):
     assert stroke.points == [(10, 20, 0.5), (30, 40, 0.6)] and stroke.width == 1.2
     assert spin(lambda: path not in signing.in_app)
     assert spin(lambda: app.held == 0) and not (tmp_path / "sent").exists() or not list((tmp_path / "sent").iterdir())
+    assert app.changed == 1  # its use over: what waited for nothing in use (the tablet's update) is told
 
 
 def test_an_app_that_does_not_answer_offers_signing_here(monkeypatch, tmp_path):

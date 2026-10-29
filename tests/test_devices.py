@@ -460,7 +460,7 @@ def test_the_speakers_follow_the_tablets_session(monkeypatch):
     from plusone import app
     applied = []
     fake = types.SimpleNamespace(started=True, devices=types.SimpleNamespace(apply=lambda: applied.append(1)),
-                                 _emit_properties=lambda: None, listeners=[])
+                                 _emit_properties=lambda: None, listeners=[], busy=lambda: True)
     app.PlusOneApp._path_changed(fake)
     assert applied == [1]
     fake.started = False
