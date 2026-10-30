@@ -5,12 +5,24 @@
 //! order, on a QUIC stream of their own (groups.rs); anywhere else each goes
 //! as a Realtime message does (a datagram, or the stream's while UDP is not
 //! proven). The other side's feature reads them as it reads datagrams.
+//!
+//! A session keeps several paths (session.rs, MAX_PATHS): its groups go on
+//! the carrier's connection, and when the carrier changes, on the new one;
+//! each connection has its groups and its other side its order of them
+//! (groups.rs), so a frame on the new one may come before the last on the
+//! one before (the tablet takes a frame whole after a newer one for lost).
+//! The channel's group left open on the one before (the carrier changed in
+//! the middle of a frame) is reset there as the channel's first message
+//! goes elsewhere (Went): else its stream stayed open, and on the other side
+//! every newer stream of that connection waited behind it, until the
+//! channel came back to it or the connection ended.
 
-use super::{Channel, Session, MAX_DATAGRAM};
+use super::{Channel, Path, Session, MAX_DATAGRAM};
 use crate::sys;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 
 /// A Video message's head: its flags (IN_GROUP, LAST, KEY), then its group
 /// (u32, big-endian).
@@ -36,10 +48,31 @@ impl Channel {
     }
 }
 
+/// Where a Video channel's groups went last (its pump keeps it): the path,
+/// and the last group begun on its connection.
+#[derive(Default)]
+pub(super) struct Went(Option<(Weak<Path>, u32)>);
+
+impl Went {
+    /// The channel's groups going on path from now on (None: on none, as
+    /// Realtime): if they went on another before, that one's connection told
+    /// the channel left it (groups.rs Groups::leave), after all the channel
+    /// handed it.
+    pub(super) fn to(&mut self, channel: u16, path: Option<&Arc<Path>>) {
+        let elsewhere = |before: &Weak<Path>| path.is_none_or(|path| !std::ptr::eq(before.as_ptr(), Arc::as_ptr(path)));
+        let Some((before, group)) = self.0.take_if(|(before, _)| elsewhere(before)) else { return };
+        if let Some(quic) = before.upgrade().as_ref().and_then(|before| before.quic.as_ref()) {
+            quic.leave(channel, group);
+        }
+    }
+}
+
 impl Session {
     /// A Video channel's message, its head taken off: on its group's QUIC
-    /// stream if the path takes them, else as Realtime (send_datagram).
-    pub(super) fn send_grouped(&self, channel: u16, message: &[u8], sealed: &mut Vec<u8>) {
+    /// stream if the path takes them, else as Realtime (send_datagram);
+    /// went: where the channel's groups went last (the connection before
+    /// told, if they go elsewhere now).
+    pub(super) fn send_grouped(&self, channel: u16, message: &[u8], sealed: &mut Vec<u8>, went: &mut Went) {
         let Some((head, body)) = message.split_first_chunk::<HEAD>() else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -47,6 +80,7 @@ impl Session {
         let group = u32::from_be_bytes([head[1], head[2], head[3], head[4]]);
         let current = self.current();
         let path = current.as_ref().filter(|path| path.udp_works() && path.quic.as_ref().is_some_and(|q| q.groups()));
+        went.to(channel, path);
         match (path, head[0] & IN_GROUP != 0) {
             (Some(path), true) if body.len() <= MAX_DATAGRAM => {
                 path.realtime_us.store(path.us().max(1), Ordering::Relaxed);
@@ -55,6 +89,7 @@ impl Session {
                 if !quic.send_in_group(channel, group, head[0] & KEY != 0, head[0] & LAST != 0, sealed) {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
+                went.0 = Some((Arc::downgrade(path), group));
             }
             _ => self.send_datagram(channel, body, sealed),
         }

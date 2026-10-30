@@ -269,6 +269,14 @@ impl Quic {
         })
     }
 
+    /// channel's groups gone from this connection, group the last it began
+    /// here (groups.rs Groups::leave): its stream reset if not all written.
+    pub(crate) fn leave(&self, channel: u16, group: u32) {
+        if let Some(telling) = self.groups.leave(channel, group) {
+            runtime().spawn(telling);
+        }
+    }
+
     /// The groups so far, and the controller's losses and cuts.
     pub(crate) fn group_stats(&self) -> groups::Stats {
         let mut stats = self.groups.shared.stats();

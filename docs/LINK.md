@@ -56,7 +56,16 @@ the carrier going (the Wi-Fi gone, or silent 1.5 s) hands over to the
 best reserve at once, no detaching; a kind that failed or went silent
 carrying does not carry again for 60 s while another is left. Each side
 picks its carrier alone and reads every path. Each path's round trip is
-measured all along (its pings).
+measured all along (its pings). A Video channel's groups go on the
+carrier's QUIC connection, each connection with its own groups and its own
+order of them on the other side: a frame on the new carrier may come
+before the last ones on the one before (the tablet takes a frame whole
+after a newer one for lost). The group a carrier change left half sent is
+reset on the connection before as the channel's first message goes
+elsewhere (`session/grouped.rs` `Went`, `groups.rs` `Groups::leave`), and
+one all sent there is no longer its channel's newest (late once it has
+had its time): left open, the other side's newer streams there waited
+behind it until the channel came back or the connection ended.
 
 ## Discovery, with or without multicast
 

@@ -1312,6 +1312,125 @@ fn video_on_a_tcp_path_goes_as_realtime() {
     assert!(session.dropped() >= 1);
 }
 
+/// A UDP relay to address, both ways, until silenced (the switch): its
+/// address. It runs as long as the process.
+fn silenceable(address: SocketAddr) -> (SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let near = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let far = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    far.connect(address).unwrap();
+    let via = near.local_addr().unwrap();
+    let silent: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let from: Arc<std::sync::Mutex<Option<SocketAddr>>> = Arc::default();
+    let (back, answering, sender, quiet) = (near.try_clone().unwrap(), far.try_clone().unwrap(), from.clone(), silent.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok(n) = answering.recv(&mut buf) {
+            let to = *sender.lock().unwrap();
+            if let Some(to) = to.filter(|_| !quiet.load(Relaxed)) {
+                let _ = back.send_to(&buf[..n], to);
+            }
+        }
+    });
+    let quiet = silent.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, sender)) = near.recv_from(&mut buf) {
+            *from.lock().unwrap() = Some(sender);
+            if !quiet.load(Relaxed) {
+                let _ = far.send(&buf[..n]);
+            }
+        }
+    });
+    (via, silent)
+}
+
+/// pieces of a Video channel's frame (its number), each of 1000 bytes
+/// saying (frame, piece), the last of 10 the group's last.
+fn video_frame(video: &plusone_link::Channel, frame: u32, pieces: std::ops::Range<u16>) {
+    for piece in pieces {
+        let mut data = vec![0u8; 1000];
+        data[..4].copy_from_slice(&frame.to_be_bytes());
+        data[4..6].copy_from_slice(&piece.to_be_bytes());
+        video.send_in_group(frame, false, piece == 9, &data).unwrap();
+    }
+}
+
+/// What the tablet's echo sends back on a Video channel, (frame, piece)
+/// each, until nothing came for wait.
+fn video_echoed(video: &plusone_link::Channel, wait: Duration) -> Vec<(u32, u16)> {
+    let (mut buf, mut got) = (vec![0u8; 2048], Vec::new());
+    while let Ok(Some(n)) = video.recv(&mut buf, Some(wait)) {
+        assert_eq!(n, 1000, "a message not as it was written");
+        got.push((u32::from_be_bytes(buf[..4].try_into().unwrap()), u16::from_be_bytes(buf[4..6].try_into().unwrap())));
+    }
+    got
+}
+
+#[test]
+fn video_moved_to_another_path_mid_frame_leaves_no_group_open_on_the_one_before() {
+    // A Video channel on a QUIC path (lan): five frames, then half of the
+    // sixth; a better path (p2p, through a relay) the carrier; the sixth's
+    // other half and five more on it: all come, each frame's pieces in
+    // order on its path, the frames on p2p in order. The channel closed
+    // and p2p silenced: back on lan, where the group the move left half
+    // sent was reset (late, unsent) as the channel's first message went on
+    // p2p, and a new Video channel's first frame comes at once, not held up
+    // LATE behind that stream on the tablet. (It stayed open until the
+    // channel came back to lan or the connection ended, and each newer
+    // stream on lan waited for it there.)
+    let (pc, tablet, _address) = pair();
+    tablet.video_streams(true);
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let session = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
+    until("datagrams proven", || session.rtt().is_some());
+    let video = session.open("echo", "v1", Class::Video).unwrap();
+    for frame in 0..5 {
+        video_frame(&video, frame, 0..10);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    video_frame(&video, 5, 0..5);
+    let (via, silent) = silenceable(quic);
+    let by_p2p = pc.connect_quic(via, Duration::from_secs(2), "p2p").unwrap();
+    assert!(Arc::ptr_eq(&by_p2p, &session), "the same session, another path");
+    until("on p2p", || session.path().as_deref() == Some("p2p"));
+    video_frame(&video, 5, 5..10);
+    for frame in 6..11 {
+        std::thread::sleep(Duration::from_millis(5));
+        video_frame(&video, frame, 0..10);
+    }
+    let got = video_echoed(&video, Duration::from_secs(1));
+    for frame in 0..11u32 {
+        let pieces: Vec<u16> = got.iter().filter(|(f, _)| *f == frame).map(|(_, p)| *p).collect();
+        if frame == 5 {
+            let mut sorted = pieces.clone();
+            sorted.sort();
+            assert_eq!(sorted, (0..10).collect::<Vec<u16>>(), "frame 5 across the move: {pieces:?}");
+        } else {
+            assert_eq!(pieces, (0..10).collect::<Vec<u16>>(), "frame {frame}: {got:?}");
+        }
+    }
+    let on_p2p: Vec<u32> = got.iter().map(|(f, _)| *f).filter(|f| *f >= 6).collect();
+    assert!(on_p2p.windows(2).all(|w| w[0] <= w[1]), "frames on p2p out of order: {on_p2p:?}");
+    drop(video);
+    silent.store(true, std::sync::atomic::Ordering::Relaxed);
+    until("back on lan", || session.path().as_deref() == Some("lan"));
+    until("back on lan on the tablet",
+          || tablet.sessions().first().is_some_and(|theirs| theirs.path().as_deref() == Some("lan")));
+    let stats = session.group_stats().expect("a QUIC path");
+    assert!(stats.late_unsent >= 1 && stats.resets >= 1, "the group left half sent on lan not reset: {stats}");
+    let video = session.open("echo", "v2", Class::Video).unwrap();
+    let sent = Instant::now();
+    video_frame(&video, 0, 0..10);
+    let mut buf = vec![0u8; 2048];
+    for piece in 0..10 {
+        let n = video.recv(&mut buf, WAIT).unwrap().unwrap_or_else(|| panic!("piece {piece} of v2's first frame lost"));
+        assert_eq!(n, 1000);
+    }
+    let took = sent.elapsed();
+    assert!(took < Duration::from_millis(90), "v2's first frame on lan held up {took:?}: a stream left open before it");
+}
+
 /// A UDP relay to address: towards it at rate bytes a second, queue's
 /// worth of packets waiting at most (the rest dropped, as a router's), back
 /// as they come. Its address; it runs as long as the process.

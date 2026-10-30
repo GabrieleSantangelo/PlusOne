@@ -43,6 +43,14 @@
 //! what still comes on them is dropped; so too past HELD_MOST bytes waiting.
 //! Each side says its groups' counts once a second while they go (Seconds).
 //!
+//! A session with several paths sends its groups on the carrier's connection
+//! (session/grouped.rs): a channel that goes to another connection tells the
+//! one before (Groups::leave, after all it handed it), where its group left
+//! half written is reset (counted late, unsent), and one all written is no
+//! longer its newest (late once it has had its time). Else that stream stayed
+//! open, and on the other side every newer stream of the connection waited
+//! behind it (LATE, then given up), until the channel came back.
+//!
 //! Beside them, a stream of the session's own messages, copies of those it
 //! numbers (open, accept, credit...: session.rs early), ahead of all
 //! (CONTROL); its first bytes are CONTROL_MARK, which no group's can be.
@@ -231,13 +239,16 @@ impl<T: Copy + PartialEq> Seconds<T> {
 }
 
 /// A message handed over: its channel, its group, whether it is the last
-/// and its group a key one, it sealed and after its length.
+/// and its group a key one, it sealed and after its length. Or, left: the
+/// channel gone from the connection, group the last it began here
+/// (Groups::leave; no message).
 pub(crate) struct Piece {
     channel: u16,
     group: u32,
     last: bool,
     key: bool,
     framed: Bytes,
+    left: bool,
 }
 
 /// A connection's groups: the writer (started with the first), the
@@ -272,6 +283,10 @@ struct Begun {
     /// first (bytes a second; 0: none known yet).
     bytes: u64,
     rate: u64,
+    /// Its channel went to another connection while it was the newest
+    /// (Shared::leave): late once it has had its time, as if a newer one
+    /// began here.
+    left: bool,
 }
 
 /// Why a group is over.
@@ -310,16 +325,16 @@ fn deadline(b: &Begun, rtt: Duration) -> std::time::Instant {
 
 /// Until when a channel's group lasts, among its groups as they began (the
 /// newest last): Ok(None) while it is the newest, Ok(its deadline()) once a
-/// newer one began, or why it is over already (a newer key group began;
-/// long gone from them). rate: the controller's now (each group keeps the
-/// lowest since it was written).
+/// newer one began (or its channel left the connection), or why it is over
+/// already (a newer key group began; long gone from them). rate: the
+/// controller's now (each group keeps the lowest since it was written).
 fn lasts_in(groups: &mut VecDeque<Begun>, group: u32, rate: u64, rtt: Duration)
             -> Result<Option<std::time::Instant>, Over> {
     let Some(i) = groups.iter().rposition(|b| b.group == group) else { return Err(Over::Late) };
     if groups.iter().skip(i + 1).any(|b| b.key) {
         return Err(Over::Superseded);
     }
-    let newest = i + 1 == groups.len();
+    let newest = i + 1 == groups.len() && !groups[i].left;
     let b = &mut groups[i];
     if b.written.is_some() && rate > 0 {
         b.rate = if b.rate == 0 { rate } else { b.rate.min(rate) };
@@ -439,7 +454,8 @@ impl Shared {
             if groups.back().is_some_and(|b| b.group == group) {
                 return;
             }
-            groups.push_back(Begun { group, key, handed: std::time::Instant::now(), written: None, bytes: 0, rate: 0 });
+            groups.push_back(Begun { group, key, handed: std::time::Instant::now(), written: None, bytes: 0, rate: 0,
+                                     left: false });
             if groups.len() > HISTORY {
                 groups.pop_front();
             }
@@ -469,6 +485,19 @@ impl Shared {
         let mut begun = self.begun.lock().unwrap();
         let Some(groups) = begun.get_mut(&channel) else { return Ok(None) };
         lasts_in(groups, group, rate, rtt).map(|until| until.map(Instant::from_std))
+    }
+
+    /// channel gone from the connection, group the last it began here: that
+    /// group, if still its newest here, no longer is (Begun::left); its
+    /// end looked at again.
+    fn leave(&self, channel: u16, group: u32) {
+        {
+            let mut begun = self.begun.lock().unwrap();
+            let newest = begun.get_mut(&channel).and_then(|groups| groups.back_mut()).filter(|b| b.group == group);
+            let Some(newest) = newest else { return };
+            newest.left = true;
+        }
+        self.began.notify_waiters();
     }
 
     /// A group over, its stream (if any) reset: counted (unsent: before all
@@ -546,7 +575,7 @@ impl Groups {
         let length = framed.len() as u64;
         self.shared.queued.fetch_add(length, Ordering::Relaxed);
         self.shared.handed.fetch_add(length, Ordering::Relaxed);
-        if writer.try_send(Piece { channel, group, last, key, framed: framed.into() }).is_err() {
+        if writer.try_send(Piece { channel, group, last, key, framed: framed.into(), left: false }).is_err() {
             self.shared.queued.fetch_sub(length, Ordering::Relaxed);
             self.shared.count.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -557,6 +586,25 @@ impl Groups {
     /// Bytes handed over and not written yet.
     pub(crate) fn queued(&self) -> usize {
         self.shared.queued.load(Ordering::Relaxed) as usize
+    }
+
+    /// channel's groups gone to another connection (the session's carrier
+    /// changed under it, or the channel closed), group the last it began
+    /// here: told the writer after what was handed over before (write()).
+    /// If its queue is full, the future that tells it (on the connection's
+    /// runtime: the caller is not held up).
+    pub(crate) fn leave(&self, channel: u16, group: u32) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let writer = self.writer.get()?;
+        let left = Piece { channel, group, last: false, key: false, framed: Bytes::new(), left: true };
+        match writer.try_send(left) {
+            Err(mpsc::error::TrySendError::Full(left)) => {
+                let writer = writer.clone();
+                Some(async move {
+                    let _ = writer.send(left).await;
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -634,6 +682,20 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
         }
         let Some(piece) = piece else { continue };
         let (channel, group) = (piece.channel, piece.group);
+        if piece.left {
+            // The channel gone elsewhere: its group here, if this one is
+            // still the channel's last, reset if not all written (its
+            // stream would stay open, the other side's newer streams
+            // waiting behind it there, its bytes held here, until the
+            // channel came back or the connection ended); if all written
+            // (finished), late once it has had its time, not kept the
+            // newest.
+            if let Some(w) = writing.get_mut(&channel).filter(|w| w.group == group) {
+                w.over(Over::Late, &shared);
+            }
+            shared.leave(channel, group);
+            continue;
+        }
         let length = piece.framed.len() as u64;
         shared.queued.fetch_sub(length, Ordering::Relaxed);
         if writing.get(&channel).is_none_or(|w| w.group != group) {
@@ -1231,7 +1293,7 @@ mod tests {
     }
 
     fn begun(key: bool, handed: At, written: Option<(At, u64, u64)>, bytes: u64, rate: u64) -> Begun {
-        Begun { group: 1, key, handed, written, bytes, rate }
+        Begun { group: 1, key, handed, written, bytes, rate, left: false }
     }
 
     #[test]
@@ -1276,6 +1338,12 @@ mod tests {
         assert_eq!(lasts_in(&mut groups, 0, 3_000_000, rtt), Err(Over::Late));
         groups.push_back(Begun { group: 3, ..begun(true, t, None, 0, 0) });
         assert_eq!(lasts_in(&mut groups, 1, 3_000_000, rtt), Err(Over::Superseded));
+        // The newest, its channel gone to another connection: it has its
+        // time as if a newer one began.
+        let mut groups: VecDeque<Begun> = [begun(false, t, Some((t, 0, 0)), 20_000, 3_000_000)].into();
+        assert_eq!(lasts_in(&mut groups, 1, 3_000_000, rtt), Ok(None));
+        groups[0].left = true;
+        assert!(near(lasts_in(&mut groups, 1, 3_000_000, rtt).unwrap().unwrap(), t + LATE));
     }
 
     #[test]

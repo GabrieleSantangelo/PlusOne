@@ -1549,6 +1549,7 @@ impl Session {
             // A control message numbered (8 bytes more) is still a frame.
             let mut buf = vec![0u8; if end.class == Class::Control { frame::MAX - 8 } else { 64 << 10 }];
             let mut sealed = Vec::with_capacity(2048);
+            let mut went = grouped::Went::default();
             loop {
                 let length = match sys::recv(end.fd.as_raw_fd(), &mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1569,10 +1570,11 @@ impl Session {
                         me.wait_for_room(end.id);
                         me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
                     }
-                    Class::Video => me.send_grouped(end.id, &buf[..length], &mut sealed),
+                    Class::Video => me.send_grouped(end.id, &buf[..length], &mut sealed, &mut went),
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
                 }
             }
+            went.to(end.id, None);  // its group left open, if any, reset
             me.close_channel(end.id, true);
         });
         if spawned.is_err() {
