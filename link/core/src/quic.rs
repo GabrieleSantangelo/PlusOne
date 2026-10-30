@@ -371,8 +371,13 @@ pub(crate) fn endpoint(address: SocketAddr, server: Option<&Arc<rustls::ServerCo
     config.cid_generator(move || Box::new(MacCids(key.clone())));
     let _entered = runtime().enter();
     let marking = Arc::new(Marking::new());
-    let socket = Arc::new(crate::dscp::Socket::new(socket, marking.clone())?);
-    let quinn = quinn::Endpoint::new_with_abstract_socket(config, server, socket, Arc::new(quinn::TokioRuntime))?;
+    let quinn = if crate::dscp::on() {
+        let socket = Arc::new(crate::dscp::Socket::new(socket, marking.clone())?);
+        quinn::Endpoint::new_with_abstract_socket(config, server, socket, Arc::new(quinn::TokioRuntime))?
+    } else {
+        // quinn's own socket, as before dscp.rs: every packet DSCP 0.
+        quinn::Endpoint::new(config, server, socket, Arc::new(quinn::TokioRuntime))?
+    };
     Ok(Endpoint { quinn, marking })
 }
 

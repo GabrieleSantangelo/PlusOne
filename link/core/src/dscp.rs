@@ -56,6 +56,21 @@ const CONTROL: usize = 128;
 /// most (quinn-udp's interval).
 const LOG_EVERY: Duration = Duration::from_secs(60);
 
+/// QUIC's endpoints on this socket (quic.rs endpoint): on unless
+/// PLUSONE_LINK_DSCP=0 (a live A/B against the way before it, with no
+/// build: quinn's own socket, every QUIC packet DSCP 0). Read once; the
+/// raw UDP path's datagrams stay AF41 either way, as before.
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("PLUSONE_LINK_DSCP").map_or(true, |v| v.trim() != "0");
+        if !on {
+            log!("QUIC unmarked (PLUSONE_LINK_DSCP=0): quinn's own socket, every packet DSCP 0, as before");
+        }
+        on
+    })
+}
+
 /// Whether an endpoint's packets go as video now: realtime went within
 /// MARKED_FOR. Atomics alone, and nothing runs while idle: each send reads
 /// the time of realtime's last datagram.

@@ -314,6 +314,12 @@ the transport takes no unidirectional streams; logged once ("video
 streams off"). The desktop's frames go in groups only once Plus One opens
 its channel as Video and writes each packet's group head.
 
+`PLUSONE_LINK_DSCP=0` (the process's; on by default) leaves QUIC's
+packets unmarked, as before `dscp.rs`: the endpoint on quinn's own socket,
+every packet DSCP 0 (the raw UDP path's datagrams stay AF41, as they
+always were); logged once ("QUIC unmarked"). It holds for the side whose
+process has it: the tablet's app marks its own either way.
+
 ## Measured
 
 ### The emulated grid, the reference
