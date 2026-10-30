@@ -40,7 +40,9 @@ for test in tests:
             if not values:
                 pair.append("-")
                 continue
-            worse_high = key.startswith("p") or key in ("gap", "failed", "dropped")
+            worse_high = key.startswith("p") or key in (
+                "gap", "failed", "dropped", "frozen", "lost", "keyframes", "asks", "answered", "held", "changes",
+                "skipped", "queue", "budget", "forkey", "unsent", "late")
             worst = max(values) if worse_high else min(values)
             pair.append(f"{statistics.median(values):g} ({worst:g})" if len(values) > 1 else f"{values[0]:g}")
         cells.append(f"{key} {pair[0]} / {pair[1]}")

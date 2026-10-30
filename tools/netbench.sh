@@ -14,6 +14,10 @@
 # (else 0.85 of the session's rate on QUIC, 2 Mbit/s on TCP).
 # NETBENCH_NAME (po): the containers' and their network's names, for two
 # benches side by side (two builds compared under the same load).
+# NETBENCH_ARGS: more of pathbench's arguments ("--chain 30": the desktop's
+# chain after a cut only, before and after l36, 30 s each, on QUIC; and
+# "--variant h500:hold=500 --variant old:l36=0 ...": those ways instead, as
+# appdisplay.py's PLUSONE_L36 knobs, in an order turned each run).
 set -e
 cd "$(dirname "$0")/.."
 name=${NETBENCH_NAME:-po}
@@ -77,6 +81,7 @@ for run in $(seq "$runs"); do
         echo "== $profile run $run $transport"
         docker run --rm --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" plus-one-netbench \
             sh -c "$shape && $cross_pc /b/pathbench --cert /w/pc/cert.pem --key /w/pc/key.pem --trust $(cat "$work/tablet/fp") \
-            --tablet $ip:47101 --seconds $seconds --opens $opens $flag ${video:+--video $video}" || echo "test=failed"
+            --tablet $ip:47101 --seconds $seconds --opens $opens $flag ${video:+--video $video} ${NETBENCH_ARGS:-}" \
+            || echo "test=failed"
     done
 done

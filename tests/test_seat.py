@@ -163,7 +163,8 @@ def listen(streamer, bodies):
 
 def test_locked_the_tablet_s_input_is_dropped_and_what_touches_let_go():
     touch = bytes([appdisplay.INPUT, 0, 0])
-    streamer = types.SimpleNamespace(input=FakeInput(), gated=False, active=True, _let_go=False)
+    streamer = types.SimpleNamespace(input=FakeInput(), gated=False, active=True, _let_go=False,
+                                     _tick=lambda: None)
     listen(streamer, [touch])
     assert streamer.input.packets == [touch] and streamer.input.let_goes == 0
     streamer.gated = True
@@ -216,7 +217,7 @@ def test_the_pen_stays_while_paused_or_locked_and_goes_with_another_user_in_fron
         return types.SimpleNamespace(report=lambda report: None, close=lambda: closed.append(1))
     touch = appdisplay.Input(types.SimpleNamespace(), (1000, 1000), make_pen)
     streamer = types.SimpleNamespace(input=touch, gated=False, active=True, _let_go=False, shown=True, _frame=1,
-                                     _state_lock=threading.Lock(), _capture=lambda: None,
+                                     _state_lock=threading.Lock(), _capture=lambda: None, _tick=lambda: None,
                                      force_keyframe=lambda: None, on_visible=lambda shown: None)
     near = bytes([appdisplay.INPUT, 0, 1, appdisplay.pen.IN_RANGE]) + bytes(8)
 

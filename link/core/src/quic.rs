@@ -19,12 +19,13 @@ use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, Endpo
 use crate::cc::{Budget, GccConfig};
 use crate::dscp::Marking;
 use crate::gate::Gate;
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 /// ALPN: no other QUIC service taken for ours, nor ours for one.
@@ -118,22 +119,75 @@ pub struct Quic {
     marking: Arc<Marking>,
 }
 
+/// Why a realtime datagram did not go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unsent {
+    /// It would have waited longer than LATE for the window.
+    Late,
+    /// quinn had no room for it, or would not take it.
+    NoRoom,
+}
+
+/// Realtime a session dropped on its QUIC paths, said once a second at
+/// most (the live tests set them against the desktop's frames): datagrams
+/// late, those quinn had no room for, and the runs they came in (a run:
+/// one channel's datagrams dropped one after the other, a frame's tail or
+/// frames: the frames hit, roughly).
+#[derive(Debug, Default)]
+pub(crate) struct Drops {
+    since: Option<Instant>,
+    late: u64,
+    room: u64,
+    runs: u64,
+    /// Each channel's last datagram: dropped or not.
+    dropping: HashMap<u16, bool>,
+}
+
+impl Drops {
+    /// A datagram on channel, sent (None) or not (why); the last second's
+    /// line, once it is over and if anything was dropped in it.
+    pub(crate) fn note(&mut self, channel: u16, unsent: Option<Unsent>, now: Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        match unsent {
+            Some(why) => {
+                if why == Unsent::Late { self.late += 1 } else { self.room += 1 }
+                if !self.dropping.insert(channel, true).unwrap_or(false) {
+                    self.runs += 1;
+                }
+            }
+            None => {
+                self.dropping.insert(channel, false);
+            }
+        }
+        let over = now.duration_since(since);
+        if over < Duration::from_secs(1) {
+            return None;
+        }
+        let line = (self.late + self.room > 0).then(|| {
+            format!("realtime dropped over {:.1} s: {} late, {} for room, in {} runs", over.as_secs_f64(),
+                    self.late, self.room, self.runs)
+        });
+        (self.since, self.late, self.room, self.runs) = (Some(now), 0, 0, 0);
+        line
+    }
+}
+
 impl Quic {
     /// A sealed datagram out, unless it would wait longer than LATE for the
-    /// window or does not fit: false if dropped.
-    pub(crate) fn send(&self, sealed: &[u8]) -> bool {
+    /// window or does not fit.
+    pub(crate) fn send(&self, sealed: &[u8]) -> Result<(), Unsent> {
         let rate = self.cc.rate.load(Ordering::Relaxed);
         let room = self.conn.datagram_send_buffer_space();
+        if rate > 0 && self.idle.saturating_sub(room) as f64 > rate as f64 * LATE.as_secs_f64() {
+            return Err(Unsent::Late);
+        }
         // Nor past quinn's room: it would drop the oldest to make some,
         // unseen (over about 42 Mbit/s, LATE's worth is more than it holds).
-        if rate > 0 && self.idle.saturating_sub(room) as f64 > rate as f64 * LATE.as_secs_f64() || sealed.len() > room {
-            return false;
+        if sealed.len() > room || self.conn.send_datagram(Bytes::copy_from_slice(sealed)).is_err() {
+            return Err(Unsent::NoRoom);
         }
-        let sent = self.conn.send_datagram(Bytes::copy_from_slice(sealed)).is_ok();
-        if sent {
-            self.realtime.fetch_add(sealed.len() as u64, Ordering::Relaxed);
-        }
-        sent
+        self.realtime.fetch_add(sealed.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Realtime went on it now, either way (input too): the endpoint's
@@ -455,6 +509,26 @@ mod tests {
             let _ = paths.lock().unwrap().send((stream, quic));
         });
         (tablet, address, came)
+    }
+
+    #[test]
+    fn realtime_dropped_is_said_once_a_second_with_its_runs() {
+        let (mut drops, start) = (Drops::default(), Instant::now());
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(drops.note(3, None, at(0)), None);
+        // A frame's tail late, the sound beside it sent, then a whole frame late.
+        for (ms, channel, unsent) in [(10, 3, Some(Unsent::Late)), (11, 3, Some(Unsent::Late)), (12, 5, None),
+                                      (13, 3, Some(Unsent::Late)), (30, 3, None), (40, 3, Some(Unsent::NoRoom)),
+                                      (41, 3, Some(Unsent::Late))] {
+            assert_eq!(drops.note(channel, unsent, at(ms)), None);
+        }
+        assert_eq!(drops.note(5, None, at(1000)).as_deref(),
+                   Some("realtime dropped over 1.0 s: 4 late, 1 for room, in 2 runs"));
+        // A second with nothing dropped: nothing said.
+        assert_eq!(drops.note(3, None, at(1500)), None);
+        assert_eq!(drops.note(3, None, at(2100)), None);
+        assert_eq!(drops.note(3, Some(Unsent::Late), at(2200)), None);
+        assert!(drops.note(3, None, at(3200)).unwrap().contains(": 1 late, 0 for room, in 1 runs"));
     }
 
     #[test]

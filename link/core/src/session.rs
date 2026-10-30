@@ -683,6 +683,8 @@ pub struct Session {
     sealer: Sealer,
     opener: Mutex<Opener>,
     dropped: AtomicU64,
+    /// Realtime its QUIC paths dropped, said once a second at most.
+    drops: Mutex<crate::quic::Drops>,
 }
 
 /// What a connection's TLS handshake and hellos left: a new session
@@ -941,6 +943,7 @@ impl Session {
             sealer: std::mem::replace(&mut established.sealer, Sealer::new(&[0; 32], 0)),
             opener: Mutex::new(std::mem::replace(&mut established.opener, Opener::new(&[0; 32], 0))),
             dropped: AtomicU64::new(0),
+            drops: Mutex::default(),
         });
         // Its first path ready before anyone sees the session.
         let path = prepare(&mut established, session.next_path.fetch_add(1, Ordering::Relaxed))?;
@@ -1873,8 +1876,12 @@ impl Session {
     fn send_datagram_now(&self, path: &Path, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
         if let Some(quic) = &path.quic {
             self.sealer.seal(channel, body, sealed);
-            if !quic.send(sealed) {
-                self.dropped.fetch_add(1, Ordering::Relaxed);  // late, or too big
+            let unsent = quic.send(sealed).err();
+            if unsent.is_some() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);  // late, or no room
+            }
+            if let Some(line) = self.drops.lock().unwrap().note(channel, unsent, Instant::now()) {
+                log!("{}: {line}", self.label());
             }
             return;
         }

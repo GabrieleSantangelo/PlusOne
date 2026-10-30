@@ -247,14 +247,41 @@ on all of them).
 | TCP bulk pace (`pace.rs`) | 8 ms of queue, 32 KiB/s at least | measured on a hotspot; the floor lowered on an emulated 3 Mbit/s Wi-Fi |
 | Budget told (`cc.rs` `PUBLISH_CHANGE`, `PUBLISH_EVERY`) | past 10 % of the last told; going up at most every 100 ms, a cut at once; `{"event": "budget"}` to the apps, null on a path with no controller of its own | the design's (architecture §3.11); a condition variable, not a poll: nothing wakes while it holds |
 | Bluetooth's budget (`session.rs` `Drain`, `BT_PRIOR`, `DRAIN_SPAN`) | 0.9 Mbit/s until its stream is measured full; then what it drained over the last second of 200 ms windows one after the other, each full from start to end with more waiting all along (the socket's room filling is no rate), a window ended only with the socket full or nothing waiting; never more than that, told as above | chosen: RFCOMM carries 1-2 Mbit/s; under it the speakers go in Opus (they sent PCM's 1.7 Mbit/s with no budget); derived: a window alone is off by up to half (a bridge's socket holds 8 to 16 KB when full, 25 KB go in 200 ms at 1 Mbit/s); seen: windows ending in a round that had just emptied TLS's buffer locked onto that phase, nothing measured in 2 s of a full stream |
-| Screen's bitrate on QUIC (`appdisplay.py`) | 0.85 of the controller's rate, as the budget is told (it read it once a second); down only once it no longer fits in 95 % of the budget (less the others'), up by 15 % at least and 2 s after its last change | chosen; a frame lost asks for a keyframe, it no longer cuts the bitrate (a third each, 20 to 4 Mbit/s in 4 s on a hotspot taking 36); measured: each change of the bitrate is a keyframe (Intel's VA encoders, vah264lpenc and vaapih264enc, start a new sequence), at each cut and at each step up of 5 % before |
-| A frame left out before it is encoded (`appdisplay.py` `QUEUE_MS`) | past 60 ms of the budget waiting (on QUIC, in quinn too) | chosen: under the link's 100 ms (`LATE`), past which it drops a frame's packets and the frames after are broken; quinn's were not counted before, and on a hotspot every cut broke frames |
+| Screen's bitrate on QUIC (`appdisplay.py`) | 0.85 of the controller's rate, as the budget is told (it read it once a second); down once it no longer fits in 95 % of the budget (less the others'), at once (`HOLD` 0; `PLUSONE_L36_HOLD_MS` holds it, on Intel's encoders only, where a change is a keyframe), up by 15 % at least and 2 s after its last change; a stream starts at 0.85 of the budget, not at the most | chosen; the start: from the most, the first second on a budget under it left out frames (half of them from 20 Mbit/s on 10), then a keyframe to go down; a frame lost asks for a keyframe, it no longer cuts the bitrate (a third each, 20 to 4 Mbit/s in 4 s on a hotspot taking 36); measured: each change of the bitrate is a keyframe (Intel's VA encoders, vah264lpenc and vaapih264enc, start a new sequence), at each cut and at each step up of 5 % before; the hold: live, 61 cuts of 30 % in 10 minutes on a good Wi-Fi, most taken back within the second, 51 bitrate changes, so a second at first; then on the grid's chain (adsl, lossy, spikes, 30 runs each, against the desktop before l36), with keyframes made once they fit: hold 0, frames shown 1.9 points fewer, keyframes 10 fewer in 30 s, the delay's p99 3 ms lower; 500 ms, 3.3 fewer, 13, 6 ms higher; 1 s, 4.8 fewer |
+| Frames within the budget (`appdisplay.py` `Allowance`) | a bucket filling at 95 % of the budget less the others', 5 frames deep; a frame is encoded only while it is not in debt | chosen: over the budget (until a change's keyframe goes, a hold, a budget under the least bitrate, keyframes asked faster than the room left pays for them) whole frames are left out, none late; never more than the budget |
+| Keyframes forced (`appdisplay.py` `force_keyframe`, `_bitrate`) | not while the last one, whatever made it, still waits to go out (more waits than went after it, 0.5 s at most): the app's ask is left (it asks again), a change of bitrate on Intel's encoders made with the first frame in after it; an ask within 1.5 round trips and the keyframe's own time of the last keyframe sent, or asked for, is left too | chosen; live: 67 of 73 asks within 3 s of a cut, a bitrate change's keyframe and the app's answered one into the same queue |
+| A frame left out before it is encoded (`appdisplay.py` `QUEUE_MS`) | past 60 ms of the budget waiting (on QUIC, in quinn too), and past what leaves an average frame room under what the link holds (below) | chosen: under the link's 100 ms (`LATE`), past which it drops a frame's packets and the frames after are broken; quinn's were not counted before, and on a hotspot every cut broke frames; the 64 KB at least let in frames the link cut on budgets under 5 Mbit/s |
+| Whole frames to the link (`appdisplay.py` `_out`, `_keyframe_in`) | the link holds realtime up to 100 ms of its rate (no more than quinn's 512 KB), taken as 90 % of that of the budget told; an encoded frame that would not fit whole is not sent, nor those after it until a keyframe; a keyframe (asked for, the stream broken, a bitrate change on Intel's) is made only with a frame in when four frames at its bitrate fit, the frames left out meanwhile if the tablet waits for one | chosen: the link drops late packet by packet, a keyframe's tail, and every frame after it broken; a frame the tablet never had any of, it does not see missing (DisplaySession.kt counts frames that came in part), so those after it are never sent |
+
+`PLUSONE_L36=0` runs the desktop as before the hold, the allowance, the
+keyframes held back and the whole frames of the table above
+(`appdisplay.py` `L36`): the bitrate down at once whenever it no longer
+fits, no allowance, every frame encoded sent, keyframes made as asked; a
+live A/B without rebuilding, read as each stream starts. Its knobs, each
+kept within a safe range: `PLUSONE_L36_HOLD_MS` (0-3000), how long the
+budget must stay under the bitrate before it goes down; `PLUSONE_L36_PAY`
+(0-30, 0 off), down sooner once the frames left out for it are worth that
+many frames at the bitrate; `PLUSONE_L36_DEPTH` (1-5), the allowance's
+depth in frames (5 is about all the link holds realtime for at the
+budget); `PLUSONE_L36_FITS` (80-100), the percent of the budget less the
+others' the video may send, and the bitrate must stay under (100: right
+up to the budget told, never past it). Each stream says which in the log
+("app display: l36 on, hold 0 ms, pay off, allowance 5 frames at 95 % of
+the budget").
 
 `PLUSONE_LINK_CC_TRACE=1` puts what the controller does in the log four
 times a second (rate, what is acknowledged, trend and threshold, state,
 queue, its cuts by why); `PLUSONE_LINK_CC_RECORD=FILE` writes every event
 it gets (each acknowledgement's times, losses), a real network's to replay
 in a test.
+
+What a live test follows, always in the logs, a line a second at most:
+the link's "realtime dropped over 1.0 s: N late, N for room, in N runs"
+(a run: a channel's datagrams dropped one after the other, a frame's tail
+or frames); the desktop's every change of bitrate with its cause ("A -> B
+kbit/s, as the network takes (the budget …)", from the budget's events
+too), and each second with frames lost, not encoded or a keyframe sent
+(how many of each).
 
 ## Measured
 
