@@ -44,7 +44,7 @@ const DATAGRAM_SEND_BUFFER: usize = 512 << 10;
 /// What quinn takes from the session's stream before it is acknowledged,
 /// at first (about a fast path's bandwidth-delay product); then the
 /// bridge has it follow the rate (WINDOW_EVERY).
-const SEND_WINDOW: u64 = 2 << 20;
+pub(crate) const SEND_WINDOW: u64 = 2 << 20;
 const BRIDGE_CHUNK: usize = 16 << 10;
 /// What the bridge hands quinn ahead of the controller's rate: this long's
 /// worth (at least AHEAD_LEAST). quinn keeps what it is handed in order,
@@ -173,8 +173,7 @@ impl Quic {
     pub(crate) fn send_in_group(&self, channel: u16, group: u32, key: bool, last: bool, sealed: &[u8]) -> bool {
         self.realtime.fetch_add((sealed.len() + 2) as u64, Ordering::Relaxed);
         self.groups.send(channel, group, key, last, sealed, |pieces| {
-            let writing = groups::write(self.conn.clone(), pieces, self.groups.shared.clone(), self.cc.rate.clone());
-            runtime().spawn(writing);
+            runtime().spawn(groups::write(self.conn.clone(), pieces, self.groups.shared.clone()));
         })
     }
 
@@ -424,7 +423,7 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
                     loop {
                         let now = tokio::time::Instant::now();
                         if now.duration_since(windowed) >= WINDOW_EVERY {
-                            conn.set_send_window(send_window(rate.load(Ordering::Relaxed), conn.rtt(), groups.unacked()));
+                            groups.set_window(&conn, send_window(rate.load(Ordering::Relaxed), conn.rtt(), groups.unacked()));
                             windowed = now;
                         }
                         let elapsed = now.duration_since(refilled).as_secs_f64();
@@ -446,7 +445,7 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
                         tokio::time::sleep(Duration::from_secs_f64(wait.min(0.01))).await;
                     }
                     tokens -= n as f64;
-                    if !write_after_groups(&mut send, &buf[..n], &groups).await {
+                    if send.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
@@ -455,45 +454,6 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
         let _ = send.finish();
     });
     Ok(theirs)
-}
-
-/// data on the session's stream, all of it, a group's message waiting for
-/// room in quinn's send window let go first (groups.rs YIELD at most, then
-/// it goes: control messages go on): false if the stream is over.
-async fn write_after_groups(send: &mut quinn::SendStream, mut data: &[u8], groups: &groups::Shared) -> bool {
-    let mut yielding: Option<tokio::time::Instant> = None;
-    while !data.is_empty() {
-        let left = yielding.map_or(groups::YIELD, |since| groups::YIELD.saturating_sub(since.elapsed()));
-        if left.is_zero() {
-            match send.write(data).await {
-                Ok(n) => data = &data[n..],
-                Err(_) => return false,
-            }
-            yielding = None;
-            continue;
-        }
-        let told = groups.notify.notified();
-        tokio::pin!(told);
-        told.as_mut().enable();
-        if groups.waiting.load(Ordering::SeqCst) {
-            yielding.get_or_insert_with(tokio::time::Instant::now);
-            let _ = tokio::time::timeout(left, told).await;  // until it is written
-            continue;
-        }
-        tokio::select! {
-            written = send.write(data) => match written {
-                Ok(n) => {
-                    data = &data[n..];
-                    yielding = None;
-                }
-                Err(_) => return false,
-            },
-            // A group's message began waiting: this write (none of it
-            // written yet) gives way.
-            _ = &mut told => {}
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -691,6 +651,36 @@ mod tests {
         assert_eq!(&came.last().unwrap()[..], b"newest");
         assert!(!came.iter().any(|m| &m[..] == b"held up"));
         assert_eq!((stats.late, stats.superseded, stats.dropped), (0, 1, 1), "{stats}");
+    }
+
+    #[test]
+    fn a_group_never_waits_for_room_in_quinns_send_window() {
+        // The window full (the bulk's: here none at all): each message
+        // written all the same, the window opened for it and set back (the
+        // bulk's share stays its own). They waited a round trip at least for
+        // the bulk's bytes to be acknowledged, past LATE under load.
+        let (_stream, mut quic, _theirs, far) = dialed();
+        let got = read(&far);
+        quic.set_groups(true);
+        quic.groups.shared.set_window(&quic.conn, 0);
+        for i in 0..20u32 {
+            let message = [&i.to_be_bytes()[..], &[7u8; 1000]].concat();
+            assert!(quic.send_in_group(5, i / 10, false, i % 10 == 9, &message));
+        }
+        // (Each group's in order; the other side reads each stream apart.)
+        let mut came: Vec<u32> = (0..20).map(|_| {
+            let message = got.recv_timeout(Duration::from_millis(500)).expect("a group's message held up");
+            u32::from_be_bytes(message[..4].try_into().unwrap())
+        }).collect();
+        for g in 0..2u32 {
+            let group: Vec<u32> = came.iter().copied().filter(|i| i / 10 == g).collect();
+            assert!(group.windows(2).all(|w| w[0] < w[1]), "{group:?}");
+        }
+        came.sort_unstable();
+        assert_eq!(came, (0..20).collect::<Vec<u32>>());
+        let stats = quic.group_stats();
+        assert!(stats.window_full >= 1 && stats.wait_ms == 0, "{stats}");
+        assert_eq!(*quic.groups.shared.window.lock().unwrap(), 0, "the window not set back");
     }
 
     #[test]

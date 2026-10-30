@@ -15,15 +15,22 @@
 //! holds up no newer one. The other side reads each stream as it comes and
 //! hands its messages on as datagrams (read()). (After moq-dev/moq's and
 //! moxygen's groups, checked against quinn-proto 0.11.19.)
+//!
+//! quinn's send window is one for all streams: the bulk, handed a little over
+//! its share, keeps it full, and a group's message waited for room a round
+//! trip at least (the window frees what is acknowledged), often past LATE.
+//! The window is opened for each as it is written (write_now), never
+//! waited for.
 
 use crate::quic::LATE;
 use bytes::Bytes;
 use quinn::{Connection, SendStream, VarInt};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::task::Poll;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
@@ -31,6 +38,9 @@ use tokio::time::Instant;
 /// frames a second, LATE and a long path's round trip (200 ms) hold about
 /// 18; some more than three times that.
 pub(crate) const MAX_STREAMS: u32 = 64;
+/// quinn's send window while a group's message is written into it
+/// (write_now): no limit but the other side's.
+const OPEN: u64 = u64::MAX >> 2;
 /// Messages handed over and not on their streams yet, at most (a fifth of
 /// a second of a 100 Mbit/s video; more are dropped).
 const QUEUE: usize = 2048;
@@ -41,10 +51,6 @@ const MAX_SEALED: usize = crate::session::MAX_DATAGRAM + crate::seal::OVERHEAD;
 /// its newest (a group not among them is long late): more than may be open
 /// at once (MAX_STREAMS), and those waiting for their turn.
 const HISTORY: usize = 2 * MAX_STREAMS as usize;
-/// The session's stream lets a group's message waiting for room in quinn's
-/// send window go first, this long at most (quic.rs bridge): the window is
-/// one for all streams (quic.rs send_window leaves the groups theirs).
-pub(crate) const YIELD: Duration = Duration::from_millis(20);
 
 /// A QUIC connection's groups so far (each connection has its own).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,12 +63,19 @@ pub struct Stats {
     pub late_bytes: u64,
     pub superseded: u64,
     pub superseded_bytes: u64,
+    /// Of those, the ones reset before all their messages were written.
+    pub late_unsent: u64,
     /// Messages dropped before their stream: the queue full, their group
     /// over before it began, or while they waited.
     pub dropped: u64,
     /// Groups whose stream waited for the other side's credit
     /// (MAX_STREAMS open already).
     pub credit_waits: u64,
+    /// Messages that found quinn's send window full (the bulk's): it was
+    /// opened for them. And how long they waited to be taken, all told (the
+    /// other side's flow control).
+    pub window_full: u64,
+    pub wait_ms: u64,
     /// Bytes written on group streams, and sent as datagrams (realtime and
     /// input not in groups, the path's pings).
     pub stream_bytes: u64,
@@ -79,11 +92,12 @@ pub struct Stats {
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kb = |bytes: u64| bytes as f64 / 1000.0;
-        write!(f, "groups={} late={} late_kb={:.1} superseded={} superseded_kb={:.1} dropped={} credit_waits={} \
-                   stream_kb={:.1} datagram_kb={:.1} lost_kb={:.1} lost_cut_kb={:.1} cuts={}",
-               self.groups, self.late, kb(self.late_bytes), self.superseded, kb(self.superseded_bytes), self.dropped,
-               self.credit_waits, kb(self.stream_bytes), kb(self.datagram_bytes), kb(self.lost_bytes),
-               kb(self.lost_after_cut), self.cuts)
+        write!(f, "groups={} late={} late_kb={:.1} superseded={} superseded_kb={:.1} late_unsent={} dropped={} \
+                   credit_waits={} window_full={} wait_ms={} stream_kb={:.1} datagram_kb={:.1} \
+                   lost_kb={:.1} lost_cut_kb={:.1} cuts={}",
+               self.groups, self.late, kb(self.late_bytes), self.superseded, kb(self.superseded_bytes),
+               self.late_unsent, self.dropped, self.credit_waits, self.window_full, self.wait_ms,
+               kb(self.stream_bytes), kb(self.datagram_bytes), kb(self.lost_bytes), kb(self.lost_after_cut), self.cuts)
     }
 }
 
@@ -119,20 +133,18 @@ enum Over {
     Superseded,
 }
 
-#[derive(Default)]
 pub(crate) struct Shared {
-    /// A group's message waits for room in quinn's send window (told as it
-    /// starts and as it ends): the session's stream waits, YIELD at most.
-    pub(crate) waiting: AtomicBool,
-    pub(crate) notify: Notify,
+    /// quinn's send window as last set (quic.rs bridge; write_now opens it
+    /// and sets it back), under its lock.
+    pub(crate) window: Mutex<u64>,
     /// Each channel's last HISTORY groups as they began (handed over), the
     /// newest last; told as a group begins.
     begun: Mutex<HashMap<u16, VecDeque<Begun>>>,
     began: Notify,
     /// Bytes written on group streams not all acknowledged yet nor reset
     /// (a stream's count until it is): quinn's send window holds them on
-    /// top of the session stream's share (quic.rs send_window), so a
-    /// group's message never waits for room the bulk took.
+    /// top of the session stream's share (quic.rs send_window), which stays
+    /// the bulk's whatever the video holds.
     unacked: AtomicU64,
     /// Bytes handed over, and not written yet.
     handed: AtomicU64,
@@ -142,12 +154,54 @@ pub(crate) struct Shared {
     late_bytes: AtomicU64,
     superseded: AtomicU64,
     superseded_bytes: AtomicU64,
+    late_unsent: AtomicU64,
     dropped: AtomicU64,
     credit_waits: AtomicU64,
+    window_full: AtomicU64,
+    wait_us: AtomicU64,
     stream_bytes: AtomicU64,
 }
 
+impl Default for Shared {
+    fn default() -> Shared {
+        Shared { window: Mutex::new(crate::quic::SEND_WINDOW),
+                 begun: Mutex::default(), began: Notify::new(), unacked: AtomicU64::new(0), handed: AtomicU64::new(0),
+                 queued: AtomicU64::new(0), groups: AtomicU64::new(0), late: AtomicU64::new(0),
+                 late_bytes: AtomicU64::new(0), superseded: AtomicU64::new(0), superseded_bytes: AtomicU64::new(0),
+                 late_unsent: AtomicU64::new(0), dropped: AtomicU64::new(0), credit_waits: AtomicU64::new(0),
+                 window_full: AtomicU64::new(0), wait_us: AtomicU64::new(0), stream_bytes: AtomicU64::new(0) }
+    }
+}
+
 impl Shared {
+    /// quinn's send window set to window (the bridge, as the rate moves).
+    pub(crate) fn set_window(&self, conn: &Connection, window: u64) {
+        let mut set = self.window.lock().unwrap();
+        *set = window;
+        conn.set_send_window(window);
+    }
+
+    /// As much of data as quinn takes on stream now: if its send window is
+    /// full (the bulk's, mostly: one for all streams), opened for this write
+    /// alone and set back at once (what the bulk may take stays its share);
+    /// None if quinn takes none of it still (the other side's flow
+    /// control), and then cx is woken when it may.
+    fn poll_write_now(&self, conn: &Connection, stream: &mut SendStream, data: &[u8], cx: &mut std::task::Context)
+                      -> Option<Result<usize, quinn::WriteError>> {
+        if let Poll::Ready(written) = Pin::new(&mut *stream).poll_write(cx, data) {
+            return Some(written);
+        }
+        self.window_full.fetch_add(1, Ordering::Relaxed);
+        let window = self.window.lock().unwrap();
+        conn.set_send_window(OPEN);
+        let written = Pin::new(&mut *stream).poll_write(cx, data);
+        conn.set_send_window(*window);
+        match written {
+            Poll::Ready(written) => Some(written),
+            Poll::Pending => None,
+        }
+    }
+
     /// Bytes on group streams not all acknowledged yet (unacked).
     pub(crate) fn unacked(&self) -> u64 {
         self.unacked.load(Ordering::Relaxed)
@@ -158,17 +212,14 @@ impl Shared {
         self.handed.load(Ordering::Relaxed)
     }
 
-    fn wait(&self, on: bool) {
-        self.waiting.store(on, Ordering::SeqCst);
-        self.notify.notify_waiters();
-    }
-
     /// Ours (the rest of Stats is the connection's: quic.rs).
     pub(crate) fn stats(&self) -> Stats {
         let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
         Stats { groups: load(&self.groups), late: load(&self.late), late_bytes: load(&self.late_bytes),
                 superseded: load(&self.superseded), superseded_bytes: load(&self.superseded_bytes),
-                dropped: load(&self.dropped), credit_waits: load(&self.credit_waits),
+                late_unsent: load(&self.late_unsent), dropped: load(&self.dropped),
+                credit_waits: load(&self.credit_waits), window_full: load(&self.window_full),
+                wait_ms: load(&self.wait_us) / 1000,
                 stream_bytes: load(&self.stream_bytes), ..Stats::default() }
     }
 
@@ -202,8 +253,9 @@ impl Shared {
         Ok((i + 1 < groups.len()).then(|| Instant::from_std(groups[i].at) + LATE))
     }
 
-    /// A group over, its stream (if any) reset: counted.
-    fn over(&self, why: Over, stream: Option<&mut SendStream>, bytes: u64) {
+    /// A group over, its stream (if any) reset: counted (unsent: before all
+    /// its messages were written).
+    fn over(&self, why: Over, stream: Option<&mut SendStream>, bytes: u64, unsent: bool) {
         // Reset: what of it is not sent never is, nor is what was lost
         // sent again (an error: all of it acknowledged already).
         if stream.is_some_and(|stream| stream.reset(VarInt::from_u32(0)).is_err()) {
@@ -215,6 +267,9 @@ impl Shared {
         };
         count.fetch_add(1, Ordering::Relaxed);
         of.fetch_add(bytes, Ordering::Relaxed);
+        if unsent {
+            self.late_unsent.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -298,7 +353,7 @@ impl Writing {
         tokio::spawn(async move {
             let acknowledged = stream.stopped();
             if let Err(why) = until_over(&shared, channel, group, acknowledged).await {
-                shared.over(why, Some(&mut stream), bytes);
+                shared.over(why, Some(&mut stream), bytes, false);
             }
             shared.unacked.fetch_sub(bytes, Ordering::Relaxed);
         });
@@ -308,7 +363,7 @@ impl Writing {
     /// no longer held.
     fn over(&mut self, why: Over, shared: &Shared) {
         if let Some(mut stream) = self.stream.take() {
-            shared.over(why, Some(&mut stream), self.bytes);
+            shared.over(why, Some(&mut stream), self.bytes, true);
             shared.unacked.fetch_sub(self.bytes, Ordering::Relaxed);
         }
     }
@@ -316,10 +371,8 @@ impl Writing {
 
 /// The writer of a connection's groups (on its runtime), until the
 /// connection's Groups is gone: each message to its group's stream, a
-/// stream opened for each new group (the one before finished). rate: the
-/// controller's (quinn's send window follows it).
-pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, shared: Arc<Shared>,
-                          rate: Arc<AtomicU64>) {
+/// stream opened for each new group (the one before finished).
+pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, shared: Arc<Shared>) {
     let mut writing: HashMap<u16, Writing> = HashMap::new();
     let mut opened = 0u32;
     while let Some(piece) = pieces.recv().await {
@@ -360,7 +413,7 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
                 }
                 Ok(Err(_)) => None,  // the connection over
                 Err(why) => {
-                    shared.over(why, None, 0);
+                    shared.over(why, None, 0, true);
                     None
                 }
             };
@@ -378,12 +431,11 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
             shared.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        // Room for it in quinn's send window, on top of the session
-        // stream's share.
+        // Held in quinn's send window on top of the session stream's share
+        // (quic.rs send_window) until acknowledged: room the bulk leaves.
         w.bytes += length;
-        let unacked = shared.unacked.fetch_add(length, Ordering::Relaxed) + length;
-        conn.set_send_window(crate::quic::send_window(rate.load(Ordering::Relaxed), conn.rtt(), unacked));
-        if let Err(why) = write_all(stream, &piece.framed, channel, group, &shared).await {
+        shared.unacked.fetch_add(length, Ordering::Relaxed);
+        if let Err(why) = write_all(&conn, stream, &piece.framed, channel, group, &shared).await {
             w.over(why, &shared);
             shared.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -398,23 +450,25 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
     }
 }
 
+/// As much of data as quinn takes on stream now (Shared::poll_write_now).
+async fn write_now(conn: &Connection, stream: &mut SendStream, data: &[u8], shared: &Shared)
+                   -> Option<Result<usize, quinn::WriteError>> {
+    std::future::poll_fn(|cx| Poll::Ready(shared.poll_write_now(conn, stream, data, cx))).await
+}
+
 /// data on stream, all of it, unless its group is over first (why), or the
-/// stream or the connection is (Late). A wait for room in quinn's send
-/// window is told (Shared::waiting): the session's stream lets it go first.
-async fn write_all(stream: &mut SendStream, mut data: &[u8], channel: u16, group: u32, shared: &Shared)
-                   -> Result<(), Over> {
+/// stream or the connection is (Late); quinn's send window opened for it
+/// (write_now); waited for only while the other side's flow control holds
+/// it.
+async fn write_all(conn: &Connection, stream: &mut SendStream, mut data: &[u8], channel: u16, group: u32,
+                   shared: &Shared) -> Result<(), Over> {
     while !data.is_empty() {
-        let at_once = tokio::select! {
-            biased;
-            written = stream.write(data) => Some(written),
-            _ = std::future::ready(()) => None,
-        };
-        let written = match at_once {
+        let written = match write_now(conn, stream, data, shared).await {
             Some(written) => written,
             None => {
-                shared.wait(true);
+                let since = Instant::now();
                 let written = until_over(shared, channel, group, stream.write(data)).await;
-                shared.wait(false);
+                shared.wait_us.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
                 written?
             }
         };
