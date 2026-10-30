@@ -102,8 +102,15 @@ ALONE = 8 << 10
 # VBV_FRAMES' worth (KEY_WORTH): the encoder's are not VBV_FRAMES as asked
 # (live, a video starting in a browser: two or three times that), and one
 # made on that reckoning had its tail cut by the link, the next as well.
+# Only those made within KEY_AGE (two periodic keyframes), and at KEY_NEAR
+# of the bitrate reckoned at or more: encoders overshoot at low bitrates (a
+# keyframe at 800 kbit/s may weigh 20 frames), and one counted so at 17
+# Mbit/s held the climb after congestion at 4 or 5 until three newer came
+# (on NVENC or x264, one each 10 s or each ask).
 KEY_SIZES = 3
 KEY_WORTH = media.VBV_FRAMES * (1 + PACKET_EXTRA / PAYLOAD)
+KEY_AGE = 2 * media.KEYFRAME_SECONDS
+KEY_NEAR = 0.5
 # A keyframe the link dropped realtime after (its count up since it went)
 # that the app asks for again soon after (within the app's own gap between
 # asks, its time on the way out and two round trips): lost. The next is
@@ -844,10 +851,17 @@ class LinkPackets:
         except (OSError, ValueError, plusone_link.LinkError):
             return 0
 
+    def backlog(self):
+        """queued() and the realtime the link dropped so far (late, or no
+        room; None if not known), in the one request."""
+        try:
+            return self.connection.backlog(self.device)
+        except (OSError, ValueError, plusone_link.LinkError):
+            return 0, None
+
     def dropped(self):
-        """Realtime the link dropped so far (late, or no room), or None if
-        not known."""
-        return self._device().get("dropped")
+        """Realtime the link dropped so far, or None if not known."""
+        return self.backlog()[1]
 
     def rtt(self):
         """The session's round trip (seconds), or None if not known."""
@@ -999,10 +1013,13 @@ class AppStreamer:
         self._key_made = -math.inf  # when one was last made (time.monotonic())
         self._broken = False  # a frame was dropped: the next ones are of no use until a keyframe
         self._queued = 0  # what waited in the link at the last frame in (bytes)
-        self._key_worths = collections.deque(maxlen=KEY_SIZES)  # the last keyframes, in average frames (_key_worth)
+        # The last keyframes made: (average frames' worth, kbit/s, when) (_key_worth).
+        self._key_worths = collections.deque(maxlen=KEY_SIZES)
         self._key_size = 0  # the last keyframe sent (bytes on the wire)
-        self._key_dropped = None  # the link's count of realtime dropped as it went (LinkPackets.dropped)
+        self._key_last = (None, None)  # when it went, and the link's count of realtime dropped then
+        self._key_judged = None  # the last one backed off (when it went): once each (_weigh)
         self._alone_from = None  # since a keyframe was lost: the next goes alone (_left_out)
+        self._key_lock = threading.Lock()  # those two: asks (two threads), and the streaming thread
         self._keys_lost = 0  # since the last stats
         self.dropped = collections.Counter()  # encoded frames not sent, by why (DROPPED)
         self._encoded = []  # ms from capture to sent, since the last stats
@@ -1144,10 +1161,13 @@ class AppStreamer:
         if self.rate.under is not None:
             self._tick()  # the hold to the frame, not to the listener's next wake (up to IDLE_WAIT)
         self._key_flying = self._flying(queued, now)
-        if self._alone_from is not None and self._key_at is not None and self._key_at >= self._alone_from:
+        alone = self._alone_from
+        if alone is not None and self._key_at is not None and self._key_at >= alone:
             if self._key_flying:
                 return "alone"
-            self._alone_from = None  # out: the frames after it go
+            with self._key_lock:  # out: the frames after it go (unless another was lost meanwhile)
+                if self._alone_from == alone:
+                    self._alone_from = None
         if budget:
             # And room left for an average frame under what the link holds
             # (on a low budget, the 64 KB let in frames the link cut).
@@ -1177,15 +1197,28 @@ class AppStreamer:
         at MIN_KBPS, where none can be made smaller."""
         return not budget or queued + size <= self._holds(budget) or kbps <= MIN_KBPS and queued <= ALONE
 
-    def _key_worth(self):
-        """A keyframe as reckoned, in average frames at its bitrate (bytes on
-        the wire): the most of the last KEY_SIZES, KEY_WORTH at least."""
-        return max([KEY_WORTH, *self._key_worths])
+    def _key_worth(self, kbps, now):
+        """A keyframe at kbps as reckoned, in average frames at it (bytes on
+        the wire): the most of the last KEY_SIZES made within KEY_AGE at
+        KEY_NEAR of kbps or more, KEY_WORTH at least."""
+        return max([KEY_WORTH] + [worth for worth, made, at in list(self._key_worths)
+                                  if made >= kbps * KEY_NEAR and now - at <= KEY_AGE])
 
-    def _key_kbps(self, budget):
-        """The most bitrate whose keyframe, as reckoned, fits in what the link
-        holds with ALONE waiting before it (kbit/s)."""
-        return int((self._holds(budget) - ALONE) * self.fps / (125 * self._key_worth()))
+    def _key_kbps(self, budget, kbps, now):
+        """The most bitrate up to kbps whose keyframe, as reckoned at it
+        (_key_worth), fits in what the link holds with ALONE waiting before
+        it (kbit/s). The reckoning gets lighter past each keyframe made's
+        bitrate over KEY_NEAR: each stretch between those, at its top."""
+        room = (self._holds(budget) - ALONE) * self.fps / 125
+        edges = sorted({made / KEY_NEAR for _worth, made, at in list(self._key_worths)
+                        if now - at <= KEY_AGE and made / KEY_NEAR < kbps})
+        best, low = 0, 0
+        for high in edges + [kbps]:
+            top = min(high, room / self._key_worth(high, now))
+            if top > low:
+                best = top
+            low = high
+        return int(best)
 
     def _key_time(self):
         """The last keyframe's time on its way out at the budget (s); before
@@ -1215,7 +1248,7 @@ class AppStreamer:
                 self._key_room(budget, due, now)
             change = self._pending is not None
             kbps = self._pending[0] if change else self.kbps
-        size = self._key_worth() * kbps * 125 / self.fps
+        size = self._key_worth(kbps, now) * kbps * 125 / self.fps
         if self._key_flying or not self._key_fits(size, self._queued, budget, kbps):
             return "keyframe" if due else None
         if change:
@@ -1232,11 +1265,13 @@ class AppStreamer:
         it (RateControl.lower: up again UP_AFTER on, as ever), the change
         made with the keyframe; a change up only so far, or not at all.
         Sent as it was, the link cut its tail, and the app asked again."""
-        kbps = self._pending[0] if self._pending is not None else self.kbps
-        most = max(MIN_KBPS, self._key_kbps(budget))
-        if kbps <= most or not (due or self._pending is not None):
+        if not (due or self._pending is not None):
             return
-        why = f"its keyframe, {self._key_worth():.1f} frames' worth, to fit in what the link holds"
+        kbps = self._pending[0] if self._pending is not None else self.kbps
+        most = max(MIN_KBPS, self._key_kbps(budget, kbps, now))
+        if kbps <= most:
+            return
+        why = f"its keyframe, {self._key_worth(kbps, now):.1f} frames' worth, to fit in what the link holds"
         kbps = self.rate.lower(min(most, self.rate.kbps), why, now)
         self._pending = (kbps, why) if kbps != self.kbps else None
 
@@ -1272,8 +1307,8 @@ class AppStreamer:
         the last picture meanwhile, and its frame numbers run on. A
         keyframe's size is kept (_key_worth), and it goes only if all of it
         fits behind what waits in the link now (_key_fits); the link's
-        count of what it dropped as it went, for force_keyframe. Before
-        l36, every frame sent."""
+        count of what it dropped as it went, for force_keyframe (both in
+        one request, _backlog). Before l36, every frame sent."""
         now = time.monotonic()
         payload = getattr(self.channel, "payload", PAYLOAD)
         count = -(-len(data) // payload)
@@ -1283,11 +1318,13 @@ class AppStreamer:
             self.dropped["broken"] += 1
             return
         budget = self._budget_kbps
+        dropped = None
         if on and keyframe:
-            self._key_worths.append(size * self.fps / (self.kbps * 125))
+            self._key_worths.append((size * self.fps / (self.kbps * 125), self.kbps, now))
+            queued, dropped = self._backlog()  # as it goes, not as it went in; and the link's drops before it
         if on and budget:
             if keyframe:
-                fits = self._key_fits(size, self.channel.queued(), budget, self.kbps)
+                fits = self._key_fits(size, queued, budget, self.kbps)
             else:
                 # What waited as it went in, if that leaves room to spare (the
                 # frame comes out before the next goes in); else asked again.
@@ -1297,8 +1334,6 @@ class AppStreamer:
                 self.dropped["late"] += 1
                 self._broken = self._key_wanted = True
                 return
-        if on and keyframe:
-            self._key_dropped = self.channel.dropped() if hasattr(self.channel, "dropped") else None
         number = self._frame = self._frame + 1
         if number == 1 and self.input is not None:
             # The monitor is Mutter's now (the pen is mapped onto it): the
@@ -1320,7 +1355,7 @@ class AppStreamer:
             self._key_at, self._after_key = now, 0
             if on:
                 self._last_keyframe = max(self._last_keyframe, now)
-                self._key_size = size
+                self._key_size, self._key_last = size, (now, dropped)
             self._broken = self._key_wanted = False
         else:
             self._after_key += size
@@ -1440,8 +1475,7 @@ class AppStreamer:
         now = time.monotonic()
         rtt = self.channel.rtt() if hasattr(self.channel, "rtt") else None
         if self.l36.on:
-            if self._cut(now, rtt or 0):
-                self._lost_keyframe(now)
+            self._weigh(now, rtt or 0)
             gap = max(MIN_KEYFRAME_GAP, 1.5 * (rtt or 0) + max(media.VBV_FRAMES / self.fps, self._key_time()))
         else:
             gap = max(MIN_KEYFRAME_GAP, 1.5 * rtt + media.VBV_FRAMES / self.fps) if rtt else MIN_KEYFRAME_GAP
@@ -1453,22 +1487,43 @@ class AppStreamer:
         else:
             self.keyframes.request()
 
+    def _backlog(self):
+        """What waits in the link now and the realtime it dropped so far
+        (None if not known), in one request (LinkPackets.backlog)."""
+        if hasattr(self.channel, "backlog"):
+            return self.channel.backlog()
+        return self.channel.queued(), None
+
+    def _weigh(self, now, rtt):
+        """An ask, weighed: the last keyframe the link cut (_cut) backed off
+        (_lost_keyframe), once (gate()'s ask on the main loop and the app's
+        on the listening thread may weigh it together)."""
+        key_at = self._cut(now, rtt)
+        if key_at is None:
+            return
+        with self._key_lock:
+            if key_at == self._key_judged:
+                return
+            self._key_judged, self._alone_from = key_at, now
+        self._lost_keyframe(now)
+
     def _cut(self, now, rtt):
-        """Whether the last keyframe sent never came whole: the link dropped
-        realtime since it went (LinkPackets.dropped), and the app asks again
-        within the gap it keeps between asks (MIN_KEYFRAME_GAP, as
-        DisplaySession.kt's KEYFRAME_AGAIN), the keyframe's time on its way
-        out and two round trips. (An ask alone may be for a frame lost on the
-        air after it: a halving each time cost the bitrate for nothing.)
-        Each read once: the streaming thread sets them as a keyframe goes
-        (the count None if the link did not answer)."""
-        key_at, before = self._key_at, self._key_dropped
-        if key_at is None or before is None:
-            return False
+        """When the last keyframe sent went, if it never came whole (else
+        None): the link dropped realtime since it went (LinkPackets.dropped),
+        and the app asks again within the gap it keeps between asks
+        (MIN_KEYFRAME_GAP, as DisplaySession.kt's KEYFRAME_AGAIN), the
+        keyframe's time on its way out and two round trips. (An ask alone may
+        be for a frame lost on the air after it: a halving each time cost the
+        bitrate for nothing.) The two read together, once: the streaming
+        thread sets them as a keyframe goes (the count None if the link did
+        not answer)."""
+        key_at, before = self._key_last
+        if before is None or key_at == self._key_judged:
+            return None
         if now > key_at + MIN_KEYFRAME_GAP + self._key_time() + 2 * rtt:
-            return False
+            return None
         dropped = self.channel.dropped()
-        return dropped is not None and dropped > before
+        return key_at if dropped is not None and dropped > before else None
 
     def _lost_keyframe(self, now):
         """The last keyframe sent was cut: the next made at KEY_BACKOFF of
@@ -1476,8 +1531,6 @@ class AppStreamer:
         UP_AFTER on, and only as far as its keyframe fits, _key_room) and
         alone: the frames after it left out until it is out (_left_out)."""
         self._keys_lost += 1
-        self._key_dropped = None  # (once)
-        self._alone_from = now
         with self._rate_lock:
             why = "a keyframe the link cut, asked for again"
             self._bitrate(self.rate.lower(min(int(self.kbps * KEY_BACKOFF), self.rate.kbps), why, now), why)

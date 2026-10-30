@@ -451,6 +451,9 @@ class FakeLink:
     def dropped(self):
         return self.drops
 
+    def backlog(self):
+        return self.waiting, self.drops
+
     def budget_kbps(self):
         return self.budget
 
@@ -1174,6 +1177,90 @@ def test_a_keyframe_the_link_cut_is_backed_off_at_an_ask_the_gap_leaves(monkeypa
     assert streamer._key_wanted and streamer.rate.kbps == 4250 and streamer._keys_lost == 1
 
 
+def test_a_keyframe_made_at_a_low_bitrate_does_not_hold_the_climb_back(monkeypatch):
+    # Encoders overshoot at low bitrates: a keyframe at 800 kbit/s may weigh
+    # 20 average frames. Counted so at 17 Mbit/s, the climb after congestion
+    # stopped at about 5 (on NVENC or x264 until three newer keyframes came:
+    # one each 10 s, or each ask).
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    streamer.kbps = streamer.rate.kbps = 800
+    streamer.rate.most = 20000  # the preset's
+    streamer._out(bytes(frames_worth(streamer, 20)), True, 0)
+    assert streamer._key_worth(800, clock.now) > 20 and streamer._key_worth(1600, clock.now) > 20
+    assert streamer._key_worth(1700, clock.now) == appdisplay.KEY_WORTH  # past twice its bitrate: nothing of it
+    clock.now += appdisplay.RateControl.UP_AFTER
+    streamer._budget(20000)  # the network back: up to the share, 17 Mbit/s
+    assert key_frame_in(streamer, clock, 4) and streamer.kbps == 17000  # (on Intel's the change is the keyframe)
+    assert said[-1].startswith("app display: 800 -> 17000 kbit/s")
+    # Nor one older than KEY_AGE: two periodic keyframes have come since, on a stream that moves.
+    streamer._out(bytes(frames_worth(streamer, 12)), True, 0)
+    assert streamer._key_worth(17000, clock.now) > 12
+    clock.now += appdisplay.KEY_AGE + 0.1
+    assert streamer._key_worth(17000, clock.now) == appdisplay.KEY_WORTH
+
+
+def test_a_keyframe_asks_the_link_once_as_it_goes(monkeypatch):
+    # What waits and the link's drops in one request (plus-one-link's
+    # "queued"), on the encoder's thread: devices() reads paired.json and
+    # every path's state, under the connection's lock.
+    class Connection(FakeWatchedLink):
+        backlogs = 0
+
+        def backlog(self, device):
+            self.backlogs += 1
+            return 0, 3
+
+    connection, sent = Connection(), []
+    media = types.SimpleNamespace(send=sent.append, send_in_group=lambda *args: sent.append(args), close=lambda: None)
+    streamer = streamer_on(appdisplay.LinkPackets(connection, "tab", media, media, media), bitrate=8500)
+    asked = connection.asked
+    streamer._out(bytes(40000), True, 0)
+    assert sent and connection.backlogs == 1 and connection.asked == asked and streamer._key_last[1] == 3
+
+
+def test_a_keyframe_cut_is_backed_off_once_when_two_asks_weigh_it_together(monkeypatch):
+    # gate()'s ask on the main loop and the app's on the listening thread.
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    link.round_trip = 0.01
+    streamer._out(bytes(60000), True, 0)
+    link.drops += 20
+    clock.now += 0.27
+    meanwhile = [streamer.force_keyframe]
+
+    def dropped():  # the other weighs it while this one asks the link
+        if meanwhile:
+            meanwhile.pop()()
+        return link.drops
+
+    link.dropped = dropped
+    streamer.force_keyframe()
+    assert streamer._keys_lost == 1 and streamer.rate.kbps == 4250 and streamer._key_wanted
+
+
+class Meanwhile:
+    """A lock the other thread had first: what it did with it, done as this
+    one waits for it."""
+
+    def __init__(self, then):
+        self.then = then
+
+    def __enter__(self):
+        then, self.then = self.then, lambda: None
+        then()
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def test_a_keyframe_lost_as_the_last_one_alone_goes_out_goes_alone_too(monkeypatch):
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    streamer._alone_from, streamer._key_wanted = clock.now, True  # a keyframe lost...
+    assert frame_in(streamer, clock, size=8000) and made == [clock.now]  # ...the next made, sent
+    link.waiting = 0  # out: the frames after it go; but another was lost meanwhile
+    streamer._key_lock = Meanwhile(lambda: setattr(streamer, "_alone_from", clock.now))
+    assert frame_in(streamer, clock) and streamer._alone_from == clock.now  # not forgotten
+
+
 def test_no_keyframe_answers_faster_than_the_last_one_takes_to_go(monkeypatch):
     # No budget (TCP): its time at the bitrate. Three times the reckoning at
     # 20 Mbit/s is 0.2 s, and a round trip and a half of 100 ms.
@@ -1278,6 +1365,9 @@ class SocketConnection:
 
     def devices(self):
         return [{"id": APP + "0" * 48, "connected": True}]
+
+    def backlog(self, device):
+        return 0, 0
 
     def open(self, device, feature, name, kind):
         import plusone_link
