@@ -661,6 +661,9 @@ pub struct Session {
     /// Said "bye": the path's end that follows is not a path lost.
     closing: AtomicBool,
     channels: Mutex<HashMap<u16, Arc<End>>>,
+    /// Channels the other side closed whose inbox still hands its feature
+    /// what came before: shut with the session too (end()).
+    draining: Mutex<Vec<Weak<End>>>,
     pending: Mutex<HashMap<u16, mpsc::Sender<Result<(), String>>>>,
     next_id: AtomicU16,
     /// The other side has flow control on control channels (WINDOW).
@@ -924,6 +927,7 @@ impl Session {
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             channels: Mutex::default(),
+            draining: Mutex::default(),
             pending: Mutex::default(),
             // Ours odd if we connected, even if we listened: never the same.
             next_id: AtomicU16::new(if established.dialer { 1 } else { 2 }),
@@ -1095,6 +1099,12 @@ impl Session {
             end.inbox.lock().unwrap().take();
             sys::shutdown(end.fd.as_raw_fd());
             end.gone();
+        }
+        // Closed by the other side, their inbox and pump still there: they
+        // wait on a feature that may neither read nor close (the pump holds
+        // the session).
+        for end in self.draining.lock().unwrap().drain(..).filter_map(|end| end.upgrade()) {
+            sys::shutdown(end.fd.as_raw_fd());
         }
         // Under the outbox's lock: a pump looks at closed under it, then waits.
         drop(self.outbox.lock().unwrap());
@@ -1289,6 +1299,13 @@ impl Session {
             // Closed by the other side: what it sent before goes to the feature first.
             Some(inbox) if !tell => {
                 let _ = inbox.send(None);
+                let mut draining = self.draining.lock().unwrap();
+                draining.retain(|end| end.strong_count() > 0);
+                draining.push(Arc::downgrade(&end));
+                drop(draining);
+                if self.is_closed() {
+                    sys::shutdown(end.fd.as_raw_fd());  // end() went by before it was there
+                }
             }
             _ => sys::shutdown(end.fd.as_raw_fd()),
         }
@@ -2216,6 +2233,41 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(2), "{} bytes still waiting once acknowledged", session.queued());
             std::thread::sleep(Duration::from_millis(10));
         }
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_channel_closed_over_there_lets_go_of_its_threads_with_the_session() {
+        // Flow on: the tablet fills a channel whose feature on the PC
+        // reads nothing (its inbox waits for room in the feature's
+        // socket), then closes it. Out of the session's channels, the
+        // inbox and the pump (waiting for the feature, holding the
+        // session) were out of reach of the session's end: both stayed as
+        // long as the feature kept its end, unread.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, mut fake) = devices.by_cable(true, None);
+        let channel = fake.accept(&session, "sink");
+        let end = session.channels.lock().unwrap()[&channel.id].clone();
+        let chunk = vec![1u8; 200 << 10];
+        fake.conn.set_buffer_limit(None);  // a frame bigger than rustls's 64 KiB at once
+        let mut sent = 0;
+        // Until the feature's socket is full: the inbox waits with one more.
+        while end.taken.load(Ordering::Relaxed) == sent {
+            assert!(sent < 64 << 20, "the feature's socket never full");
+            fake.reliable(frame::MESSAGE, channel.id, &chunk);
+            sent += chunk.len() as u64;
+            until("delivered", Duration::from_secs(2), || end.received.load(Ordering::Relaxed) == sent);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(end);
+        fake.say(json!({"t": "close", "id": channel.id}));
+        until("closed here too", Duration::from_secs(2), || session.channels() == 0);
+        assert_eq!((threads("link-inbox").len(), threads("link-channel").len()), (1, 1), "the inbox and the pump");
+        session.close();
+        until("the inbox and the pump over with the session", Duration::from_secs(1),
+              || threads("link-inbox").is_empty() && threads("link-channel").is_empty());
+        drop(channel);
         devices.pc.close();
     }
 

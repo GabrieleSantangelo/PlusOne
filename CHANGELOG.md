@@ -2,6 +2,13 @@
 
 ## Unreleased (1.0)
 
+- **A channel the tablet closed goes with the session**: a channel
+  the tablet closed while the feature on the PC was not reading what it
+  had sent kept a thread waiting on that feature, and another holding
+  the whole session, its connection and its sockets with it, past the
+  session's end and for as long as the feature kept the channel unread.
+  Both now go when the session ends, and a session over keeps none of
+  its sockets, whatever still holds on to it.
 - **An app that stops reading holds nothing up**: plus-one-link handed
   each channel the tablet opened to the app serving its feature waiting
   as long as it took, so an app that was stuck and no longer read kept,
