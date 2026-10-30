@@ -2,6 +2,12 @@
 
 ## Unreleased (1.0)
 
+- **A device that sends and takes nothing is given up**: the link gave
+  up on a connection only once nothing came from the other side for
+  5 s. A device that kept sending but took nothing (stuck, or hostile)
+  kept the connection for good, and the answers to what it sent piled up
+  without end, megabytes of them. Now 5 s with nothing taken is a lost
+  connection too, and those answers never pile up past 256 KiB.
 - **A connection slow to start is not cut as it begins**: the side
   that takes connections (the tablet's app, or plus-one-link with
   --listen) gave each 8 s to become a session, and counted what it did

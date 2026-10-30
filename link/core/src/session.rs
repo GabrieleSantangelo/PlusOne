@@ -131,6 +131,11 @@ const ACK_AFTER: u64 = 32;
 /// ACK_AFTER frames, 32 MiB at the very most; one that never does holds no
 /// more of ours than this).
 const UNACKED_MOST: usize = 64 << 20;
+/// The session's own messages waiting (Queue::Ahead), at most, once the
+/// other side's call for more: past it the path is lost (one that sends
+/// opens and takes nothing would pile up their answers for ever; ours
+/// alone are a few KiB, credits and opens of 64 channels at most).
+const AHEAD_MOST: usize = 256 << 10;
 const KEYS_LABEL: &[u8] = b"EXPORTER-plus-one-link datagrams";
 const ID_LABEL: &[u8] = b"EXPORTER-plus-one-link session";
 const DATAGRAM_PATH: u16 = 0;  // the datagrams' own channel: pings and pongs
@@ -292,6 +297,7 @@ struct Outbox {
     /// Numbered already: what a lost path had not delivered, first again.
     resend: VecDeque<Vec<u8>>,
     ahead: VecDeque<Waiting>,
+    ahead_bytes: usize,
     channels: BTreeMap<u16, (VecDeque<Waiting>, usize)>,
     last: VecDeque<Waiting>,
     /// The channel whose turn comes next.
@@ -319,7 +325,10 @@ impl Outbox {
     fn push(&mut self, waiting: Waiting, queue: Queue) {
         self.reliable_bytes += waiting.size();
         match queue {
-            Queue::Ahead => self.ahead.push_back(waiting),
+            Queue::Ahead => {
+                self.ahead_bytes += waiting.size();
+                self.ahead.push_back(waiting);
+            }
             Queue::Last => self.last.push_back(waiting),
             Queue::Channel(id) => {
                 let (frames, bytes) = self.channels.entry(id).or_default();
@@ -365,7 +374,8 @@ impl Outbox {
                 out.extend_from_slice(&bytes);
                 continue;
             }
-            let next = self.ahead.pop_front().or_else(|| self.next_channel()).or_else(|| self.last.pop_front());
+            let next = self.ahead.pop_front().inspect(|waiting| self.ahead_bytes -= waiting.size())
+                .or_else(|| self.next_channel()).or_else(|| self.last.pop_front());
             let Some(waiting) = next else { break };
             taken += waiting.size();
             self.reliable_bytes -= waiting.size();
@@ -1624,6 +1634,8 @@ impl Session {
         let mut next_ping = Instant::now();
         let mut next_udp_ping = Instant::now();
         let mut suspect_since = None;
+        // The stream took something last, or had nothing waiting for it.
+        let mut taken_at = Instant::now();
         // Frames that came with the hello.
         while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
             self.heard_on(path);
@@ -1663,10 +1675,13 @@ impl Session {
                     conn.writer().write_all(&out).map_err(|e| e.to_string())?;
                 }
             }
-            let mut blocked = false;
+            let (mut blocked, mut took) = (false, false);
             while conn.wants_write() {
                 match conn.write_tls(stream) {
-                    Ok(written) => drain.wrote(written),
+                    Ok(written) => {
+                        drain.wrote(written);
+                        took |= written > 0;
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         blocked = true;
                         break;
@@ -1698,6 +1713,13 @@ impl Session {
             let silent = path.silent();
             if silent > PATH_SILENCE.as_micros() as u64 {
                 return Err(format!("nothing heard for {:.1} s", silent as f64 / 1e6));
+            }
+            // Heard (the other side sends) and taking nothing of what waits:
+            // lost as well (its answers, our pings, piled up for ever).
+            if took || !blocked {
+                taken_at = now;
+            } else if now.duration_since(taken_at) > PATH_SILENCE {
+                return Err(format!("nothing taken for {:.1} s", now.duration_since(taken_at).as_secs_f64()));
             }
             // Nothing heard for PATH_SUSPECT, though the other side pings
             // each PING_EVERY: suspect, until something comes (a datagram
@@ -1814,6 +1836,10 @@ impl Session {
                     match serde_json::from_slice::<Value>(&body[8..]) {
                         Ok(message) => self.message(&message),
                         Err(e) => log!("{}: a bad message: {e}", self.label()),
+                    }
+                    let ahead = self.outbox.lock().unwrap().ahead_bytes;
+                    if ahead > AHEAD_MOST {
+                        return Err(format!("{} KiB of answers waiting, none taken", ahead >> 10));
                     }
                 }
             }
@@ -2030,12 +2056,18 @@ mod tests {
         }
 
         fn send(&mut self, kind: u8, channel: u16, body: &[u8]) {
+            self.try_send(kind, channel, body).unwrap();
+        }
+
+        /// As send(): an error once the PC let go of the stream.
+        fn try_send(&mut self, kind: u8, channel: u16, body: &[u8]) -> io::Result<()> {
             let mut bytes = Vec::new();
             frame::encode(kind, channel, body, &mut bytes);
-            self.conn.writer().write_all(&bytes).unwrap();
+            self.conn.writer().write_all(&bytes)?;
             while self.conn.wants_write() {
-                self.conn.write_tls(&mut self.stream).unwrap();
+                self.conn.write_tls(&mut self.stream)?;
             }
+            Ok(())
         }
 
         /// A reliable frame, numbered (its hello was 0).
@@ -2269,6 +2301,68 @@ mod tests {
               || threads("link-inbox").is_empty() && threads("link-channel").is_empty());
         drop(channel);
         devices.pc.close();
+    }
+
+    #[test]
+    fn a_tablet_that_takes_nothing_piles_up_no_answers() {
+        // It opens channels of a feature not served, ever faster than it
+        // reads (nothing): each refusal waited in Queue::Ahead, behind a
+        // stream that took nothing, and the path, heard all along, was
+        // never lost: megabytes of them, for as long as it went on.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, mut fake) = devices.by_cable(false, None);
+        let mut frames = Vec::new();
+        for i in 0..100_000u64 {
+            let mut body = fake.next.to_be_bytes().to_vec();
+            fake.next += 1;
+            let open = json!({"t": "open", "id": 2 * (i % 30_000) + 2, "feature": "none", "channel": "x", "class": "control"});
+            body.extend_from_slice(open.to_string().as_bytes());
+            frame::encode(frame::SESSION, 0, &body, &mut frames);
+        }
+        fake.conn.set_buffer_limit(None);
+        fake.conn.writer().write_all(&frames).unwrap();
+        while fake.conn.wants_write() && fake.conn.write_tls(&mut fake.stream).is_ok() {}
+        until("the path lost", Duration::from_secs(3), || session.path().is_none());
+        assert!(session.queued() < 1 << 20, "{} bytes queued for a tablet that takes nothing", session.queued());
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_path_that_takes_nothing_is_lost_though_heard() {
+        // A tablet that pings and reads nothing: what the PC sends fills
+        // the stream and waits there. Heard all along, the path was never
+        // lost (PATH_SILENCE watched only what came); now PATH_SILENCE
+        // with nothing taken loses it, told as any lost path.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let told = told_paths(&devices.pc);
+        let (session, mut fake) = devices.by_cable(false, None);
+        let channel = fake.accept(&session, "sink");
+        let feeding = std::thread::spawn(move || {
+            let chunk = vec![7u8; 200 << 10];
+            for _ in 0..20 {
+                if channel.send(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let mut failed = None;
+        while failed.is_none() && started.elapsed() < PATH_SILENCE + Duration::from_secs(3) {
+            if fake.try_send(frame::PING, 0, &0u64.to_be_bytes()).is_err() {
+                break;
+            }
+            while let Ok((_, Some(path))) = told.recv_timeout(Duration::from_millis(500)) {
+                if path.state == PathState::Failed {
+                    failed = Some(started.elapsed());
+                }
+            }
+        }
+        let failed = failed.expect("a path that takes nothing never lost");
+        assert!(failed > PATH_SILENCE - Duration::from_secs(1), "lost after {failed:?}");
+        devices.pc.close();
+        feeding.join().unwrap();
     }
 
     #[test]
