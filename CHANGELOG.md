@@ -2,6 +2,14 @@
 
 ## Unreleased (1.0)
 
+- **An app that stops reading holds nothing up**: plus-one-link handed
+  each channel the tablet opened to the app serving its feature waiting
+  as long as it took, so an app that was stuck and no longer read kept,
+  for each channel, a thread, the channel and the tablet's whole session
+  in plus-one-link, for as long as it lived. It has a second now; then
+  the channel is closed (the tablet sees it end) and plus-one-link hangs
+  up on the app, as on one that cannot be told the tablet's news.
+
 - **What carries the desktop**: the pill bottom left on the tablet says
   it too ("PC screen · QUIC · Wi-Fi", "PC screen · TCP · Wi-Fi Direct";
   a cable or Bluetooth has no transport to say), bright for 4 s when the

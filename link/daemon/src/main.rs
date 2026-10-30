@@ -77,6 +77,9 @@ const REQUEST: usize = 64 << 10;
 const SERVICE: &str = "_plusone-link._tcp.local";
 /// A session with no channel this long: closed.
 const IDLE: Duration = Duration::from_secs(60);
+/// A channel the tablet opened, offered to the app that serves its
+/// feature: this long at most for the app to take it.
+const OFFER_STALL: Duration = Duration::from_secs(1);
 
 struct Daemon {
     node: Node,
@@ -375,8 +378,18 @@ impl Daemon {
             let channel = incoming.channel;
             let event = json!({"event": "incoming", "device": incoming.session.peer, "feature": channel.feature,
                                "channel": channel.name, "class": channel.class.name(), "id": channel.id});
-            // The app gone meanwhile: the channel closes with ours.
-            let _ = api::send(client.as_raw_fd(), &event, Some(channel.into_fd()));
+            // The app gone meanwhile: the channel closes with ours. One
+            // that takes nothing for OFFER_STALL (stuck, not reading) would
+            // hold this thread, the channel and its session for as long as
+            // it lives: it loses the channel and is hung up on, as a
+            // watcher that cannot be told (it sees its end).
+            if let Err(e) = api::send_within(client.as_raw_fd(), &event, Some(channel.into_fd()), OFFER_STALL) {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    log!("an app serving {} took nothing for {} s: hung up on", event["feature"].as_str().unwrap_or(""),
+                         OFFER_STALL.as_secs());
+                }
+                api::hang_up(client.as_raw_fd());
+            }
         });
         Ok((feature, serial))
     }
@@ -668,16 +681,22 @@ mod tests {
 
     /// An app's connection to it, served on a thread of its own.
     fn app(daemon: &Arc<Daemon>) -> (OwnedFd, std::thread::JoinHandle<()>) {
+        let (app, ours) = connection();
+        let daemon = daemon.clone();
+        (app, std::thread::spawn(move || daemon.client(ours)))
+    }
+
+    /// An app's connection: (the app's end, reads waiting 5 s at most;
+    /// the daemon's).
+    fn connection() -> (OwnedFd, OwnedFd) {
         let mut pair = [0; 2];
         assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
-        let (app, ours) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
         let wait = libc::timeval { tv_sec: 5, tv_usec: 0 };
         unsafe {
             libc::setsockopt(pair[0], libc::SOL_SOCKET, libc::SO_RCVTIMEO, &wait as *const libc::timeval as *const libc::c_void,
                              std::mem::size_of::<libc::timeval>() as libc::socklen_t);
         }
-        let daemon = daemon.clone();
-        (app, std::thread::spawn(move || daemon.client(ours)))
+        unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) }
     }
 
     /// The next message the app reads (None: nothing within 5 s, or its end).
@@ -696,6 +715,59 @@ mod tests {
     fn ended(app: &OwnedFd) -> bool {
         let mut byte = 0u8;
         unsafe { libc::recv(app.as_raw_fd(), &mut byte as *mut u8 as *mut libc::c_void, 1, 0) == 0 }
+    }
+
+    /// How many of this process's threads are named so.
+    fn threads(name: &str) -> usize {
+        std::fs::read_dir("/proc/self/task").unwrap().flatten()
+            .filter(|task| std::fs::read_to_string(task.path().join("comm")).is_ok_and(|comm| comm.trim_end() == name))
+            .count()
+    }
+
+    /// Until done, or panics past within.
+    fn until(what: &str, within: Duration, done: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(started.elapsed() < within, "{what}: not in {within:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn an_app_that_reads_nothing_holds_no_channel_offered_to_it() {
+        // An app serving a feature stops reading (its connection full):
+        // each channel the tablet opened for it held a thread of the
+        // link's core, the channel and its whole session, for as long as
+        // the app lived. Now the channel is closed after OFFER_STALL and
+        // the app hung up on.
+        let (daemon, tablet) = paired_daemon("deaf");
+        let (app, ours) = connection();
+        let filling = ours.try_clone().unwrap();
+        let served = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || daemon.client(ours))
+        };
+        assert_eq!(ask(&app, json!({"op": "serve", "feature": "deaf"}))["ok"], true);
+        while api::send_now(filling.as_raw_fd(), &json!({"event": "filler"})).is_ok() {}
+        by_bluetooth(&daemon, &tablet);
+        let session = tablet.sessions().pop().unwrap();
+        let channel = session.open("deaf", "c", Class::Control).unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(channel.recv(&mut buf, Some(Duration::from_secs(3))).unwrap(), Some(0),
+                   "the channel still open, offered to an app that takes nothing");
+        until("the offer's thread over", Duration::from_secs(1), || threads("link-incoming") == 0);
+        served.join().unwrap();
+        let mut unread = 0;
+        loop {
+            let got = unsafe { libc::recv(app.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+            if got <= 0 {
+                assert_eq!(got, 0, "the app not hung up on, after {unread} messages");
+                break;
+            }
+            unread += 1;
+        }
+        daemon.node.close();
+        tablet.close();
     }
 
     #[test]
