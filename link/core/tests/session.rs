@@ -1376,7 +1376,7 @@ fn video_moved_to_another_path_mid_frame_leaves_no_group_open_on_the_one_before(
     // and p2p silenced: back on lan, where the group the move left half
     // sent was reset (late, unsent) as the channel's first message went on
     // p2p, and a new Video channel's first frame comes at once, not held up
-    // LATE behind that stream on the tablet. (It stayed open until the
+    // behind that stream on the tablet (two round trips, LATE at least). (It stayed open until the
     // channel came back to lan or the connection ended, and each newer
     // stream on lan waited for it there.)
     let (pc, tablet, _address) = pair();

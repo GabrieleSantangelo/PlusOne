@@ -53,7 +53,8 @@
 //! half written is reset (counted late, unsent), and one all written is no
 //! longer its newest (late once it has had its time). Else that stream stayed
 //! open, and on the other side every newer stream of the connection waited
-//! behind it (LATE, then given up), until the channel came back.
+//! behind it (two round trips, LATE at least, then it was given up), until
+//! the channel came back.
 //!
 //! Beside them, a stream of the session's own messages, copies of those it
 //! numbers (open, accept, credit...: session.rs early), ahead of all
