@@ -1420,7 +1420,12 @@ class AppDisplay:
             device = next((d["id"] for d in connection.devices() if d["id"].startswith(self.app_id)), None)
             if device is None:
                 raise plusone_link.LinkError("not a paired tablet")
-            for name, kind in (("control", plusone_link.CONTROL), ("media", plusone_link.VIDEO),
+            # PLUSONE_LINK_VIDEO_STREAMS=0 (the live A/B's way before q3,
+            # plus-one-link's switch too): the media channel a realtime one,
+            # its packets exactly as before VIDEO (no head, the payload whole).
+            media = (plusone_link.REALTIME if os.environ.get("PLUSONE_LINK_VIDEO_STREAMS", "1").strip() == "0"
+                     else plusone_link.VIDEO)
+            for name, kind in (("control", plusone_link.CONTROL), ("media", media),
                                ("input", plusone_link.INPUT)):
                 try:
                     channels.append(connection.open(device, "display", name, kind))

@@ -1158,3 +1158,22 @@ def test_a_link_with_no_video_class_takes_the_frames_as_before(monkeypatch):
     assert [len(m) for m in got[:3]] == [plusone_link.MAX_DATAGRAM] * 2 + [appdisplay.VIDEO_HEADER.size + 100]
     assert got[3:] == [PONG]
     packets.close()
+
+
+def test_video_streams_off_takes_the_frames_as_before(monkeypatch):
+    # PLUSONE_LINK_VIDEO_STREAMS=0, the live A/B's old way: the media channel
+    # asked as realtime at once, its messages as before VIDEO.
+    import plusone_link
+    monkeypatch.setenv("PLUSONE_LINK_VIDEO_STREAMS", "0")
+    packets, connection, streamer = over_sockets(monkeypatch)
+    assert connection.asked == ["control", "realtime", "input"] and not packets.grouped
+    payload = packets.payload
+    assert payload == plusone_link.MAX_DATAGRAM - appdisplay.VIDEO_HEADER.size
+    streamer._out(bytes(payload + 1), True, 111)
+    packets.send(PONG)
+    got = sent_on(connection.app["media"])
+    assert [appdisplay.VIDEO_HEADER.unpack_from(m) for m in got[:2]] == [
+        (appdisplay.VIDEO, 1, 1, 0, 2, 111), (appdisplay.VIDEO, 1, 1, 1, 2, 111)]
+    assert [len(m) for m in got[:2]] == [plusone_link.MAX_DATAGRAM, appdisplay.VIDEO_HEADER.size + 1]
+    assert got[2:] == [PONG]
+    packets.close()
