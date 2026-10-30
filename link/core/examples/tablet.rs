@@ -4,7 +4,10 @@
 //! on stdout when the channel ends) and "callback" (each message a feature
 //! of the PC's: a channel opened to it, "hello" sent on it) and "frames"
 //! (a realtime channel's frames in pieces: frame u32, index u16, count
-//! u16, the rest anything; each frame whole answered with its number).
+//! u16, the rest anything; each frame whole answered with its number, and
+//! those of the last ANSWERED whole before it: an answer lost on the way is
+//! no frame lost. Frames taken as DisplaySession.kt takes them: one whole
+//! after a newer one is lost, and a keyframe asked for).
 //!   tablet --cert PEM --key PEM --trust FINGERPRINT [--listen ADDRESS] [--quic]
 //! Its first line on stdout: "listening PORT"; with --quic it takes QUIC on
 //! the same port (UDP) too.
@@ -12,6 +15,9 @@
 use plusone_link::{Class, Identity, Node};
 use std::io::Write;
 use std::sync::Arc;
+
+/// Whole frames before the newest said again in each answer.
+const ANSWERED: usize = 3;
 
 fn monotonic_ns() -> i64 {
     let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -73,9 +79,14 @@ fn main() {
     node.serve("frames", 1, |incoming| {
         let mut buf = vec![0u8; 1 << 16];
         let mut frames: std::collections::HashMap<u32, (u16, u16)> = std::collections::HashMap::new();
-        // Once a frame says it is a keyframe (count's top bit, pathbench's
-        // chain): asks for one as DisplaySession.kt does, a byte back.
-        let (mut flagged, mut need, mut asked) = (false, true, None::<std::time::Instant>);
+        // As DisplaySession.kt: a frame whole, the older ones still in part
+        // are lost, and what still comes of them (of any frame not newer
+        // than the newest whole) is dropped. Once a frame says it is a
+        // keyframe (count's top bit: pathbench's chain and video), a keyframe
+        // asked for after a loss, a byte back, at each frame that is not one,
+        // 250 ms apart.
+        let (mut newest, mut flagged, mut need, mut asked) = (None::<u32>, false, true, None::<std::time::Instant>);
+        let mut answer: Vec<u8> = Vec::new();
         while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
             if n == 0 {
                 break;
@@ -86,26 +97,32 @@ fn main() {
             let frame = u32::from_be_bytes(buf[..4].try_into().unwrap());
             let raw = u16::from_be_bytes(buf[6..8].try_into().unwrap());
             let (count, keyframe) = (raw & 0x7fff, raw & 0x8000 != 0);
+            if newest.is_some_and(|newest| frame <= newest) {
+                continue;
+            }
             flagged |= keyframe;
             let entry = frames.entry(frame).or_insert((count, 0));
             entry.1 += 1;
-            if entry.1 == entry.0 {
-                frames.remove(&frame);
-                let _ = incoming.channel.send(&frame.to_be_bytes());
-                if flagged {
-                    // The older ones that came in part: lost, a keyframe needed.
-                    let before = frames.len();
-                    frames.retain(|f, _| *f > frame);
-                    need |= frames.len() < before;
-                    if keyframe {
-                        need = false;
-                    } else if need && asked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)) {
-                        asked = Some(std::time::Instant::now());
-                        let _ = incoming.channel.send(b"K");
-                    }
+            if entry.1 < entry.0 {
+                frames.retain(|f, _| f.wrapping_add(240) > frame);
+                continue;
+            }
+            frames.remove(&frame);
+            let before = frames.len();
+            frames.retain(|f, _| *f > frame);
+            need |= frames.len() < before;
+            newest = Some(frame);
+            answer = [&frame.to_be_bytes()[..], &answer[..]].concat();
+            answer.truncate(4 * (1 + ANSWERED));
+            let _ = incoming.channel.send(&answer);
+            if flagged {
+                if keyframe {
+                    need = false;
+                } else if need && asked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)) {
+                    asked = Some(std::time::Instant::now());
+                    let _ = incoming.channel.send(b"K");
                 }
             }
-            frames.retain(|f, _| f.wrapping_add(240) > frame);
         }
     });
     let bound = node.listen(value("--listen").unwrap_or_else(|| "127.0.0.1:0".into()).parse().unwrap()).unwrap();

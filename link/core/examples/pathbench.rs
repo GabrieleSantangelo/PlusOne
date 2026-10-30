@@ -18,9 +18,11 @@
 //! (test=order): KEY l36 (0: before it), hold (ms), start (1: the first
 //! bitrate the budget's share), pay (frames), depth (frames), fits, as
 //! appdisplay.py's PLUSONE_L36* (Variant), each as it ships unless given.
+//! With --video-only, only the video's tests (video, video_up, av), its
+//! keyframes answering the tablet's asks as the desktop does.
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
 //!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S
-//!             [--variant NAME[:KEY=VALUE...]]...]
+//!             [--variant NAME[:KEY=VALUE...]]...] [--video-only]
 
 use plusone_link::groups::Stats as GroupStats;
 use plusone_link::session::MAX_DATAGRAM;
@@ -183,7 +185,11 @@ fn transfer(session: &Arc<Session>, feature: &str, seconds: f64) -> f64 {
 }
 
 /// A video for seconds at kbps, or (None) at 0.85 of the session's rate
-/// less leave (bytes a second: the others' share, as the desktop leaves it).
+/// less leave (bytes a second: the others' share, as the desktop leaves it):
+/// a keyframe of four frames every two seconds, and one answering the
+/// tablet's ask as the desktop does (a gap apart: examples/tablet asks as
+/// DisplaySession.kt does, after a frame lost, a frame whole after a newer
+/// one among them). Whole: the frames the tablet put together in order.
 fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) -> String {
     let channel = session.open("frames", "v", Class::Video).unwrap();
     let reader = channel.try_clone().unwrap();
@@ -191,65 +197,97 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
     let latencies: Arc<Mutex<Vec<f64>>> = Arc::default();
     let wholes: Arc<Mutex<std::collections::HashSet<u32>>> = Arc::default();
     let done = Arc::new(AtomicBool::new(false));
+    let asks = Arc::new(AtomicU64::new(0));
     let collecting = {
-        let (sent_at, latencies, wholes, done) = (sent_at.clone(), latencies.clone(), wholes.clone(), done.clone());
+        let (sent_at, latencies, wholes, done, asks) =
+            (sent_at.clone(), latencies.clone(), wholes.clone(), done.clone(), asks.clone());
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64];
             while !done.load(Ordering::SeqCst) {
-                if let Ok(Some(4)) = reader.recv(&mut buf, Some(Duration::from_millis(100))) {
-                    let frame = u32::from_be_bytes(buf[..4].try_into().unwrap());
-                    if let Some(at) = sent_at.lock().unwrap().remove(&frame) {
-                        wholes.lock().unwrap().insert(frame);
-                        latencies.lock().unwrap().push((now_ns() - at) as f64 / 1e6);
+                match reader.recv(&mut buf, Some(Duration::from_millis(100))) {
+                    // The frame whole, then those whole before it (said
+                    // again: their own answer may have been lost), timed
+                    // only if this is the first heard of them.
+                    Ok(Some(n)) if n >= 4 && n % 4 == 0 => {
+                        for (i, piece) in buf[..n].chunks_exact(4).enumerate() {
+                            let frame = u32::from_be_bytes(piece.try_into().unwrap());
+                            if let Some(at) = sent_at.lock().unwrap().remove(&frame) {
+                                wholes.lock().unwrap().insert(frame);
+                                if i == 0 {
+                                    latencies.lock().unwrap().push((now_ns() - at) as f64 / 1e6);
+                                }
+                            }
+                        }
                     }
+                    Ok(Some(1)) => {
+                        asks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
             }
         })
     };
     let payload = MAX_DATAGRAM - 8;
     let (start, mut frame, mut bytes, mut rates) = (Instant::now(), 0u32, 0u64, Vec::new());
+    let (mut keyframes, mut key_next, mut last_keyframe) = (std::collections::HashSet::new(), false, f64::NEG_INFINITY);
+    let (mut asks_seen, mut answered) = (0u64, 0u64);
     while start.elapsed().as_secs_f64() < seconds {
         let due = start + Duration::from_secs_f64(frame as f64 / 60.0);
         std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        let now = start.elapsed().as_secs_f64();
+        let gap = session.rtt().map_or(MIN_KEYFRAME_GAP, |rtt| (1.5 * rtt.as_secs_f64() + VBV_FRAMES / FPS).max(MIN_KEYFRAME_GAP));
+        for _ in asks_seen..asks.load(Ordering::Relaxed) {
+            asks_seen += 1;
+            if now - last_keyframe >= gap {
+                (key_next, answered) = (true, answered + 1);
+            }
+        }
         let rate = match kbps {
             Some(kbps) => kbps * 1000 / 8,
             None => session.rate().map(|r| (r * 85 / 100).saturating_sub(leave)).unwrap_or(250_000)
                 .clamp(12_500, 2_500_000),
         };
         rates.push(rate);
+        let keyframe = frame % 120 == 0 || std::mem::take(&mut key_next);
+        if keyframe {
+            keyframes.insert(frame);
+            last_keyframe = now;
+        }
         let average = (rate / 60) as usize;
-        let size = if frame % 120 == 0 { average * 4 } else { average }.max(1);
+        let size = if keyframe { average * 4 } else { average }.max(1);
         let count = size.div_ceil(payload);
         sent_at.lock().unwrap().insert(frame, now_ns());
         for index in 0..count {
             let mut packet = frame.to_be_bytes().to_vec();
             packet.extend_from_slice(&(index as u16).to_be_bytes());
-            packet.extend_from_slice(&(count as u16).to_be_bytes());
+            packet.extend_from_slice(&(count as u16 | if keyframe { KEYFRAME_FLAG } else { 0 }).to_be_bytes());
             packet.resize(8 + payload.min(size - index * payload), 0);
             bytes += packet.len() as u64;
-            let _ = channel.send_in_group(frame, frame % 120 == 0, index + 1 == count, &packet);
+            let _ = channel.send_in_group(frame, keyframe, index + 1 == count, &packet);
         }
         frame += 1;
     }
     std::thread::sleep(Duration::from_millis(800));
     done.store(true, Ordering::SeqCst);
     let _ = collecting.join();
-    let whole = latencies.lock().unwrap().len();
+    let whole = wholes.lock().unwrap().len();
     let mean = rates.iter().sum::<u64>() / rates.len().max(1) as u64;
-    // Whole frames after a lost one of their GOP (a keyframe each 120): a
-    // decoder could not show them.
+    // Whole frames after a lost one since their keyframe: a decoder could
+    // not show them.
     let (wholes, mut broken, mut undecodable) = (wholes.lock().unwrap(), false, 0);
     for f in 0..frame {
-        broken &= f % 120 != 0;
+        broken &= !keyframes.contains(&f);
         match wholes.contains(&f) {
             false => broken = true,
             true if broken => undecodable += 1,
             true => {}
         }
     }
-    format!("whole={:.1}% decodable={:.1}% undecodable={undecodable} kbps={} target={} {}",
+    format!("whole={:.1}% decodable={:.1}% lost={} undecodable={undecodable} asks={asks_seen} answered={answered} \
+             keyframes={} kbps={} target={} {}",
             100.0 * whole as f64 / frame.max(1) as f64, 100.0 * (whole - undecodable) as f64 / frame.max(1) as f64,
-            (bytes as f64 * 8.0 / 1000.0 / seconds) as u64, mean * 8 / 1000, quantiles(latencies.lock().unwrap().clone()))
+            frame as usize - whole, keyframes.len(), (bytes as f64 * 8.0 / 1000.0 / seconds) as u64, mean * 8 / 1000,
+            quantiles(latencies.lock().unwrap().clone()))
 }
 
 /// The desktop's numbers, as plusone/appdisplay.py has them (media.py's,
@@ -411,8 +449,10 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
             let (mut buf, mut whole) = (vec![0u8; 64], HashMap::new());
             while !done.load(Ordering::SeqCst) {
                 match reader.recv(&mut buf, Some(Duration::from_millis(100))) {
-                    Ok(Some(4)) => {
-                        whole.insert(u32::from_be_bytes(buf[..4].try_into().unwrap()), now_ns());
+                    Ok(Some(n)) if n >= 4 && n % 4 == 0 => {
+                        for piece in buf[..n].chunks_exact(4) {
+                            whole.entry(u32::from_be_bytes(piece.try_into().unwrap())).or_insert_with(now_ns);
+                        }
                     }
                     Ok(Some(1)) => {
                         asks.fetch_add(1, Ordering::Relaxed);
@@ -646,6 +686,40 @@ fn main() {
         std::thread::sleep(Duration::from_millis(20));
     }
     println!("test=path transport={} path={:?}", if session.by_quic() { "quic" } else { "tcp" }, session.path());
+    if args.iter().any(|a| a == "--video-only") {
+        // The video alone, beside an upload, and beside the sound.
+        let before = session.group_stats();
+        println!("test=video {}", video(&session, seconds, video_kbps, 0));
+        if session.by_quic() {
+            println!("test=video_groups {}", groups(before, session.group_stats()));
+        }
+        settle(&session);
+        let before = session.group_stats();
+        let up = {
+            let session = session.clone();
+            std::thread::spawn(move || transfer(&session, "sink", seconds))
+        };
+        let v = video(&session, seconds, video_kbps, 0);
+        println!("test=video_up {v} mbs={:.2}", up.join().unwrap());
+        if session.by_quic() {
+            println!("test=up_groups {}", groups(before, session.group_stats()));
+        }
+        settle(&session);
+        let before = session.group_stats();
+        let sound = {
+            let session = session.clone();
+            std::thread::spawn(move || flow(&session, Class::Realtime, 960, Duration::from_millis(5), seconds))
+        };
+        let v = video(&session, seconds, video_kbps, SOUND);
+        let (rtts, sent, gap) = sound.join().unwrap();
+        println!("test=av_audio back={} sent={sent} gap={gap} {}", rtts.len(), quantiles(rtts));
+        println!("test=av_video {v}");
+        if session.by_quic() {
+            println!("test=av_groups {}", groups(before, session.group_stats()));
+        }
+        println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
+        return;
+    }
     if let Some(chained) = chained {
         // The budget is a QUIC path's controller's: on TCP, nothing to follow.
         if session.by_quic() {

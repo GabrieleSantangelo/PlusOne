@@ -17,7 +17,14 @@
 # NETBENCH_ARGS: more of pathbench's arguments ("--chain 30": the desktop's
 # chain after a cut only, before and after l36, 30 s each, on QUIC; and
 # "--variant h500:hold=500 --variant old:l36=0 ...": those ways instead, as
-# appdisplay.py's PLUSONE_L36 knobs, in an order turned each run).
+# appdisplay.py's PLUSONE_L36 knobs, in an order turned each run; or
+# "--video-only": the video's tests alone, its keyframes answering the
+# tablet's asks).
+# NETBENCH_NETEM_SLOT: netem's slot, each way, on any profile ("1ms 4ms":
+# packets let go in bursts, as a Wi-Fi aggregates them). NETBENCH_TABLET_CPUS:
+# the tablet on one CPU (NETBENCH_TABLET_CPU, else 0), that share of it each
+# 10 ms (0.3: a slow core, its threads in turn). The tablet's own lines (its
+# groups as they came) follow each run's, each after "tablet: ".
 set -e
 cd "$(dirname "$0")/.."
 name=${NETBENCH_NAME:-po}
@@ -42,6 +49,12 @@ esac
 # home).
 slot=""
 [ "${extra:-}" = bursts ] && slot="slot 1ms 4ms"
+[ -z "${NETBENCH_NETEM_SLOT:-}" ] || slot="slot $NETBENCH_NETEM_SLOT"
+tablet_cpus=""
+if [ -n "${NETBENCH_TABLET_CPUS:-}" ]; then
+    tablet_cpus="--cpuset-cpus ${NETBENCH_TABLET_CPU:-0} --cpu-period 10000 \
+        --cpu-quota $(awk -v share="$NETBENCH_TABLET_CPUS" 'BEGIN { print int(share * 10000) }')"
+fi
 low=$(echo "$rate" | awk '{ n = $1 + 0; sub(/[0-9.]+/, "", $1); print int(n / 3 + 0.5) $1 }')
 docker build -q -t plus-one-netbench - < Dockerfile.netbench > /dev/null
 docker network inspect "$name-bench" > /dev/null 2>&1 || docker network create "$name-bench" > /dev/null
@@ -71,7 +84,7 @@ fi
 for run in $(seq "$runs"); do
     for transport in tcp quic; do
         docker rm -f "$name-tablet" > /dev/null 2>&1 || true
-        docker run -d --name "$name-tablet" --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" \
+        docker run -d --name "$name-tablet" $tablet_cpus --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" \
             plus-one-netbench sh -c "$shape && $cross_tablet exec /b/tablet --cert /w/tablet/cert.pem --key /w/tablet/key.pem \
             --trust $(cat "$work/pc/fp") --listen 0.0.0.0:47101 --quic" > /dev/null
         sleep 1
@@ -83,5 +96,6 @@ for run in $(seq "$runs"); do
             sh -c "$shape && $cross_pc /b/pathbench --cert /w/pc/cert.pem --key /w/pc/key.pem --trust $(cat "$work/tablet/fp") \
             --tablet $ip:47101 --seconds $seconds --opens $opens $flag ${video:+--video $video} ${NETBENCH_ARGS:-}" \
             || echo "test=failed"
+        docker logs "$name-tablet" 2>&1 | grep ' link: ' | sed 's/^/tablet: /' || true
     done
 done
