@@ -11,9 +11,14 @@
 //! key=value.
 //! With --chain S, only the desktop's chain after a cut, on QUIC (chain()):
 //! S seconds as appdisplay.py ran before l36 (chain_old), S as after
-//! (chain_new), on the same session.
+//! (chain_new), on the same session; with --variant NAME[:KEY=VALUE...]
+//! (once each), those instead (chain_NAME), in an order turned at random
+//! (test=order): KEY l36 (0: before it), hold (ms), start (1: the first
+//! bitrate the budget's share), pay (frames), depth (frames), fits, as
+//! appdisplay.py's PLUSONE_L36* (Variant).
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
-//!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S]
+//!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S
+//!             [--variant NAME[:KEY=VALUE...]]...]
 
 use plusone_link::session::MAX_DATAGRAM;
 use plusone_link::{Class, Identity, Node, Session};
@@ -273,25 +278,76 @@ impl Told {
     }
 }
 
-/// RateControl.budget(): the bitrate to change to, if it does; fix: only
-/// after the budget has been under it for HOLD.
+/// One way the desktop runs in chain(), as appdisplay.py's PLUSONE_L36*
+/// set it: before l36 (l36 false: the bitrate down at once), or after, the
+/// bitrate down once the budget has been under it for hold (s), or sooner
+/// once the frames left out for it are worth pay frames at its bitrate (0:
+/// never); start, the first bitrate the budget's share (the first frame is
+/// a keyframe anyway); the allowance depth frames deep, filling at fits of
+/// the budget (also what the bitrate must stay under).
+#[derive(Clone, Debug)]
+struct Variant {
+    name: String,
+    l36: bool,
+    hold: f64,
+    start: bool,
+    pay: f64,
+    depth: f64,
+    fits: f64,
+}
+
+impl Variant {
+    fn new(name: &str, l36: bool) -> Variant {
+        Variant { name: name.into(), l36, hold: HOLD, start: false, pay: 0.0, depth: ALLOWANCE_FRAMES, fits: FITS }
+    }
+
+    /// NAME[:KEY=VALUE...], as --variant has it.
+    fn parse(spec: &str) -> Variant {
+        let mut parts = spec.split(':');
+        let mut variant = Variant::new(parts.next().unwrap(), true);
+        for part in parts {
+            let (key, value) = part.split_once('=').expect("--variant NAME[:KEY=VALUE...]");
+            let value: f64 = value.parse().expect("a number");
+            match key {
+                "l36" => variant.l36 = value != 0.0,
+                "hold" => variant.hold = value / 1000.0,
+                "start" => variant.start = value != 0.0,
+                "pay" => variant.pay = value,
+                "depth" => variant.depth = value,
+                "fits" => variant.fits = value,
+                _ => panic!("--variant: no key {key}"),
+            }
+        }
+        variant
+    }
+}
+
+/// RateControl.budget(): the bitrate to change to, if it does; after l36,
+/// only once the budget has been under it for the variant's hold, or the
+/// bytes it is over by (what the allowance leaves out) are worth pay frames.
 struct Rate {
     kbps: f64,
     changed_at: f64,
     under: Option<f64>,
+    over: f64,
+    at: f64,
 }
 
 impl Rate {
-    fn budget(&mut self, budget: f64, now: f64, fix: bool) -> Option<f64> {
+    fn budget(&mut self, budget: f64, now: f64, v: &Variant) -> Option<f64> {
         let target = (budget * SHARE).min(MOST_KBPS).max(MIN_KBPS).floor();
-        let fits = self.kbps <= budget * FITS;
+        let fits = self.kbps <= budget * v.fits;
         if fits {
-            self.under = None;
+            (self.under, self.over) = (None, 0.0);
         } else if self.under.is_none() {
-            self.under = Some(now);
+            (self.under, self.over) = (Some(now), 0.0);
+        } else {
+            self.over += (self.kbps - budget * v.fits) * 125.0 * (now - self.at);
         }
+        self.at = now;
         if target < self.kbps {
-            if fits || (fix && now - self.under.unwrap_or(now) < HOLD) {
+            let paid = v.pay > 0.0 && self.over >= v.pay * self.kbps * 125.0 / FPS;
+            if fits || (v.l36 && now - self.under.unwrap_or(now) < v.hold && !paid) {
                 return None;
             }
         } else if target < self.kbps * UP && (target < MOST_KBPS || target < self.kbps * (1.0 + STEADY))
@@ -309,20 +365,25 @@ impl Rate {
 
 /// The desktop after a cut, on a picture that always moves (a frame offered
 /// each 1/60 s, its size the bitrate's average, a keyframe VBV_FRAMES of
-/// them), as appdisplay.py runs it: fix false, before l36 (the bitrate
+/// them), as appdisplay.py runs it: v.l36 false, before l36 (the bitrate
 /// down at once when it no longer fits; each change a keyframe, as on
 /// Intel's encoders; the tablet's asks answered a gap apart; frames left
 /// out past QUEUE_MS of the budget waiting, 64 KB at least; every frame
-/// sent, the link dropping what is late packet by packet); fix true, after
-/// (the bitrate down after HOLD under the budget, frames left out within
-/// it meanwhile; no keyframe while the last still waits to go out; a
-/// keyframe made once all of it fits in what the link holds; a frame that
-/// would not fit whole not sent, nor those after it until a keyframe).
+/// sent, the link dropping what is late packet by packet); true, after
+/// (the bitrate down after v.hold under the budget, or once the frames
+/// left out are worth v.pay, frames left out within it meanwhile; no
+/// keyframe while the last still waits to go out; a keyframe made once all
+/// of it fits in what the link holds; a frame that would not fit whole not
+/// sent, nor those after it until a keyframe; v.start, the first bitrate
+/// the budget's share).
 /// examples/tablet asks for a keyframe as DisplaySession.kt does (a frame
 /// whole while an older one came in part; then at each frame that is not
 /// one, 250 ms apart), and answers each frame whole. What the tablet shows:
-/// a frame whole, and every one since the last keyframe whole too.
-fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
+/// a frame whole, and every one since the last keyframe whole too; and how
+/// long the bitrate was over the budget (under), the frames left out
+/// meanwhile for it (inhold).
+fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
+    let fix = v.l36;
     let channel = session.open("frames", "chain", Class::Realtime).unwrap();
     let reader = channel.try_clone().unwrap();
     let done = Arc::new(AtomicBool::new(false));
@@ -351,8 +412,13 @@ fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
     let at = |instant: Instant| instant.duration_since(start).as_secs_f64();
     let rate_kbps = || session.rate().map(|r| r as f64 * 8.0 / 1000.0).unwrap_or(0.0);
     let mut told = Told { kbps: rate_kbps(), at: 0.0 };
-    let mut rate = Rate { kbps: MOST_KBPS, changed_at: f64::NEG_INFINITY, under: None };
-    let mut encoder = MOST_KBPS;
+    let mut rate = Rate { kbps: MOST_KBPS, changed_at: f64::NEG_INFINITY, under: None, over: 0.0, at: 0.0 };
+    if v.start && told.kbps > 0.0 {
+        // Before the first frame, a keyframe anyway: no change to hold back.
+        (rate.kbps, rate.changed_at) = ((told.kbps * SHARE).min(MOST_KBPS).max(MIN_KBPS).floor(), 0.0);
+    }
+    let mut encoder = rate.kbps;
+    let (mut under_for, mut under_left_out) = (0.0f64, 0u64);
     let (mut pending, mut key_next, mut since_key) = (None::<f64>, true, 0u64);
     let (mut wanted, mut broken, mut key_made, mut last_keyframe) = (false, false, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let (mut key_at, mut after_key, mut flying) = (None::<f64>, 0.0f64, false);
@@ -367,8 +433,11 @@ fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
         frame += 1;
         let now = at(Instant::now());
         let budget = told.update(rate_kbps(), now);
+        if rate.under.is_some() {
+            under_for += 1.0 / FPS;
+        }
         if budget > 0.0 {
-            if let Some(kbps) = rate.budget(budget, now, fix) {
+            if let Some(kbps) = rate.budget(budget, now, v) {
                 if fix {
                     pending = Some(kbps);
                 } else {
@@ -399,13 +468,14 @@ fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
                 skipped[0] += 1;
                 continue;
             }
-            let allowed = budget * FITS * 125.0;
+            let allowed = budget * v.fits * 125.0;
             if budget > 0.0 {
-                let depth = allowed * ALLOWANCE_FRAMES / FPS;
+                let depth = allowed * v.depth / FPS;
                 level = if level.is_nan() { depth } else { (level + allowed * (now - level_at)).min(depth) };
                 level_at = now;
                 if level < 0.0 {
                     skipped[1] += 1;
+                    under_left_out += rate.under.is_some() as u64;
                     continue;
                 }
             }
@@ -490,7 +560,8 @@ fn chain(session: &Arc<Session>, seconds: f64, fix: bool) -> String {
     let shown_frames: u32 = shown.iter().sum();
     let frozen = shown[..seconds.floor() as usize].iter().filter(|&&n| n == 0).count();
     format!("shown={:.1}% frozen={frozen} lost={lost} keyframes={keyframes} asks={asks_seen} answered={answered} \
-             held={held} changes={changes} skipped={} queue={} budget={} forkey={} unsent={} late={} kbps={} {}",
+             held={held} changes={changes} skipped={} queue={} budget={} forkey={} unsent={} late={} kbps={} {} \
+             under={under_for:.1} inhold={under_left_out}",
             100.0 * shown_frames as f64 / frame.max(1) as f64, skipped.iter().sum::<u64>(), skipped[0], skipped[1],
             skipped[2], unsent.iter().sum::<u64>(), session.dropped() - dropped,
             (bytes * 8.0 / 1000.0 / seconds) as u64, quantiles(latencies))
@@ -518,6 +589,15 @@ fn main() {
     let quic = args.iter().any(|a| a == "--quic");
     let opened: usize = value("--opens").and_then(|n| n.parse().ok()).unwrap_or(20);
     let chained: Option<f64> = value("--chain").and_then(|s| s.parse().ok());
+    let mut variants: Vec<Variant> = args.windows(2).filter(|w| w[0] == "--variant").map(|w| Variant::parse(&w[1])).collect();
+    if variants.is_empty() {
+        variants = vec![Variant::new("old", false), Variant::new("new", true)];
+    } else {
+        // Each variant as often first as last, over the runs.
+        let turn = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
+            ^ std::process::id().wrapping_mul(2_654_435_761)) as usize % variants.len();
+        variants.rotate_left(turn);
+    }
     let node = Node::new("Bench PC", &identity, Arc::new(move |fp: &str| fp == trusted)).unwrap();
     node.upgrade_to_quic(quic);
     let session = node.connect(tablet, Duration::from_secs(5)).expect("a session");
@@ -532,10 +612,11 @@ fn main() {
     if let Some(chained) = chained {
         // The budget is a QUIC path's controller's: on TCP, nothing to follow.
         if session.by_quic() {
-            settle(&session);
-            println!("test=chain_old {}", chain(&session, chained, false));
-            settle(&session);
-            println!("test=chain_new {}", chain(&session, chained, true));
+            println!("test=order chain={}", variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(","));
+            for variant in &variants {
+                settle(&session);
+                println!("test=chain_{} {}", variant.name, chain(&session, chained, variant));
+            }
         }
         println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
         return;

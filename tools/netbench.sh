@@ -15,7 +15,9 @@
 # NETBENCH_NAME (po): the containers' and their network's names, for two
 # benches side by side (two builds compared under the same load).
 # NETBENCH_ARGS: more of pathbench's arguments ("--chain 30": the desktop's
-# chain after a cut only, before and after l36, 30 s each, on QUIC).
+# chain after a cut only, before and after l36, 30 s each, on QUIC; and
+# "--variant h500:hold=500 --variant old:l36=0 ...": those ways instead, as
+# appdisplay.py's PLUSONE_L36 knobs, in an order turned each run).
 set -e
 cd "$(dirname "$0")/.."
 name=${NETBENCH_NAME:-po}
