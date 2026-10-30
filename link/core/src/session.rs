@@ -1140,7 +1140,8 @@ fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
     let quic = established.quic.take();
     // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
     let transport = if quic.is_some() { "quic" } else { established.stream.transport() };
-    let budget = established.stream.prior().or_else(|| prior(&established.kind)).filter(|_| quic.is_none()).unwrap_or(0);
+    let budget = established.stream.prior().filter(|prior| *prior != 0).or_else(|| prior(&established.kind))
+        .filter(|_| quic.is_none()).unwrap_or(0);
     Ok(Arc::new(Path { id, kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),

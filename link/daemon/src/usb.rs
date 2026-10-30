@@ -101,9 +101,11 @@ impl Device {
 
     /// What a cable at its speed is taken to carry each way until what it
     /// drains is measured (bytes a second): AOA_SHARE of it; None if its
-    /// speed is not known (the session's own prior for a cable then).
+    /// speed is not known, or not one a link is made at (the session's own
+    /// prior for a cable then).
     pub fn prior(&self) -> Option<u64> {
-        self.speed.filter(|speed| *speed > 0.0).map(|speed| (speed * 1e6 / 8.0 * AOA_SHARE) as u64)
+        self.speed.filter(|speed| speed.is_finite() && *speed > 0.0).map(|speed| (speed * 1e6 / 8.0 * AOA_SHARE) as u64)
+            .filter(|prior| *prior > 0)
     }
 
     pub fn is_accessory(&self) -> bool {
@@ -438,8 +440,12 @@ mod tests {
     fn a_cable_is_taken_to_carry_a_fifth_of_its_speed() {
         // USB 2's high speed: 12 MB/s (96 Mbit/s; it carries 17.5 one way).
         let mut tablet = device("2-12", GOOGLE, 12, &[]);
+        // What sysfs says ("1.5", "12", "480", "5000", "10000", "20000";
+        // "unknown": None), and what it never says.
         for (speed, prior) in [(Some(480.0), Some(12_000_000)), (Some(5000.0), Some(125_000_000)), (Some(12.0), Some(300_000)),
-                               (None, None), (Some(0.0), None)] {
+                               (Some(1.5), Some(37_500)), (Some(10000.0), Some(250_000_000)), (Some(20000.0), Some(500_000_000)),
+                               (None, None), (Some(0.0), None), (Some(-480.0), None), (Some(1e-9), None),
+                               (Some(f64::INFINITY), None), (Some(f64::NAN), None)] {
             tablet.speed = speed;
             assert_eq!(tablet.prior(), prior, "{speed:?}");
         }
@@ -611,5 +617,119 @@ mod tests {
         let said = said.into_inner();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].starts_with("usb: the accessory at /dev/bus/usb/002/011: ") && said[0].contains("busy"), "{said:?}");
+    }
+
+    /// An accessory as open_accessory() gives it, faked, on a cable pulled
+    /// once pulled is: claimed until both threads of its bridge are over
+    /// (each holding a clone of alive meanwhile); silent, its reads only
+    /// time out, until pulled (ENODEV, as usbfs says it).
+    fn pullable_accessory(claimed: &Arc<std::sync::atomic::AtomicBool>, pulled: &Arc<std::sync::atomic::AtomicBool>,
+                          alive: &Arc<()>) -> io::Result<(UnixStream, Released)> {
+        use std::sync::atomic::Ordering;
+        struct Claim {
+            claimed: Arc<std::sync::atomic::AtomicBool>,
+            _said: mpsc::Sender<()>,
+        }
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                self.claimed.store(false, Ordering::SeqCst);
+            }
+        }
+        let gone = || io::Error::from_raw_os_error(libc::ENODEV);
+        if pulled.load(Ordering::SeqCst) {
+            return Err(gone());
+        }
+        if claimed.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        let (said, released) = Released::new();
+        let claim = Arc::new(Claim { claimed: claimed.clone(), _said: said });
+        let reading = (claim.clone(), pulled.clone(), alive.clone());
+        let writing = (claim, pulled.clone(), alive.clone());
+        let stream = plusone_link::stream::bridge(
+            move |_| {
+                let (_claim, pulled, _alive) = &reading;
+                std::thread::sleep(Duration::from_millis(10));
+                Err(if pulled.load(Ordering::SeqCst) { gone() } else { io::ErrorKind::TimedOut.into() })
+            },
+            move |_| {
+                let (_claim, pulled, _alive) = &writing;
+                if pulled.load(Ordering::SeqCst) { Err(gone()) } else { Ok(()) }
+            },
+            4096)?;
+        Ok((stream, released))
+    }
+
+    #[test]
+    fn twenty_plugs_leave_no_thread_and_no_claim() {
+        // Twenty plugs, each on a thread of its own as look() makes them,
+        // and pulled: in a session, after one ended (waiting for the app's
+        // next READY), or after one not made (waiting to try again). Each
+        // plug's thread over, its accessory let go of, no bridge's thread
+        // left, nor a session's stream on it.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(());
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        for plug in 0..20usize {
+            let (claimed, pulled, connected) =
+                (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (done, over) = mpsc::channel();
+            {
+                let (claimed, pulled, connected, alive, sessions) =
+                    (claimed.clone(), pulled.clone(), connected.clone(), alive.clone(), sessions.clone());
+                std::thread::spawn(move || {
+                    let opened = AtomicUsize::new(0);
+                    sessions_on(&accessory_at(None), &|| !pulled.load(Ordering::SeqCst),
+                                &|| {
+                                    if opened.fetch_add(1, Ordering::SeqCst) > 0 && plug % 3 == 1 {
+                                        // Waiting for the app's READY, the cable pulled.
+                                        pulled.store(true, Ordering::SeqCst);
+                                    }
+                                    pullable_accessory(&claimed, &pulled, &alive)
+                                },
+                                &|stream, _| {
+                                    connected.store(true, Ordering::SeqCst);
+                                    match plug % 3 {
+                                        // The session on it until its stream ends (the cable pulled).
+                                        0 => sessions.lock().unwrap().push(std::thread::spawn(move || {
+                                            let mut stream = stream;
+                                            let _ = std::io::Read::read(&mut stream, &mut [0u8; 64]);
+                                        })),
+                                        // The session over a moment on, the cable still in.
+                                        1 => sessions.lock().unwrap().push(std::thread::spawn(move || {
+                                            std::thread::sleep(Duration::from_millis(30));
+                                            drop(stream);
+                                        })),
+                                        // Not made: its stream dropped at once.
+                                        _ => return Err("the handshake failed".into()),
+                                    }
+                                    Ok("6a2665bcebe1984c".repeat(4))
+                                },
+                                // Waiting to try again, the cable pulled.
+                                &|_| pulled.store(true, Ordering::SeqCst), &|_| {});
+                    let _ = done.send(());
+                });
+            }
+            if plug % 3 == 0 {
+                let started = Instant::now();
+                while !connected.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(30));
+                pulled.store(true, Ordering::SeqCst);
+            }
+            assert_eq!(over.recv_timeout(Duration::from_secs(5)), Ok(()), "plug {plug}: its thread still there");
+            assert!(connected.load(Ordering::SeqCst), "plug {plug}: no session tried");
+            assert!(!claimed.load(Ordering::SeqCst), "plug {plug}: its accessory still claimed");
+        }
+        for session in std::mem::take(&mut *sessions.lock().unwrap()) {
+            session.join().unwrap();
+        }
+        // Each bridge's closures let go of as its threads end: none left.
+        let started = Instant::now();
+        while Arc::strong_count(&alive) > 1 && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&alive), 1, "bridges' threads left");
     }
 }
