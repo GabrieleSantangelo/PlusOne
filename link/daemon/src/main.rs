@@ -15,10 +15,13 @@
 //!                                "stream": a cable's, Bluetooth's; null
 //!                                with no path), rate_kbps (its
 //!                                controller's, or what Bluetooth's stream
-//!                                drains), dropped, paths (each:
-//!                                id, kind, transport, state "active",
-//!                                "suspect" or "failed", rtt_ms,
-//!                                silent_ms, budget_bps, budget_from)
+//!                                drains), dropped, paths (each, the
+//!                                one in use first: id, kind,
+//!                                transport, state "active" (in use),
+//!                                "standby" (a reserve), "suspect",
+//!                                "failed" or "closed" (its last),
+//!                                rtt_ms, silent_ms, budget_bps,
+//!                                budget_from)
 //!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]
 //!    [, "kind": "p2p"|"ap"]}     a session with the tablet there (or with
 //!                                that one, wherever it is): its id; "p2p",

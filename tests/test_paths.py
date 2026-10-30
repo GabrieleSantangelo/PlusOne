@@ -56,6 +56,30 @@ def test_each_path_s_state_is_kept_and_its_trouble_logged_not_shown(monkeypatch)
     assert watched.states(DEVICE) == []
 
 
+def test_a_reserve_is_kept_and_one_let_go_of_forgotten_unlogged(monkeypatch):
+    # With several paths at once: a reserve ("standby") kept beside the one
+    # in use, logged as it gets in trouble and out of it; one let go of on
+    # purpose ("closed") forgotten, no trouble to log.
+    monkeypatch.setattr(paths, "plusone_link", None)
+    monkeypatch.setattr(paths.GLib, "idle_add", lambda f: f())
+    logged = []
+    monkeypatch.setattr(paths, "log", lambda *parts: logged.append(" ".join(map(str, parts))))
+    watched = paths.Paths(lambda: None)
+    watched._event({"event": "up", "device": DEVICE, "path": "usb"})
+    usb = {"event": "path", "device": DEVICE, "id": 2, "kind": "usb", "transport": "stream", "state": "active",
+           "silent_ms": 0}
+    lan = dict(usb, id=1, kind="lan", transport="tcp", state="standby")
+    watched._event(usb)
+    watched._event(lan)
+    assert [(p["kind"], p["state"]) for p in watched.states(DEVICE)] == [("usb", "active"), ("lan", "standby")]
+    watched._event(dict(lan, state="suspect", silent_ms=1500))
+    watched._event(lan)
+    assert logged == ["link: the Wi-Fi path (1) is suspect, nothing heard for 1.5 s",
+                      "link: the Wi-Fi path (1) is standby again"]
+    watched._event(dict(lan, state="closed"))
+    assert [p["kind"] for p in watched.states(DEVICE)] == ["usb"] and len(logged) == 2
+
+
 def looked_for_once(monkeypatch, devices):
     """Paths._run once (its wait for the next look ends it), with a
     plus-one-link whose devices() is devices: (Paths, what was closed, waits)."""

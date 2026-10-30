@@ -26,13 +26,15 @@ object LinkStatus {
         private set
 
     /** A path of a PC's as the core last told it (its "path" event):
-     * kind ("usb", "lan", "bt"...), transport, state ("active", "suspect",
-     * "failed"), round trip, how long nothing was heard on it, its budget
+     * kind ("usb", "lan", "bt"...), transport, state ("active": in use,
+     * "standby": a reserve, "suspect"; "failed", "closed": its last), round
+     * trip, how long nothing was heard on it, its budget
      * (bits a second) and whose ("gcc", "drain", "prior", "none"). */
     data class Path(val id: Long, val kind: String, val transport: String?, val state: String, val rttMs: Double?,
                     val silentMs: Long, val budgetBps: Long?, val budgetFrom: String?)
 
-    /** Each PC's paths by their id; a failed one forgotten. */
+    /** Each PC's paths by their id; a failed one forgotten, and one let go
+     * of (closed). */
     @Volatile var paths: Map<String, Map<Long, Path>> = emptyMap()
         private set
     private val listeners = CopyOnWriteArrayList<(Pc?, Pc?) -> Unit>()
@@ -97,9 +99,9 @@ object LinkStatus {
             if (event.isNull("budget_bps")) null else event.optLong("budget_bps"), text("budget_from"))
         val known = paths[pc].orEmpty()
         val before = known[told.id]
-        val now = if (told.state == "failed") known - told.id else known + (told.id to told)
+        val now = if (told.state == "failed" || told.state == "closed") known - told.id else known + (told.id to told)
         paths = paths + (pc to now)
-        if (told.state != "active" || before?.state == "suspect") {
+        if (told.state == "suspect" || told.state == "failed" || before?.state == "suspect") {
             Log.i(LinkCore.TAG, "link: the ${told.kind} path (${told.id}) is ${told.state}, " +
                 "nothing heard for ${told.silentMs} ms")
         }
