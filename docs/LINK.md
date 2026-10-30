@@ -306,6 +306,14 @@ less while it drains), and writes the same
 trace (its decreases as cuts: by loss when one came in the second before,
 else by trend) and record.
 
+`PLUSONE_LINK_VIDEO_STREAMS=0` (either side's process; on by default)
+turns off what q3 added on QUIC: our hellos say neither "groups" nor
+"control", so a Video channel's groups go as datagrams and the session's
+own messages on its stream alone, both ways (each needs both hellos), and
+the transport takes no unidirectional streams; logged once ("video
+streams off"). The desktop's frames go in groups only once Plus One opens
+its channel as Video and writes each packet's group head.
+
 ## Measured
 
 ### The emulated grid, the reference
