@@ -1264,6 +1264,11 @@ impl Session {
     /// Another path for this session (both hellos named it): it takes over
     /// if it is better than the one now, if there is none, or if the other
     /// side has none (the one we believe in is dead for them); else closed.
+    /// The session over, closed: looked at again under the lock end() lets
+    /// go of those coming under (over between the two, end() had let go of
+    /// them before this one came: it stayed, its stream open, until the
+    /// session was dropped; on a cable, plus-one-link waited that long for
+    /// the accessory).
     pub(crate) fn adopt(&self, established: Established) -> bool {
         if self.is_closed() {
             established.close();
@@ -1279,9 +1284,16 @@ impl Session {
             established.close();
             return false;
         }
-        if let Some(before) = self.arriving.lock().unwrap().replace(established) {
+        let mut arriving = self.arriving.lock().unwrap();
+        if self.is_closed() {
+            drop(arriving);
+            established.close();
+            return false;
+        }
+        if let Some(before) = arriving.replace(established) {
             before.close();
         }
+        drop(arriving);
         self.wake.wake();
         true
     }
@@ -1310,7 +1322,14 @@ impl Session {
             established.close_notified();
             return false;
         }
-        self.joining.lock().unwrap().push(established);
+        let mut joining = self.joining.lock().unwrap();
+        if self.is_closed() {
+            drop(joining);
+            established.close();
+            return false;
+        }
+        joining.push(established);
+        drop(joining);
         self.wake.wake();
         true
     }
@@ -3223,6 +3242,43 @@ mod tests {
             assert_eq!(session.is_closed(), bye);
             devices.pc.close();
         }
+    }
+
+    #[test]
+    fn a_path_that_comes_as_the_session_ends_is_closed() {
+        // A path made as the session ended: adopt() past its look at the
+        // session (not over yet), end() then over, its paths ended and
+        // those coming let go of, before this one came. Closed at once,
+        // its stream shut down. (It stayed among those coming, its stream
+        // open, until the session was dropped: on a cable, plus-one-link
+        // waited that long for the accessory to be let go of.)
+        let _one = one_at_a_time();
+        let (pc_id, pc_fingerprint) = identity();
+        let (tablet, tablet_fingerprint) = identity();
+        let pc = Node::new("pc", &pc_id, trusting(&tablet_fingerprint)).unwrap();
+        let said = json!({"paths": 1});
+        let (first, theirs) = UnixStream::pair().unwrap();
+        let faking = Fake::start_saying(&tablet, &pc_fingerprint, said.clone(), None, move || Box::new(theirs));
+        let session = pc.connect_stream(Box::new(first), "bt").unwrap();
+        let _bt = faking.join().unwrap();
+        assert!(session.multipath);
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let faking =
+            Fake::start_saying(&tablet, &pc_fingerprint, said, Some((session.id.clone(), false)), move || Box::new(theirs));
+        let name = rustls::pki_types::ServerName::try_from("plus-one.invalid").unwrap();
+        let conn = rustls::ClientConnection::new(pc_id.client_config(trusting(&tablet_fingerprint)).unwrap(), name).unwrap();
+        let hello = json!({"t": "hello", "name": "pc", "features": {}, "flow": 1, "paths": 1});
+        let id = session.id.clone();
+        let established = establish(conn.into(), Box::new(ours), true, hello, "usb", &move |_| Some((id.clone(), false))).unwrap();
+        let mut usb = faking.join().unwrap();
+        session.close();
+        // Where adopt() goes on past its look at the session.
+        assert!(!session.join(established), "taken by a session over");
+        usb.stream.set_timeouts(Some(Duration::from_secs(2))).unwrap();
+        let mut byte = [0u8; 1];
+        let read = std::io::Read::read(&mut usb.stream, &mut byte);
+        assert!(matches!(read, Ok(0)), "its stream not shut down: {read:?}");
+        pc.close();
     }
 
     /// fake pinging its path each 300 ms on a thread, until the sender is
