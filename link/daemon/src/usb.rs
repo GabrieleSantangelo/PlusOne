@@ -15,8 +15,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 const SYSFS: &str = "/sys/bus/usb/devices";
@@ -41,6 +42,13 @@ const CHUNK: usize = 64 << 10;
 /// meanwhile, however long no app answers; the cable pulled ends the read
 /// (usbfs kills the transfer: an error).
 const READY_WAIT: u32 = 0;
+/// An accessory that could not be opened (its interface held by another,
+/// its endpoints not there yet), or its session not made: tried again
+/// after this, twice as long after each failure in a row, up to AGAIN_MOST
+/// (it was tried each second, and each failure logged: 68 lines of
+/// "Device or resource busy" in a minute).
+const AGAIN: Duration = Duration::from_secs(1);
+const AGAIN_MOST: Duration = Duration::from_secs(16);
 const USBDEVFS_CONTROL: libc::c_ulong = 0xC018_5500;
 const USBDEVFS_BULK: libc::c_ulong = 0xC018_5502;
 const USBDEVFS_CLAIMINTERFACE: libc::c_ulong = 0x8004_550F;
@@ -164,8 +172,37 @@ pub fn switch(device: &Device) -> io::Result<()> {
     Ok(())
 }
 
-/// The accessory's byte stream, bridged to a socket for a session.
-pub fn open_accessory(device: &Device) -> io::Result<std::os::unix::net::UnixStream> {
+/// The accessory's device, claimed, while its bridge's threads run: let
+/// go of (closed, its interface with it) as the last of them ends, and
+/// then said (Released).
+struct Claimed {
+    fd: OwnedFd,
+    _said: mpsc::Sender<()>,
+}
+
+/// Said once the accessory is let go of: its bridge's threads both over
+/// (the session's stream on it ended, or the cable pulled).
+pub struct Released(mpsc::Receiver<()>);
+
+impl Released {
+    /// One that says so as the last clone of claimed goes: (it, the
+    /// receiver's side).
+    fn new() -> (mpsc::Sender<()>, Released) {
+        let (said, released) = mpsc::channel();
+        (said, Released(released))
+    }
+
+    /// Until the accessory is let go of.
+    pub fn wait(self) {
+        let _ = self.0.recv();
+    }
+}
+
+/// The accessory's byte stream, bridged to a socket for a session, and
+/// when its device is let go of: not before the bridge's threads end,
+/// whatever became of the session meanwhile (the next attempt claims it
+/// again only then).
+pub fn open_accessory(device: &Device) -> io::Result<(UnixStream, Released)> {
     let interface = interfaces(&device.path).into_iter().find(|i| i.to_string_lossy().ends_with(":1.0"))
         .ok_or_else(|| io::Error::other("no interface"))?;
     let (mut inward, mut outward) = (None, None);
@@ -177,14 +214,15 @@ pub fn open_accessory(device: &Device) -> io::Result<std::os::unix::net::UnixStr
         if read(&endpoint.join("direction")) == "in" { inward = Some(address) } else { outward = Some(address) }
     }
     let (Some(inward), Some(outward)) = (inward, outward) else { return Err(io::Error::other("no bulk endpoints")) };
-    let fd = std::sync::Arc::new(device.open()?);
+    let (said, released) = Released::new();
+    let fd = Arc::new(Claimed { fd: device.open()?, _said: said });
     let mut number: libc::c_uint = 0;
-    if unsafe { libc::ioctl(fd.as_raw_fd(), USBDEVFS_CLAIMINTERFACE, &mut number) } < 0 {
+    if unsafe { libc::ioctl(fd.fd.as_raw_fd(), USBDEVFS_CLAIMINTERFACE, &mut number) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let bulk = |fd: &OwnedFd, endpoint: u32, data: *mut u8, length: usize, timeout: u32| -> io::Result<usize> {
+    let bulk = |fd: &Claimed, endpoint: u32, data: *mut u8, length: usize, timeout: u32| -> io::Result<usize> {
         let mut transfer = Bulk { endpoint, length: length as u32, timeout, data: data as *mut libc::c_void };
-        let done = unsafe { libc::ioctl(fd.as_raw_fd(), USBDEVFS_BULK, &mut transfer) };
+        let done = unsafe { libc::ioctl(fd.fd.as_raw_fd(), USBDEVFS_BULK, &mut transfer) };
         if done < 0 { Err(io::Error::last_os_error()) } else { Ok(done as usize) }
     };
     let number = ready(|buf, timeout| bulk(&fd, inward, buf.as_mut_ptr(), buf.len(), timeout))?;
@@ -194,7 +232,7 @@ pub fn open_accessory(device: &Device) -> io::Result<std::os::unix::net::UnixStr
     let reader = fd.clone();
     // Its READYs sent before it saw the GO: dropped, until the session's first bytes.
     let mut started = false;
-    plusone_link::stream::bridge(
+    let stream = plusone_link::stream::bridge(
         // A second without anything: TimedOut, the bridge only looks whether the session is still there.
         move |buf| loop {
             let n = bulk(&reader, inward, buf.as_mut_ptr(), buf.len(), 1000)?;
@@ -213,7 +251,8 @@ pub fn open_accessory(device: &Device) -> io::Result<std::os::unix::net::UnixStr
             }
             Ok(())
         },
-        CHUNK)
+        CHUNK)?;
+    Ok((stream, released))
 }
 
 /// The app's READY on the accessory, read(buf, timeout in ms) reading it:
@@ -279,15 +318,9 @@ impl Watcher {
                     continue;
                 }
                 let connect = connect.clone();
-                // Sessions on it, one after the other, as long as it is plugged in.
                 let _ = std::thread::Builder::new().name("link-usb-accessory".into()).spawn(move || {
-                    while devices().iter().any(|d| (d.bus, d.number) == (device.bus, device.number)) {
-                        match open_accessory(&device).map_err(|e| e.to_string()).and_then(|stream| connect(stream, &device)) {
-                            Ok(id) => log!("usb: a session with {} by cable, over", &id[..8.min(id.len())]),
-                            Err(e) => log!("usb: the accessory at {}: {e}", device.node()),
-                        }
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
+                    sessions_on(&device, &|| devices().iter().any(|d| (d.bus, d.number) == (device.bus, device.number)),
+                                &|| open_accessory(&device), &*connect, &std::thread::sleep, &|said| log!("{said}"));
                 });
             } else if device.is_android() && (asked || (!device.serial.is_empty() && remembered(&device.serial)))
                 && self.tried.lock().unwrap().insert((device.bus, device.number)) {
@@ -304,6 +337,47 @@ impl Watcher {
         let present: HashSet<(u32, u32)> = plugged.iter().map(|d| (d.bus, d.number)).collect();
         self.bridged.lock().unwrap().retain(|key| present.contains(key));
         self.tried.lock().unwrap().retain(|key| present.contains(key));
+    }
+}
+
+/// Sessions on an accessory, one after the other, as long as it is plugged
+/// in (present): each on what open gives (its stream, and when its device
+/// is let go of), connect making the session (its device id, or why not).
+/// The next attempt only once the device is let go of: the session's
+/// stream on it ended (the session over, or the path let go of), not as
+/// soon as connect returns (the session goes on over the cable, a reserve
+/// or the carrier, long after: claimed again meanwhile, the accessory was
+/// "Device or resource busy" each second until the cable was pulled). A
+/// failure (open's, connect's) tried again after AGAIN, twice as long each
+/// time in a row up to AGAIN_MOST (pause), and said once until it changes
+/// (say).
+fn sessions_on(device: &Device, present: &dyn Fn() -> bool, open: &dyn Fn() -> io::Result<(UnixStream, Released)>,
+               connect: &(dyn Fn(UnixStream, &Device) -> Result<String, String> + Send + Sync),
+               pause: &dyn Fn(Duration), say: &dyn Fn(String)) {
+    let mut again = AGAIN;
+    let mut said: Option<String> = None;
+    while present() {
+        let failed = match open() {
+            Ok((stream, released)) => {
+                let made = connect(stream, device);
+                released.wait();
+                match made {
+                    Ok(id) => {
+                        say(format!("usb: a session with {} by cable, over", &id[..8.min(id.len())]));
+                        (again, said) = (AGAIN, None);
+                        continue;
+                    }
+                    Err(e) => e,
+                }
+            }
+            Err(e) => e.to_string(),
+        };
+        if said.as_deref() != Some(failed.as_str()) {
+            say(format!("usb: the accessory at {}: {failed}", device.node()));
+            said = Some(failed);
+        }
+        pause(again);
+        again = (again * 2).min(AGAIN_MOST);
     }
 }
 
@@ -399,5 +473,105 @@ mod tests {
         });
         assert_eq!(result.err().and_then(|e| e.raw_os_error()), Some(libc::ENODEV));
         assert_eq!(reads, 1, "reads while no app answered, for 2 s");
+    }
+
+    /// An accessory as open_accessory() gives it, faked: claimed (a second
+    /// claim busy) until both threads of its bridge are over, the app's end
+    /// kept in apps (silent; its end would be read as zero-length packets).
+    fn fake_accessory(claimed: &Arc<std::sync::atomic::AtomicBool>, apps: &std::cell::RefCell<Vec<UnixStream>>)
+                      -> io::Result<(UnixStream, Released)> {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        struct Claim {
+            claimed: Arc<std::sync::atomic::AtomicBool>,
+            _said: mpsc::Sender<()>,
+        }
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                self.claimed.store(false, Ordering::SeqCst);
+            }
+        }
+        if claimed.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        let (said, released) = Released::new();
+        let claim = Arc::new(Claim { claimed: claimed.clone(), _said: said });
+        let (device, app) = UnixStream::pair()?;
+        apps.borrow_mut().push(app);
+        device.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let (mut reading, mut writing) = (device.try_clone()?, device);
+        let (for_reading, for_writing) = (claim.clone(), claim);
+        let stream = plusone_link::stream::bridge(
+            move |buf| {
+                let _claim = &for_reading;
+                reading.read(buf).map_err(|e| if e.kind() == io::ErrorKind::WouldBlock { io::ErrorKind::TimedOut.into() } else { e })
+            },
+            move |data| {
+                let _claim = &for_writing;
+                writing.write_all(data)
+            },
+            4096)?;
+        Ok((stream, released))
+    }
+
+    #[test]
+    fn an_accessory_is_claimed_again_only_once_its_session_let_it_go() {
+        // The session made on the cable goes on (a reserve, the carrier)
+        // long after connect returns, its stream holding the accessory:
+        // the next attempt waits for it to be let go of. (It came at once,
+        // connect given up 5 s on: "Device or resource busy" each second
+        // until the cable was pulled.)
+        let tablet = device("2-10", GOOGLE, 10, &[]);
+        let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let apps = std::cell::RefCell::new(Vec::new());
+        let opened = std::cell::RefCell::new(Vec::new());
+        let made = std::sync::atomic::AtomicUsize::new(0);
+        let said = std::cell::RefCell::new(Vec::new());
+        let started = Instant::now();
+        let held = Duration::from_millis(1500);
+        sessions_on(&tablet, &|| made.load(std::sync::atomic::Ordering::SeqCst) < 2,
+                    &|| {
+                        let accessory = fake_accessory(&claimed, &apps);
+                        opened.borrow_mut().push((started.elapsed(), accessory.is_ok()));
+                        accessory
+                    },
+                    &|stream, _| {
+                        made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // The session on it until held is over; made at once.
+                        std::thread::spawn(move || {
+                            std::thread::sleep(held);
+                            drop(stream);
+                        });
+                        Ok("6a2665bcebe1984c".repeat(4))
+                    },
+                    &std::thread::sleep, &|line| said.borrow_mut().push(line));
+        let opened = opened.into_inner();
+        assert!(opened.iter().all(|(_, ok)| *ok), "claimed while held: {opened:?}, said {:?}", said.borrow());
+        assert_eq!(opened.len(), 2, "{opened:?}");
+        assert!(opened[1].0 >= held, "claimed again {:?} in, the first held {held:?}", opened[1].0);
+        assert_eq!(said.into_inner(), ["usb: a session with 6a2665bc by cable, over"; 2]);
+        assert!(!claimed.load(std::sync::atomic::Ordering::SeqCst), "the accessory still claimed at the end");
+    }
+
+    #[test]
+    fn an_accessory_that_fails_is_tried_less_and_less_and_said_once() {
+        // Busy for a minute (another holding it): tried after 1 s, then 2,
+        // 4, 8, 16, 16... and said once. (Tried and said each second: 68
+        // lines in a minute.)
+        let tablet = device("2-11", GOOGLE, 11, &[]);
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let tries = std::cell::Cell::new(0);
+        let said = std::cell::RefCell::new(Vec::new());
+        sessions_on(&tablet, &|| clock.get() < Duration::from_secs(60),
+                    &|| {
+                        tries.set(tries.get() + 1);
+                        Err(io::Error::from_raw_os_error(libc::EBUSY))
+                    },
+                    &|_, _| unreachable!("no stream, no session"),
+                    &|pause| clock.set(clock.get() + pause), &|line| said.borrow_mut().push(line));
+        assert_eq!(tries.get(), 7, "tries in a minute (at 0, 1, 3, 7, 15, 31, 47 s)");
+        let said = said.into_inner();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("usb: the accessory at /dev/bus/usb/002/011: ") && said[0].contains("busy"), "{said:?}");
     }
 }

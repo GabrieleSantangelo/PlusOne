@@ -279,22 +279,16 @@ impl Daemon {
         let me = self.clone();
         let connect: Arc<dyn Fn(std::os::unix::net::UnixStream, &usb::Device) -> Result<String, String> + Send + Sync> =
             Arc::new(move |stream, _device| {
+                // The session goes on over the cable (the carrier or a
+                // reserve) until its stream on it ends: usb.rs waits for
+                // that before the cable carries the next. (Given up 5 s on
+                // with the session not on the cable, a reserve that stayed
+                // one was taken for over, and the accessory it held for
+                // free.)
                 let session = me.node.connect_stream(Box::new(stream), "usb")?;
                 log!("usb: a session with {} by cable", session.name);
                 if let Some(serial) = me.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
                     me.remember_usb(&serial);
-                }
-                // While it runs on the cable (it may take a moment to move
-                // over): then the cable may carry the next.
-                let since = std::time::Instant::now();
-                let mut on_it = false;
-                while !session.is_closed() {
-                    if session.path().as_deref() == Some("usb") {
-                        on_it = true;
-                    } else if on_it || since.elapsed() > Duration::from_secs(5) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(300));
                 }
                 Ok(session.peer.clone())
             });

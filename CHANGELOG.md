@@ -22,6 +22,13 @@
   minute later, or at once if nothing else is left: a Wi-Fi coming and
   going no longer takes the desktop and the sound along with each of its
   drops.
+- **The cable carries the next session once the last one let it go**:
+  plus-one-link took a session kept on the cable as a spare connection
+  for over after 5 s, and tried to open the cable again every second
+  while that session still held it, logging "Device or resource busy"
+  each time until the cable was pulled. It now opens the cable again
+  only once the session on it ended; and a cable that cannot be opened
+  is tried again after 1, 2, 4... up to 16 s, and said once.
 - **A session ended over there ends here at once**: when one side
   ended the session (closed by hand, idle, plus-one-link stopping) and
   its connection closed in the same moment, its goodbye could go unread:
