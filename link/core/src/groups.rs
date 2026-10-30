@@ -38,10 +38,11 @@
 //! newer one for lost (DisplaySession.kt): with each task handing its own
 //! messages on, a newer frame's reached it ahead of an older one's tail (sent
 //! again, or a thread behind another), 75 frames lost in 10 minutes live
-//! against 2 to 6 as datagrams. A message waits LATE at most: then the older
-//! streams still open are given up (stopped: their sender resets them) and
-//! what still comes on them is dropped; so too past HELD_MOST bytes or
-//! HELD_MESSAGES messages waiting.
+//! against 2 to 6 as datagrams. A message waits two round trips at most
+//! (LATE at least, HOLD_LONGEST at most: an older frame's lost packet sent
+//! again): then the older streams still open are given up (stopped: their
+//! sender resets them) and what still comes on them is dropped; so too past
+//! HELD_MOST bytes or HELD_MESSAGES messages waiting.
 //! Each side says its groups' counts once a second while they go (Seconds).
 //!
 //! Beside them, a stream of the session's own messages, copies of those it
@@ -60,7 +61,6 @@ use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -108,6 +108,19 @@ const AT_RATE: f64 = 1.5;
 /// Bytes of newer groups waiting for an older one on the other side, at
 /// most (Order): LATE of 300 Mbit/s, near enough.
 const HELD_MOST: usize = 4 << 20;
+/// How long a newer group's messages wait for an older one, at most
+/// (Order, hold_for()): two round trips (QUIC declares the older one's
+/// lost packet lost 9/8 of a round trip after it went, its copy takes half
+/// one more, the acknowledgements a little), as the sender gives a frame
+/// that is not a keyframe (deadline(): LATE, or its bytes' time and two
+/// round trips); LATE at least, and this at most. Not the sender's
+/// LONGEST: the other side cannot tell a key group (sealed), and every
+/// newer frame waits as long. 400 ms: a path of a 200 ms round trip (the
+/// longest MAX_STREAMS is sized for) gets its copy; past that a frame on
+/// its way is a stall the viewer sees (24 frames at 60 a second).
+const HOLD_LONGEST: Duration = Duration::from_millis(400);
+/// How often the orderer looks at the round trip again (hold_for()).
+const HOLD_EVERY: Duration = Duration::from_millis(100);
 /// Messages of newer groups waiting, at most (Order): they are opened after
 /// what came meanwhile (the datagrams: the sound, the input), and the
 /// opener takes a message its WINDOW behind the newest at most (seal.rs);
@@ -869,13 +882,19 @@ struct Held {
     overtaken: bool,
 }
 
+/// How long a newer group's messages wait for an older one, the smoothed
+/// round trip rtt (HOLD_LONGEST).
+fn hold_for(rtt: Duration) -> Duration {
+    rtt.saturating_mul(2).clamp(LATE, HOLD_LONGEST)
+}
+
 /// The other side's group streams put back in order, by their numbers: the
 /// order their groups began. The oldest stream not over (the head) hands
 /// its messages on as they come; a newer one's wait until every older one
 /// is over (finished, reset, the control stream) or given up: once a
-/// message waited LATE, or more than HELD_MOST bytes or HELD_MESSAGES
-/// messages wait, the head is given up (stopped: its stop dropped), and
-/// what still comes on it is dropped.
+/// message waited its hold (hold_for()), or more than HELD_MOST bytes or
+/// HELD_MESSAGES messages wait, the head is given up (stopped: its stop
+/// dropped), and what still comes on it is dropped.
 #[derive(Default)]
 struct Order {
     head: u64,
@@ -961,15 +980,16 @@ impl Order {
         }
     }
 
-    /// Once a message waited LATE, or too many bytes or messages wait: the
-    /// head given up, and the next, until none is so. When to look again
-    /// (the oldest waiting message's LATE), if any waits.
-    fn tick<F: FnMut(Bytes)>(&mut self, now: std::time::Instant, on: &mut F) -> Option<std::time::Instant> {
+    /// Once a message waited hold (hold_for()), or too many bytes or
+    /// messages wait: the head given up, and the next, until none is so.
+    /// When to look again (the oldest waiting message's hold), if any waits.
+    fn tick<F: FnMut(Bytes)>(&mut self, now: std::time::Instant, hold: Duration, on: &mut F)
+                             -> Option<std::time::Instant> {
         loop {
             let oldest = self.streams.values().filter_map(|s| s.since).min()?;
-            if now.saturating_duration_since(oldest) < LATE && self.held <= HELD_MOST
+            if now.saturating_duration_since(oldest) < hold && self.held <= HELD_MOST
                 && self.held_messages <= HELD_MESSAGES {
-                return Some(oldest + LATE);
+                return Some(oldest + hold);
             }
             // Its stop dropped with it: its reader stops it.
             if self.streams.remove(&self.head).is_none_or(|head| head.end.is_none()) {
@@ -1003,7 +1023,7 @@ impl Order {
 pub(crate) async fn read<F, C>(conn: Connection, on: Arc<F>, control: Option<Arc<C>>)
 where F: Fn(Bytes) + Send + Sync + 'static, C: Fn(u8, u16, Vec<u8>) + Send + Sync + 'static {
     let (reads, read) = mpsc::channel(READS);
-    tokio::spawn(order(read, on, conn.remote_address()));
+    tokio::spawn(order(read, on, conn.clone()));
     while let Ok(stream) = conn.accept_uni().await {
         let index = stream.id().index();
         let (stop, stopped) = oneshot::channel();
@@ -1014,12 +1034,15 @@ where F: Fn(Bytes) + Send + Sync + 'static, C: Fn(u8, u16, Vec<u8>) + Send + Syn
     }
 }
 
-/// The streams' messages to on in order (Order), until no reader is left;
+/// The streams' messages to on in order (Order), a newer one's held as
+/// long as conn's round trip says (hold_for()), until no reader is left;
 /// its counts said once a second while groups come.
-async fn order<F: Fn(Bytes)>(mut reads: mpsc::Receiver<Read>, on: Arc<F>, remote: SocketAddr) {
+async fn order<F: Fn(Bytes)>(mut reads: mpsc::Receiver<Read>, on: Arc<F>, conn: Connection) {
+    let remote = conn.remote_address();
     let mut order = Order::default();
     let mut seconds = Seconds::new(std::time::Instant::now(), order.stats);
     let mut wake: Option<std::time::Instant> = None;
+    let (mut hold, mut held_at) = (hold_for(conn.rtt()), std::time::Instant::now());
     let mut deliver = |message: Bytes| on(message);
     loop {
         let at = wake.into_iter().chain(seconds.due(&order.stats)).min().map(Instant::from_std);
@@ -1031,13 +1054,16 @@ async fn order<F: Fn(Bytes)>(mut reads: mpsc::Receiver<Read>, on: Arc<F>, remote
             _ = sleep_until(at) => None,
         };
         let now = std::time::Instant::now();
+        if now.saturating_duration_since(held_at) >= HOLD_EVERY {
+            (hold, held_at) = (hold_for(conn.rtt()), now);
+        }
         match read {
             Some(Read::Taken(index, stop)) => order.taken(index, stop),
             Some(Read::Message(index, message)) => order.message(index, message, now, &mut deliver),
             Some(Read::End(index, end)) => order.end(index, end, now, &mut deliver),
             None => {}
         }
-        wake = order.tick(now, &mut deliver);
+        wake = order.tick(now, hold, &mut deliver);
         if let Some(line) = order.line(&mut seconds, now) {
             log!("{remote}: {line}");
         }
@@ -1172,11 +1198,11 @@ mod tests {
         order.message(1, bytes("b1"), t + ms(2), &mut |m| got.push(m));
         order.end(1, End::Finished, t + ms(5), &mut |m| got.push(m));
         assert_eq!(got, [bytes("a1")]);
-        assert_eq!(order.tick(t + ms(5), &mut |m| got.push(m)), Some(t + LATE));
+        assert_eq!(order.tick(t + ms(5), LATE, &mut |m| got.push(m)), Some(t + LATE));
         order.message(0, bytes("a2"), t + ms(10), &mut |m| got.push(m));
         order.end(0, End::Finished, t + ms(10), &mut |m| got.push(m));
         assert_eq!(got, ["a1", "a2", "b1", "c1"].map(bytes));
-        assert_eq!(order.tick(t + ms(10), &mut |m| got.push(m)), None);
+        assert_eq!(order.tick(t + ms(10), LATE, &mut |m| got.push(m)), None);
         assert_eq!(order.stats, Received { groups: 3, overtaken: 2, held: 2, ..Received::default() });
         assert_eq!((order.held, order.head, order.held_most), (0, 3, ms(10)));
         // The next stream's, at once.
@@ -1191,12 +1217,12 @@ mod tests {
         order.message(0, bytes("a1"), t, &mut |m| got.push(m));
         order.message(2, bytes("c1"), t + ms(1), &mut |m| got.push(m));
         order.end(2, End::Finished, t + ms(1), &mut |m| got.push(m));
-        assert_eq!(order.tick(t + LATE, &mut |m| got.push(m)), Some(t + ms(1) + LATE));
+        assert_eq!(order.tick(t + LATE, LATE, &mut |m| got.push(m)), Some(t + ms(1) + LATE));
         assert_eq!(got, [bytes("a1")]);
         assert!(stops[0].try_recv().is_err_and(|e| e == oneshot::error::TryRecvError::Empty));
         // LATE: both older ones given up (the middle one had nothing yet),
         // their readers told to stop them.
-        assert_eq!(order.tick(t + ms(1) + LATE, &mut |m| got.push(m)), None);
+        assert_eq!(order.tick(t + ms(1) + LATE, LATE, &mut |m| got.push(m)), None);
         assert_eq!(got, ["a1", "c1"].map(bytes));
         for stopped in &mut stops[..2] {
             assert_eq!(stopped.try_recv(), Err(oneshot::error::TryRecvError::Closed));
@@ -1235,9 +1261,9 @@ mod tests {
         let big = Bytes::from(vec![7u8; HELD_MOST / 2]);
         order.message(1, big.clone(), t, &mut |m| got.push(m));
         order.message(1, big.clone(), t, &mut |m| got.push(m));
-        assert_eq!(order.tick(t, &mut |m| got.push(m)), Some(t + LATE));
+        assert_eq!(order.tick(t, LATE, &mut |m| got.push(m)), Some(t + LATE));
         order.message(1, bytes("one more"), t, &mut |m| got.push(m));
-        assert_eq!(order.tick(t, &mut |m| got.push(m)), None);
+        assert_eq!(order.tick(t, LATE, &mut |m| got.push(m)), None);
         assert_eq!((got.len(), order.held, order.stats.given_up), (3, 0, 1));
     }
 
@@ -1252,13 +1278,39 @@ mod tests {
         for _ in 0..HELD_MESSAGES {
             order.message(1, bytes("m"), t, &mut |m| got.push(m));
         }
-        assert_eq!(order.tick(t, &mut |m| got.push(m)), Some(t + LATE));
+        assert_eq!(order.tick(t, LATE, &mut |m| got.push(m)), Some(t + LATE));
         assert!(got.is_empty());
         order.message(1, bytes("one more"), t, &mut |m| got.push(m));
-        assert_eq!(order.tick(t, &mut |m| got.push(m)), None);
+        assert_eq!(order.tick(t, LATE, &mut |m| got.push(m)), None);
         assert_eq!(stops[0].try_recv(), Err(oneshot::error::TryRecvError::Closed));
         assert_eq!((got.len(), order.held, order.held_messages, order.stats.given_up),
                    (HELD_MESSAGES + 1, 0, 0, 1));
+    }
+
+    #[test]
+    fn on_a_long_path_an_older_frame_has_two_round_trips_for_its_lost_packet() {
+        // A 60 ms round trip: a newer frame's messages wait 120 ms. The older
+        // one's lost packet comes again 110 ms after the newer one was whole
+        // (declared lost 9/8 of a round trip after it went, its copy half a
+        // round trip more, the acknowledgements a little late): the older
+        // one handed on whole, then the newer. LATE alone gave it up at 100.
+        let ((mut order, mut stops), t) = (taken(2), At::now());
+        let mut got = Vec::new();
+        let hold = hold_for(ms(60));
+        assert_eq!(hold, ms(120));
+        order.message(0, bytes("a1"), t, &mut |m| got.push(m));
+        order.message(1, bytes("b1"), t + ms(1), &mut |m| got.push(m));
+        order.end(1, End::Finished, t + ms(1), &mut |m| got.push(m));
+        assert_eq!(order.tick(t + ms(105), hold, &mut |m| got.push(m)), Some(t + ms(121)));
+        assert_eq!(stops[0].try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        order.message(0, bytes("a2"), t + ms(111), &mut |m| got.push(m));
+        order.end(0, End::Finished, t + ms(111), &mut |m| got.push(m));
+        assert_eq!(order.tick(t + ms(111), hold, &mut |m| got.push(m)), None);
+        assert_eq!(got, ["a1", "a2", "b1"].map(bytes));
+        assert_eq!((order.stats.groups, order.stats.given_up), (2, 0));
+        // LATE on a short path; HOLD_LONGEST on one longer than MAX_STREAMS
+        // is sized for (and before the first sample: quinn's 333 ms).
+        assert_eq!((hold_for(ms(5)), hold_for(ms(333))), (LATE, HOLD_LONGEST));
     }
 
     fn begun(key: bool, handed: At, written: Option<(At, u64, u64)>, bytes: u64, rate: u64) -> Begun {
