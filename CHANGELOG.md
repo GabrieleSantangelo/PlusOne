@@ -2,6 +2,15 @@
 
 ## Unreleased (1.0)
 
+- **The cable asks a device once each time it is plugged in**: with
+  "use the cable" on, plus-one-link asked anything of Samsung's (a disk,
+  a hub) to become Plus One's accessory, and asked again every 2 s for
+  as long as it stayed plugged in, logging each refusal; so too a tablet
+  that would not switch. A disk, a hub, a keyboard, a webcam or a
+  printer is no longer asked at all, and any other device is asked once,
+  then again only once plugged in again or when "use the cable" is
+  turned on or off. A tablet charging only, with no file transfer and
+  no USB debugging, is still asked, as before.
 - **The cable waits for the app asleep**: a tablet plugged in as Plus
   One's accessory while its app did not answer (not allowed yet, or not
   installed) had plus-one-link wake every second to look again, for as

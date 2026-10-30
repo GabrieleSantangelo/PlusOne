@@ -8,7 +8,7 @@
 //!
 //! Only a tablet asked for: one whose USB serial was reached this way
 //! before (remembered), or any Android device when an app asks (the "usb"
-//! request: the user's "use the cable").
+//! request: the user's "use the cable"); each plug asked once.
 
 use plusone_link::log;
 use std::collections::HashSet;
@@ -23,6 +23,9 @@ const SYSFS: &str = "/sys/bus/usb/devices";
 const GOOGLE: &str = "18d1";
 const ACCESSORY: [&str; 2] = ["2d00", "2d01"];  // accessory; accessory and adb
 const SAMSUNG: &str = "04e8";
+/// Interface classes no tablet is made of alone: audio (01), HID (03),
+/// printer (07), mass storage (08), hub (09), video (0e).
+const NOT_A_TABLET: [&str; 6] = ["01", "03", "07", "08", "09", "0e"];
 const GET_PROTOCOL: u8 = 51;
 const SEND_STRING: u8 = 52;
 const START: u8 = 53;
@@ -81,16 +84,22 @@ impl Device {
         self.vendor == GOOGLE && ACCESSORY.contains(&self.product.as_str())
     }
 
-    /// An Android device: Samsung's, or one with an adb or MTP/PTP interface.
+    /// An Android device, maybe: Samsung's, or one with an adb or MTP/PTP
+    /// interface. A tablet charging only may show neither adb nor MTP, and
+    /// switches all the same (the accessory's requests work whatever its
+    /// USB mode); but not a device whose every interface is of a kind no
+    /// tablet is made of alone (a Samsung disk or hub, a keyboard, a
+    /// webcam, a printer).
     pub fn is_android(&self) -> bool {
         if self.is_accessory() {
             return false;
         }
-        self.vendor == SAMSUNG || interfaces(&self.path).iter().any(|i| {
-            let class = read(&i.join("bInterfaceClass"));
-            let subclass = read(&i.join("bInterfaceSubClass"));
-            class == "06" || (class == "ff" && subclass == "42")
-        })
+        let classes: Vec<(String, String)> = interfaces(&self.path).iter()
+            .map(|i| (read(&i.join("bInterfaceClass")), read(&i.join("bInterfaceSubClass")))).collect();
+        if !classes.is_empty() && classes.iter().all(|(class, _)| NOT_A_TABLET.contains(&class.as_str())) {
+            return false;
+        }
+        self.vendor == SAMSUNG || classes.iter().any(|(class, subclass)| class == "06" || (class == "ff" && subclass == "42"))
     }
 
     fn open(&self) -> io::Result<OwnedFd> {
@@ -232,20 +241,38 @@ fn ready(mut read: impl FnMut(&mut [u8], u32) -> io::Result<usize>) -> io::Resul
 /// switched when wanted (remembered serials; any while asked to).
 pub struct Watcher {
     bridged: Mutex<HashSet<(u32, u32)>>,
+    /// Plugs asked to switch already: one still there did not (refused,
+    /// no accessory mode), and asking again each EVERY changes nothing.
+    /// Forgotten as it leaves the bus (Android comes back with another
+    /// number at each change of its USB mode), or as an app asks.
+    tried: Mutex<HashSet<(u32, u32)>>,
     pub asked: std::sync::atomic::AtomicBool,
 }
 
 impl Watcher {
     pub fn new() -> Watcher {
-        Watcher { bridged: Mutex::default(), asked: std::sync::atomic::AtomicBool::new(false) }
+        Watcher { bridged: Mutex::default(), tried: Mutex::default(), asked: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// The user's "use the cable" (or no longer): each plug asked again.
+    pub fn ask(&self, on: bool) {
+        self.asked.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.tried.lock().unwrap().clear();
     }
 
     /// Once: what is plugged in now, done; an accessory on a thread of its
     /// own (it waits for the app). remembered: serials reached by cable before.
     pub fn look(&self, remembered: &dyn Fn(&str) -> bool, switched: &dyn Fn(&Device),
                 connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync>) {
+        self.look_at(devices(), &switch, remembered, switched, connect);
+    }
+
+    /// As look(), plugged in: those, each asked to switch by switch.
+    fn look_at(&self, plugged: Vec<Device>, switch: &dyn Fn(&Device) -> io::Result<()>, remembered: &dyn Fn(&str) -> bool,
+               switched: &dyn Fn(&Device),
+               connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync>) {
         let asked = self.asked.load(std::sync::atomic::Ordering::Relaxed);
-        for device in devices() {
+        for device in plugged.iter().cloned() {
             if device.is_accessory() {
                 let key = (device.bus, device.number);
                 if !self.bridged.lock().unwrap().insert(key) {
@@ -262,7 +289,8 @@ impl Watcher {
                         std::thread::sleep(Duration::from_secs(1));
                     }
                 });
-            } else if device.is_android() && (asked || (!device.serial.is_empty() && remembered(&device.serial))) {
+            } else if device.is_android() && (asked || (!device.serial.is_empty() && remembered(&device.serial)))
+                && self.tried.lock().unwrap().insert((device.bus, device.number)) {
                 match switch(&device) {
                     Ok(()) => {
                         log!("usb: {} {}:{} asked to be Plus One's accessory", device.serial, device.vendor, device.product);
@@ -273,8 +301,9 @@ impl Watcher {
             }
         }
         // Gone from the bus: forgotten (the same numbers can come again).
-        let present: HashSet<(u32, u32)> = devices().iter().map(|d| (d.bus, d.number)).collect();
+        let present: HashSet<(u32, u32)> = plugged.iter().map(|d| (d.bus, d.number)).collect();
         self.bridged.lock().unwrap().retain(|key| present.contains(key));
+        self.tried.lock().unwrap().retain(|key| present.contains(key));
     }
 }
 
@@ -285,6 +314,68 @@ pub const EVERY: Duration = Duration::from_secs(2);
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// A device in a sysfs of the test's own: its interfaces (class,
+    /// subclass, protocol, name).
+    fn device(name: &str, vendor: &str, number: u32, interfaces: &[(&str, &str, &str, &str)]) -> Device {
+        let path = std::env::temp_dir().join(format!("plus-one-usb-{}", std::process::id())).join(name);
+        let _ = fs::remove_dir_all(&path);
+        for (i, (class, subclass, protocol, named)) in interfaces.iter().enumerate() {
+            let interface = path.join(format!("{name}:1.{i}"));
+            fs::create_dir_all(&interface).unwrap();
+            for (file, value) in [("bInterfaceClass", class), ("bInterfaceSubClass", subclass), ("bInterfaceProtocol", protocol)] {
+                fs::write(interface.join(file), format!("{value}\n")).unwrap();
+            }
+            if !named.is_empty() {
+                fs::write(interface.join("interface"), format!("{named}\n")).unwrap();
+            }
+        }
+        Device { path, vendor: vendor.into(), product: "0001".into(), serial: format!("S{number}"), bus: 2, number }
+    }
+
+    #[test]
+    fn a_device_no_tablet_is_made_of_is_no_android() {
+        // Samsung's vendor id alone made a device Android: a Samsung disk
+        // or hub was asked to switch, and failed, every EVERY while "use
+        // the cable" was on. A tablet with no adb nor MTP (charging only)
+        // is still one to ask.
+        assert!(!device("2-1", "04e8", 1, &[("08", "06", "50", "")]).is_android(), "a Samsung disk");
+        assert!(!device("2-2", "04e8", 2, &[("09", "00", "00", "")]).is_android(), "a Samsung hub");
+        assert!(!device("2-3", "046d", 3, &[("0e", "01", "00", ""), ("01", "01", "00", "")]).is_android(), "a webcam");
+        assert!(device("2-4", "04e8", 4, &[("ff", "ff", "00", "")]).is_android(), "a Samsung tablet charging only");
+        assert!(device("2-5", "04e8", 5, &[]).is_android(), "a Samsung tablet showing no interface");
+        assert!(device("2-6", "04e8", 6, &[("ff", "ff", "00", "MTP"), ("ff", "42", "01", "ADB Interface")]).is_android(),
+                "a Samsung tablet, MTP and adb");
+        assert!(device("2-7", "18d1", 7, &[("ff", "42", "01", "")]).is_android(), "another's tablet, adb");
+        assert!(!device("2-8", "18d1", 8, &[("ff", "ff", "00", "")]).is_android(), "another's, no adb nor PTP");
+    }
+
+    #[test]
+    fn a_device_that_does_not_switch_is_asked_once_each_plug() {
+        // Asked again every EVERY for as long as it stayed plugged in, each
+        // failure logged.
+        let watcher = Watcher::new();
+        watcher.ask(true);
+        let tablet = device("2-9", "04e8", 9, &[("ff", "ff", "00", "")]);
+        let asked = std::cell::Cell::new(0);
+        let switch = |_: &Device| -> io::Result<()> {
+            asked.set(asked.get() + 1);
+            Err(io::Error::other("no accessory mode"))
+        };
+        let connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync> =
+            std::sync::Arc::new(|_, _| Err("no".into()));
+        let look = |plugged: Vec<Device>| watcher.look_at(plugged, &switch, &|_| false, &|_| {}, connect.clone());
+        for _ in 0..3 {
+            look(vec![tablet.clone()]);
+        }
+        assert_eq!(asked.get(), 1, "asks while it stayed plugged in");
+        look(Vec::new());
+        look(vec![tablet.clone()]);
+        assert_eq!(asked.get(), 2, "plugged in again, asked again");
+        watcher.ask(true);
+        look(vec![tablet.clone()]);
+        assert_eq!(asked.get(), 3, "an app asking, asked again");
+    }
 
     #[test]
     fn waiting_for_the_app_wakes_for_nothing() {

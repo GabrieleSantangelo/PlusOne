@@ -511,7 +511,7 @@ impl Daemon {
                 "queued" => (self.queued(&request), None),
                 "usb" => match request.get("use").map_or(Some(true), Value::as_bool) {
                     Some(on) => {
-                        self.usb.asked.store(on, Ordering::Relaxed);
+                        self.usb.ask(on);
                         (Ok(json!({"ok": true})), None)
                     }
                     None => (Err("use: true or false".into()), None),
