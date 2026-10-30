@@ -43,7 +43,9 @@
 //! again): then the older streams still open are given up (stopped: their
 //! sender resets them) and what still comes on them is dropped; so too past
 //! HELD_MOST bytes or HELD_MESSAGES messages waiting.
-//! Each side says its groups' counts once a second while they go (Seconds).
+//! Each side says its groups' counts while they go (Seconds): within a
+//! second when more moved than groups begun or whole, else every SUMMARY;
+//! what is left when it ends.
 //!
 //! Beside them, a stream of the session's own messages, copies of those it
 //! numbers (open, accept, credit...: session.rs early), ahead of all
@@ -127,8 +129,11 @@ const HOLD_EVERY: Duration = Duration::from_millis(100);
 /// a quarter of it left for what is sealed beside them. Past it they would
 /// be dropped there, all the same.
 const HELD_MESSAGES: usize = crate::seal::WINDOW as usize / 4 * 3;
-/// Counts said once a second at most (Seconds).
+/// Counts said once a second at most (Seconds), and as often as SUMMARY
+/// while only groups begin or come whole (a healthy video: one line an
+/// hour's 360, not its 3600).
 const SECOND: Duration = Duration::from_secs(1);
+const SUMMARY: Duration = Duration::from_secs(10);
 /// What the streams' readers hand the orderer, at most, before they wait
 /// for it (read()): QUIC's flow control holds the rest, as it did when each
 /// reader handed its messages on itself (a second of a 10 Mbit/s video).
@@ -192,59 +197,93 @@ impl std::fmt::Display for Stats {
 }
 
 impl Stats {
+    /// Whether more moved from before than groups begun (and bytes): a
+    /// group late, superseded, given up there or reset, a message dropped,
+    /// a credit wait, the window full (Seconds: said within a second).
+    pub(crate) fn troubled(&self, before: &Stats) -> bool {
+        (self.late, self.superseded, self.stopped, self.resets, self.dropped, self.credit_waits, self.window_full)
+            != (before.late, before.superseded, before.stopped, before.resets, before.dropped, before.credit_waits,
+                before.window_full)
+    }
+
     /// What moved from before over a span, as the log's line, if groups
-    /// went in it (began, or were reset or given up).
+    /// went in it (began, or were reset, given up, their messages dropped,
+    /// their streams waited for; not the window full alone: control frames
+    /// find it too).
     pub(crate) fn line(&self, before: &Stats, over: Duration) -> Option<String> {
         let d = |a: u64, b: u64| a.saturating_sub(b);
         let begun = d(self.groups, before.groups);
         let (late, superseded, stopped) =
             (d(self.late, before.late), d(self.superseded, before.superseded), d(self.stopped, before.stopped));
-        if begun + late + superseded + stopped == 0 {
+        let (resets, dropped, credit_waits) =
+            (d(self.resets, before.resets), d(self.dropped, before.dropped), d(self.credit_waits, before.credit_waits));
+        if begun + late + superseded + stopped + resets + dropped + credit_waits == 0 {
             return None;
         }
         Some(format!("groups over {:.1} s: {begun} begun, {late} late ({} unsent), {superseded} superseded, \
                       {stopped} given up there, {} reset; {} messages dropped, {} credit waits, {} window full; \
                       {:.0} KB on streams, {:.1} KB lost",
-                     over.as_secs_f64(), d(self.late_unsent, before.late_unsent), d(self.resets, before.resets),
-                     d(self.dropped, before.dropped), d(self.credit_waits, before.credit_waits),
+                     over.as_secs_f64(), d(self.late_unsent, before.late_unsent), resets, dropped, credit_waits,
                      d(self.window_full, before.window_full),
                      d(self.stream_bytes, before.stream_bytes) as f64 / 1000.0,
                      d(self.lost_bytes, before.lost_bytes) as f64 / 1000.0))
     }
 }
 
-/// Counts said once a second at most while they move, as the other
-/// per-second lines are (quic.rs Drops): what moved since the last said.
-/// Nothing to wake for while nothing moves.
+/// Counts said while they move, as the other per-second lines are (quic.rs
+/// Drops): what moved since the last said, within a second if troubled
+/// says more moved than the healthy counts, else SUMMARY after the last;
+/// and what is left when they end (rest). Nothing to wake for while
+/// nothing moves.
 pub(crate) struct Seconds<T> {
     since: std::time::Instant,
     said: T,
+    troubled: fn(&T, &T) -> bool,
 }
 
 impl<T: Copy + PartialEq> Seconds<T> {
-    pub(crate) fn new(now: std::time::Instant, counts: T) -> Seconds<T> {
-        Seconds { since: now, said: counts }
+    pub(crate) fn new(now: std::time::Instant, counts: T, troubled: fn(&T, &T) -> bool) -> Seconds<T> {
+        Seconds { since: now, said: counts, troubled }
     }
 
-    /// When the next line is due: a second after the last, if the counts
-    /// moved since.
+    /// How long after the last line the next one is due, the counts now:
+    /// none if they did not move.
+    fn every(&self, counts: &T) -> Option<Duration> {
+        (*counts != self.said).then(|| if (self.troubled)(counts, &self.said) { SECOND } else { SUMMARY })
+    }
+
+    /// When the next line is due, if the counts moved since the last.
     pub(crate) fn due(&self, counts: &T) -> Option<std::time::Instant> {
-        (*counts != self.said).then(|| self.since + SECOND)
+        self.every(counts).map(|every| self.since + every)
     }
 
-    /// The last second's line (line: the counts now, as last said, over
-    /// how long), once it is over and if they moved in it.
+    /// The line due (line: the counts now, as last said, over how long),
+    /// once its time is over and if they moved in it.
     pub(crate) fn note(&mut self, now: std::time::Instant, counts: T,
                        line: impl FnOnce(&T, &T, Duration) -> Option<String>) -> Option<String> {
-        if counts == self.said {
+        let Some(every) = self.every(&counts) else {
             self.since = now;
             return None;
-        }
-        let over = now.saturating_duration_since(self.since);
-        if over < SECOND {
+        };
+        if now.saturating_duration_since(self.since) < every {
             return None;
         }
-        let said = line(&counts, &self.said, over);
+        self.say(now, counts, line)
+    }
+
+    /// What moved since the last line, now whatever its time: the counts
+    /// end (their connection over).
+    pub(crate) fn rest(&mut self, now: std::time::Instant, counts: T,
+                       line: impl FnOnce(&T, &T, Duration) -> Option<String>) -> Option<String> {
+        if counts == self.said {
+            return None;
+        }
+        self.say(now, counts, line)
+    }
+
+    fn say(&mut self, now: std::time::Instant, counts: T, line: impl FnOnce(&T, &T, Duration) -> Option<String>)
+           -> Option<String> {
+        let said = line(&counts, &self.said, now.saturating_duration_since(self.since));
         (self.since, self.said) = (now, counts);
         said
     }
@@ -635,11 +674,11 @@ impl Writing {
 /// The writer of a connection's groups (on its runtime), until the
 /// connection's Groups is gone: each message to its group's stream, a
 /// stream opened for each new group (the one before finished). The counts
-/// said once a second while groups go.
+/// said while groups go (Seconds), what is left at the end.
 pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, shared: Arc<Shared>) {
     let mut writing: HashMap<u16, Writing> = HashMap::new();
     let mut opened = 0u32;
-    let mut seconds = Seconds::new(std::time::Instant::now(), shared.stats());
+    let mut seconds = Seconds::new(std::time::Instant::now(), shared.stats(), Stats::troubled);
     loop {
         let due = seconds.due(&shared.stats()).map(Instant::from_std);
         let piece = tokio::select! {
@@ -730,6 +769,9 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
     }
     for (channel, mut w) in writing {
         w.finish(channel, &shared);
+    }
+    if let Some(line) = seconds.rest(std::time::Instant::now(), shared.stats(), Stats::line) {
+        log!("{}: {line}", conn.remote_address());
     }
 }
 
@@ -831,6 +873,14 @@ pub struct Received {
 }
 
 impl Received {
+    /// Whether more moved from before than groups whole: a group reset
+    /// there, not whole when a newer one was, held for an older one or
+    /// given up, a message dropped (Seconds: said within a second).
+    fn troubled(&self, before: &Received) -> bool {
+        (self.reset, self.overtaken, self.held, self.given_up, self.dropped)
+            != (before.reset, before.overtaken, before.held, before.given_up, before.dropped)
+    }
+
     /// What moved from before over a span, as the log's line, if groups
     /// came in it (held_most: the longest a stream's messages waited in it,
     /// held_bytes_most the most bytes waiting).
@@ -838,15 +888,15 @@ impl Received {
         let d = |a: u64, b: u64| a.saturating_sub(b);
         let (groups, reset, given_up) =
             (d(self.groups, before.groups), d(self.reset, before.reset), d(self.given_up, before.given_up));
-        if groups + reset + given_up == 0 {
+        let (overtaken, held, dropped) =
+            (d(self.overtaken, before.overtaken), d(self.held, before.held), d(self.dropped, before.dropped));
+        if groups + reset + given_up + overtaken + held + dropped == 0 {
             return None;
         }
-        Some(format!("groups in over {:.1} s: {groups} whole, {reset} reset; {} not whole when a newer one was, \
-                      {} held for an older one ({:.0} ms, {:.0} KB at most), {given_up} given up, \
-                      {} messages dropped after",
-                     over.as_secs_f64(), d(self.overtaken, before.overtaken), d(self.held, before.held),
-                     held_most.as_secs_f64() * 1000.0, held_bytes_most as f64 / 1000.0,
-                     d(self.dropped, before.dropped)))
+        Some(format!("groups in over {:.1} s: {groups} whole, {reset} reset; {overtaken} not whole when a newer one \
+                      was, {held} held for an older one ({:.0} ms, {:.0} KB at most), {given_up} given up, \
+                      {dropped} messages dropped after",
+                     over.as_secs_f64(), held_most.as_secs_f64() * 1000.0, held_bytes_most as f64 / 1000.0))
     }
 }
 
@@ -1001,10 +1051,12 @@ impl Order {
         }
     }
 
-    /// The last second's line, if it is over and groups came.
-    fn line(&mut self, seconds: &mut Seconds<Received>, now: std::time::Instant) -> Option<String> {
+    /// The line due (Seconds), if its time is over and groups came; at the
+    /// end (rest), what is left.
+    fn line(&mut self, seconds: &mut Seconds<Received>, now: std::time::Instant, rest: bool) -> Option<String> {
         let (most, bytes) = (self.held_most, self.held_bytes_most);
-        let line = seconds.note(now, self.stats, |stats, before, over| stats.line(before, over, most, bytes));
+        let line = |stats: &Received, before: &Received, over| stats.line(before, over, most, bytes);
+        let line = if rest { seconds.rest(now, self.stats, line) } else { seconds.note(now, self.stats, line) };
         if line.is_some() {
             (self.held_most, self.held_bytes_most) = (Duration::ZERO, self.held);
         }
@@ -1036,11 +1088,11 @@ where F: Fn(Bytes) + Send + Sync + 'static, C: Fn(u8, u16, Vec<u8>) + Send + Syn
 
 /// The streams' messages to on in order (Order), a newer one's held as
 /// long as conn's round trip says (hold_for()), until no reader is left;
-/// its counts said once a second while groups come.
+/// its counts said while groups come (Seconds), what is left at the end.
 async fn order<F: Fn(Bytes)>(mut reads: mpsc::Receiver<Read>, on: Arc<F>, conn: Connection) {
     let remote = conn.remote_address();
     let mut order = Order::default();
-    let mut seconds = Seconds::new(std::time::Instant::now(), order.stats);
+    let mut seconds = Seconds::new(std::time::Instant::now(), order.stats, Received::troubled);
     let mut wake: Option<std::time::Instant> = None;
     let (mut hold, mut held_at) = (hold_for(conn.rtt()), std::time::Instant::now());
     let mut deliver = |message: Bytes| on(message);
@@ -1064,9 +1116,12 @@ async fn order<F: Fn(Bytes)>(mut reads: mpsc::Receiver<Read>, on: Arc<F>, conn: 
             None => {}
         }
         wake = order.tick(now, hold, &mut deliver);
-        if let Some(line) = order.line(&mut seconds, now) {
+        if let Some(line) = order.line(&mut seconds, now, false) {
             log!("{remote}: {line}");
         }
+    }
+    if let Some(line) = order.line(&mut seconds, std::time::Instant::now(), true) {
+        log!("{remote}: {line}");
     }
 }
 
@@ -1362,41 +1417,70 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_sent_are_said_once_a_second_while_they_go() {
+    fn the_groups_sent_are_said_within_a_second_when_more_than_their_beginnings_moved_else_every_ten() {
         let t = At::now();
-        let mut seconds = Seconds::new(t, Stats::default());
-        let mut stats = Stats { groups: 30, late: 1, late_bytes: 9000, resets: 1, stream_bytes: 600_000,
-                                lost_bytes: 1500, ..Stats::default() };
-        assert_eq!(seconds.note(t + ms(500), stats, Stats::line), None);
-        assert_eq!(seconds.due(&stats), Some(t + SECOND));
-        (stats.groups, stats.superseded, stats.resets, stats.late_unsent) = (60, 1, 2, 1);
-        assert_eq!(seconds.note(t + SECOND, stats, Stats::line).as_deref(),
-                   Some("groups over 1.0 s: 60 begun, 1 late (1 unsent), 1 superseded, 0 given up there, 2 reset; \
-                         0 messages dropped, 0 credit waits, 0 window full; 600 KB on streams, 1.5 KB lost"));
+        let mut seconds = Seconds::new(t, Stats::default(), Stats::troubled);
+        // A healthy video: groups begun, their bytes, the datagrams' losses
+        // (the sound's): a line each SUMMARY.
+        let mut stats = Stats { groups: 60, stream_bytes: 600_000, lost_bytes: 1500, ..Stats::default() };
+        assert_eq!(seconds.due(&stats), Some(t + SUMMARY));
+        assert_eq!(seconds.note(t + SECOND, stats, Stats::line), None);
+        (stats.groups, stats.stream_bytes) = (600, 6_000_000);
+        assert_eq!(seconds.note(t + SUMMARY, stats, Stats::line).as_deref(),
+                   Some("groups over 10.0 s: 600 begun, 0 late (0 unsent), 0 superseded, 0 given up there, 0 reset; \
+                         0 messages dropped, 0 credit waits, 0 window full; 6000 KB on streams, 1.5 KB lost"));
+        // One late, reset: said within a second.
+        let at = t + SUMMARY;
+        (stats.groups, stats.late, stats.late_bytes, stats.resets, stats.late_unsent) = (630, 1, 9000, 1, 1);
+        assert_eq!(seconds.due(&stats), Some(at + SECOND));
+        assert_eq!(seconds.note(at + ms(500), stats, Stats::line), None);
+        assert_eq!(seconds.note(at + SECOND, stats, Stats::line).as_deref(),
+                   Some("groups over 1.0 s: 30 begun, 1 late (1 unsent), 0 superseded, 0 given up there, 1 reset; \
+                         0 messages dropped, 0 credit waits, 0 window full; 0 KB on streams, 0.0 KB lost"));
         // Nothing moved: nothing said, nothing to wake for.
         assert_eq!(seconds.due(&stats), None);
-        assert_eq!(seconds.note(t + ms(3000), stats, Stats::line), None);
-        // The newest's bytes alone: no line.
-        stats.stream_bytes += 1000;
-        assert_eq!(seconds.note(t + ms(3500), stats, Stats::line), None);
-        assert_eq!(seconds.note(t + ms(4100), stats, Stats::line), None);
+        assert_eq!(seconds.note(at + ms(3000), stats, Stats::line), None);
+        // The window full alone (a control frame's) and the newest's bytes:
+        // looked at within a second, no line.
+        (stats.window_full, stats.stream_bytes) = (1, 6_001_000);
+        assert_eq!(seconds.due(&stats), Some(at + ms(4000)));
+        assert_eq!(seconds.note(at + ms(4000), stats, Stats::line), None);
+        // Given up there: within a second.
         stats.stopped += 1;
-        assert_eq!(seconds.note(t + ms(4600), stats, Stats::line), None);
-        assert!(seconds.note(t + ms(5200), stats, Stats::line).unwrap().contains(" 1 given up there"));
+        assert_eq!(seconds.note(at + ms(4500), stats, Stats::line), None);
+        assert!(seconds.note(at + ms(5000), stats, Stats::line).unwrap().contains(" 1 given up there"));
+        // What is left when the connection is over, whenever that is.
+        stats.groups += 5;
+        assert_eq!(seconds.note(at + ms(5100), stats, Stats::line), None);
+        assert!(seconds.rest(at + ms(5100), stats, Stats::line).unwrap().starts_with("groups over 0.1 s: 5 begun,"));
+        assert_eq!(seconds.rest(at + ms(5200), stats, Stats::line), None);
     }
 
     #[test]
-    fn the_groups_come_are_said_once_a_second_while_they_come() {
-        let ((mut order, _stops), t) = (taken(3), At::now());
-        let mut seconds = Seconds::new(t, order.stats);
-        order.message(1, bytes("b1"), t, &mut |_| {});
-        order.end(1, End::Finished, t, &mut |_| {});
-        assert_eq!(order.line(&mut seconds, t + ms(10)), None);
-        order.end(0, End::Finished, t + ms(12), &mut |_| {});
-        order.end(2, End::Cut, t + ms(20), &mut |_| {});
-        assert_eq!(order.line(&mut seconds, t + SECOND).as_deref(),
-                   Some("groups in over 1.0 s: 2 whole, 1 reset; 1 not whole when a newer one was, \
+    fn the_groups_come_are_said_within_a_second_when_held_or_reset_else_every_ten() {
+        let ((mut order, _stops), t) = (taken(4), At::now());
+        let mut seconds = Seconds::new(t, order.stats, Received::troubled);
+        // Whole in order: a line each SUMMARY.
+        order.end(0, End::Finished, t, &mut |_| {});
+        assert_eq!(seconds.due(&order.stats), Some(t + SUMMARY));
+        assert_eq!(order.line(&mut seconds, t + SECOND, false), None);
+        assert_eq!(order.line(&mut seconds, t + SUMMARY, false).as_deref(),
+                   Some("groups in over 10.0 s: 1 whole, 0 reset; 0 not whole when a newer one was, \
+                         0 held for an older one (0 ms, 0 KB at most), 0 given up, 0 messages dropped after"));
+        // One held for an older one, that one reset: within a second.
+        let at = t + SUMMARY;
+        order.message(2, bytes("c1"), at, &mut |_| {});
+        order.end(2, End::Finished, at, &mut |_| {});
+        order.end(1, End::Cut, at + ms(12), &mut |_| {});
+        assert_eq!(seconds.due(&order.stats), Some(at + SECOND));
+        assert_eq!(order.line(&mut seconds, at + ms(500), false), None);
+        assert_eq!(order.line(&mut seconds, at + SECOND, false).as_deref(),
+                   Some("groups in over 1.0 s: 1 whole, 1 reset; 1 not whole when a newer one was, \
                          1 held for an older one (12 ms, 0 KB at most), 0 given up, 0 messages dropped after"));
         assert_eq!((order.held_most, seconds.due(&order.stats)), (Duration::ZERO, None));
+        // What is left when the connection is over, whenever that is.
+        order.end(3, End::Finished, at + ms(1100), &mut |_| {});
+        assert_eq!(order.line(&mut seconds, at + ms(1100), false), None);
+        assert!(order.line(&mut seconds, at + ms(1100), true).unwrap().starts_with("groups in over 0.1 s: 1 whole,"));
     }
 }
