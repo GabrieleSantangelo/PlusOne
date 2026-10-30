@@ -14,7 +14,7 @@ pub const DIALER: u32 = 1;
 pub const LISTENER: u32 = 2;
 /// How far behind the newest a datagram may come and still count
 /// (Wi-Fi reorders; a reordered packet is not a replay).
-const WINDOW: u64 = 1024;
+pub(crate) const WINDOW: u64 = 1024;
 
 fn key(bytes: &[u8; 32]) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&AES_256_GCM, bytes).expect("a 32-byte key"))

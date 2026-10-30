@@ -46,8 +46,8 @@ const ALPN: &[u8] = b"plus-one-link/1";
 const LOCAL_MTU: u16 = 1452;
 /// Realtime that would wait longer than this for the window: dropped (a
 /// group this long after its first byte went out, at least: reset; a newer
-/// one's messages wait this long at most for it on the other side:
-/// groups.rs).
+/// one's messages wait this long for it on the other side, or two round
+/// trips: groups.rs).
 pub(crate) const LATE: Duration = Duration::from_millis(100);
 const DATAGRAM_SEND_BUFFER: usize = 512 << 10;
 /// What quinn takes from the session's stream before it is acknowledged,
