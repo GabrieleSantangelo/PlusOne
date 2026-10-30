@@ -1252,3 +1252,77 @@ fn a_reserve_carries_its_pings_and_nothing_else() {
     }
     assert_eq!(kinds(&session), reserved);
 }
+
+/// A stream between a and b through a relay that holds what comes while
+/// paused (as a network gone silent a while, what was on its way delivered
+/// as it comes back): (a's end, b's end, the pause).
+fn pausable() -> (std::os::unix::net::UnixStream, std::os::unix::net::UnixStream, Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write};
+    let (a, relay_a) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (b, relay_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for (mut from, mut to) in [(relay_a.try_clone().unwrap(), relay_b.try_clone().unwrap()), (relay_b, relay_a)] {
+        let paused = paused.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16384];
+            let wait = || while paused.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            loop {
+                wait();
+                let n = match from.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => break,
+                };
+                wait();
+                if to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            let _ = to.shutdown(std::net::Shutdown::Both);
+        });
+    }
+    (a, b, paused)
+}
+
+#[test]
+fn a_path_gone_suspect_is_not_made_the_carrier_again_for_a_while() {
+    // usb the carrier, bt a reserve; usb silent 2.5 s: suspect on both
+    // sides, and bt the carrier at once. Heard again, usb is a reserve,
+    // better, but not made the carrier again (it was, 2 s after, and went
+    // with the next silence: a Wi-Fi coming and going took the session
+    // along each time); unless it is the only one left: bt cut, usb the
+    // carrier at once. Never detached.
+    let (pc, tablet, _address) = pair();
+    let (pc_told, tablet_told) = (told(&pc), told(&tablet));
+    let (session, bt) = stream_path(&pc, &tablet, "bt");
+    let (pcs, tablets, paused) = pausable();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "usb").map(|_| ())
+    });
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "usb").unwrap(), &session), "the same session, another path");
+    let theirs = tablet.sessions().pop().unwrap();
+    let on = |kind: &str| session.path().as_deref() == Some(kind) && theirs.path().as_deref() == Some(kind);
+    until("on usb on both sides", || on("usb") && session.paths().len() == 2 && theirs.paths().len() == 2);
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    let silent = Instant::now();
+    until("on bt on both sides", || on("bt"));
+    let moved = silent.elapsed();
+    assert!(moved >= Duration::from_millis(1400) && moved < Duration::from_millis(2300), "on bt {moved:?} after the silence");
+    std::thread::sleep(Duration::from_millis(2500).saturating_sub(silent.elapsed()));
+    paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    let reserved = [("bt".to_owned(), "active"), ("usb".to_owned(), "standby")];
+    until("usb heard again, a reserve", || kinds(&session) == reserved && kinds(&theirs) == reserved);
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!((kinds(&session), kinds(&theirs)), (reserved.to_vec(), reserved.to_vec()), "usb the carrier again");
+    let cut = Instant::now();
+    bt.shutdown(std::net::Shutdown::Both).unwrap();
+    until("on usb, the only one", || on("usb"));
+    assert!(cut.elapsed() < Duration::from_millis(500), "on usb {:?} after bt was cut", cut.elapsed());
+    for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
+        let said: Vec<_> = told.try_iter().map(|(event, path, _)| (event, path.unwrap_or_default())).collect();
+        let expected = [("up", "bt"), ("moved", "usb"), ("moved", "bt"), ("moved", "usb")].map(|(e, p)| (e, p.to_owned()));
+        assert_eq!(said, expected, "{side}");
+    }
+}

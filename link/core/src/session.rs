@@ -20,10 +20,11 @@
 //! carrier alone: the carrier lost or suspect, the best reserve takes its
 //! place at once, what it had not delivered first again on it, no
 //! detaching; a better path (rank()) is a reserve first, the carrier's
-//! once heard throughout HYSTERESIS. With no path left, or with a peer
-//! from before (one path at a time: a better one coming takes over, the
-//! one before is retired), the session waits RESUME_WAIT for another (the
-//! dialer makes one: plus-one-link).
+//! once heard throughout HYSTERESIS, unless its kind failed or went
+//! suspect carrying within FLAP_HOLD (then only if no other is left). With
+//! no path left, or with a peer from before (one path at a time: a better
+//! one coming takes over, the one before is retired), the session waits
+//! RESUME_WAIT for another (the dialer makes one: plus-one-link).
 //!
 //! Threads, none of them busy while nothing moves:
 //! - the session's: it alone touches the paths' TLS connections; reads
@@ -72,6 +73,10 @@ const MAX_PATHS: usize = 3;
 /// this long (its own pings): not at once (a path that came and went at
 /// once carried nothing meanwhile).
 const HYSTERESIS: Duration = Duration::from_secs(2);
+/// A kind whose path failed, or went suspect while it carried, is not
+/// made the carrier again for this long, while another is left: a Wi-Fi
+/// coming and going does not take the session along each time.
+const FLAP_HOLD: Duration = Duration::from_secs(60);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
@@ -723,11 +728,20 @@ struct Live {
 /// What the session's thread keeps of its paths: those it drives, the
 /// carrier first; whether one was taken before (the next carrier sends
 /// again what that one had not delivered, and tells Moved); the last
-/// carrier lost and why, until it is said (detached, or another taken).
+/// carrier lost and why, until it is said (detached, or another taken);
+/// when each kind last failed, or went suspect carrying (FLAP_HOLD).
 struct Paths {
     lives: Vec<Live>,
     resumed: bool,
     last: Option<(String, String)>,
+    held: HashMap<String, Instant>,
+}
+
+impl Paths {
+    /// Whether a path of kind is held off the carrier's place (FLAP_HOLD).
+    fn held(&self, kind: &str) -> bool {
+        self.held.get(kind).is_some_and(|at| at.elapsed() < FLAP_HOLD)
+    }
 }
 
 /// Why a path left the session's thread.
@@ -1598,7 +1612,7 @@ impl Session {
     /// several, the carrier and its reserves at once): each round over the
     /// paths there are; none left, another waited for.
     fn run(self: Arc<Self>, first: Established, path: Arc<Path>) {
-        let mut paths = Paths { lives: Vec::new(), resumed: false, last: None };
+        let mut paths = Paths { lives: Vec::new(), resumed: false, last: None, held: HashMap::new() };
         let mut plain = vec![0u8; 64 << 10];
         let kind = first.kind.clone();
         // The path given, not kept here: its socket goes with it.
@@ -1800,6 +1814,9 @@ impl Session {
                 log!("{}: the {} path ({}) failed ({reason}), {:.1} s after the last heard{suspect}", self.label(), path.kind,
                      path.id, silent.as_secs_f64());
                 self.tell_path(path, PathState::Failed);
+                if self.multipath {
+                    paths.held.insert(path.kind.clone(), Instant::now());
+                }
             }
         }
         if !self.multipath {
@@ -1831,12 +1848,13 @@ impl Session {
     }
 
     /// The reserve that takes the carrier's place: the best heard lately
-    /// (rank()); the carrier lost, any left rather than none (one suspect,
-    /// one being let go of).
+    /// (rank()), one held (FLAP_HOLD) only if no other is; the carrier
+    /// lost, any left rather than none (one suspect, one being let go of).
     fn best_reserve(&self, paths: &Paths, carrier_lost: bool) -> Option<usize> {
         paths.lives.iter().enumerate().skip(if carrier_lost { 0 } else { 1 })
             .filter(|(_, live)| carrier_lost || (live.leaving.is_none() && live.suspect_since.is_none()))
-            .max_by_key(|(_, live)| (live.leaving.is_none(), live.suspect_since.is_none(), live.path.rank()))
+            .max_by_key(|(_, live)| (live.leaving.is_none(), live.suspect_since.is_none(), !paths.held(&live.path.kind),
+                                     live.path.rank()))
             .map(|(index, _)| index)
     }
 
@@ -1924,9 +1942,9 @@ impl Session {
     /// better one of its kind took the place of is let go of once the
     /// other side is heard on that one (or HANDOVER_CAP after); the
     /// carrier suspect, the best reserve heard lately takes its place at
-    /// once; else a better reserve heard throughout HYSTERESIS does. When
-    /// to look again, if something is due (the round's wait: no timer of
-    /// its own).
+    /// once (the suspect's kind held: FLAP_HOLD); else a better reserve
+    /// heard throughout HYSTERESIS does, its kind not held. When to look
+    /// again, if something is due (the round's wait: no timer of its own).
     fn choose(self: &Arc<Self>, paths: &mut Paths) -> Option<Instant> {
         let now = Instant::now();
         let mut next: Option<Instant> = None;
@@ -1949,6 +1967,7 @@ impl Session {
                 index += 1;
             }
         }
+        paths.held.retain(|_, at| now.duration_since(*at) < FLAP_HOLD);
         if paths.lives.len() < 2 {
             return next;
         }
@@ -1956,6 +1975,7 @@ impl Session {
             if let Some(best) = self.best_reserve(paths, false) {
                 log!("{}: from {} to {} at once, the {} path suspect", self.label(), paths.lives[0].path.kind,
                      paths.lives[best].path.kind, paths.lives[0].path.kind);
+                paths.held.insert(paths.lives[0].path.kind.clone(), now);
                 self.carry(paths, best);
             }
             return next;
@@ -1968,7 +1988,8 @@ impl Session {
                 || live.path.rank() <= carrier {
                 continue;
             }
-            let ready = live.steady_since + HYSTERESIS;
+            let held = paths.held.get(&live.path.kind).map(|at| *at + FLAP_HOLD);
+            let ready = held.map_or(live.steady_since + HYSTERESIS, |held| held.max(live.steady_since + HYSTERESIS));
             if now < ready {
                 soon(ready, &mut next);
             } else if best.is_none_or(|best| live.path.rank() > paths.lives[best].path.rank()) {

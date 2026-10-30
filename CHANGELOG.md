@@ -16,6 +16,12 @@
   better one coming (the cable) is used once it has worked for 2 s, the
   one before kept ready. With an app or a plus-one-link from before, one
   connection at a time, as before.
+- **A connection that comes and goes is not gone back to for a minute**:
+  a connection that failed, or went silent while in use, is still kept
+  ready once it works again, but the session goes back to it only a
+  minute later, or at once if nothing else is left: a Wi-Fi coming and
+  going no longer takes the desktop and the sound along with each of its
+  drops.
 - **A session ended over there ends here at once**: when one side
   ended the session (closed by hand, idle, plus-one-link stopping) and
   its connection closed in the same moment, its goodbye could go unread:
