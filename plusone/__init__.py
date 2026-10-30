@@ -5,7 +5,7 @@ import os
 import tempfile
 import time
 
-__version__ = "0.10.0"
+__version__ = "0.10.37"
 
 _handlers = []
 
