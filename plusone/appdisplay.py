@@ -483,8 +483,8 @@ class RateControl:
     asked for again. Meanwhile whole frames are left out to stay within the
     budget (Allowance): fewer frames for that time, none late; with PAY,
     down sooner once those are worth PAY frames (a keyframe is VBV_FRAMES).
-    Up only by UP at least, UP_AFTER after its last change. HOLD, PAY and
-    FITS as L36 has them."""
+    Up only by UP at least, UP_AFTER after its last change. A stream starts
+    at the budget's share (start()). HOLD, PAY and FITS as L36 has them."""
 
     SHARE = 0.85    # of a path's budget (its congestion controller's), the video's
     STEADY = 0.05   # up to the most: by this much at least
@@ -601,6 +601,14 @@ class RateControl:
                         + (f"; under it for {now - under:.1f} s" if under is not None else ""))
         return kbps
 
+    def start(self, budget, others=0):
+        """The bitrate a stream starts at, on a path whose budget is known:
+        its share at once (the first frame is a keyframe anyway: no change
+        to hold back), not the most and a hold of frames left out."""
+        self.kbps = max(MIN_KBPS, min(self.most, int(budget * self.SHARE - others)))
+        self.changed_at, self.last = time.monotonic(), (budget, others)
+        return self.kbps
+
     def tick(self, now=None):
         """Between the budget's events (it may tell nothing new for long):
         the new bitrate once the budget has been under it for HOLD, else
@@ -688,10 +696,11 @@ class L36:
     encoded sent, keyframes made as asked. Else (the default) a cut is first
     absorbed by whole frames left out within the budget (Allowance), the
     bitrate down only once it has held, keyframes made once they fit, whole
-    frames to the link. Its knobs, the frames left out (each kept within
-    its range, said if not):
+    frames to the link; and the stream starts at the budget's share. Its
+    knobs, the frames left out (each kept within its range, said if not):
     PLUSONE_L36_HOLD_MS: how long the budget must stay under the bitrate
-    before it goes down (RateControl.HOLD);
+    before it goes down (RateControl.HOLD), on an encoder whose every
+    change of bitrate is a keyframe (Intel's: elsewhere, none);
     PLUSONE_L36_PAY: down sooner once the frames left out for it are worth
     this many frames at the bitrate (0: never; a change costs a keyframe,
     media.VBV_FRAMES of them);
@@ -744,12 +753,15 @@ class L36:
         """Of the budget less the others', what the video may send."""
         return self.fits / 100 if self.on else RateControl.FITS
 
-    def describe(self):
+    def describe(self, restarts=True):
+        """restarts: each change of the encoder's bitrate is a keyframe (else
+        no hold: AppStreamer._encoder_restarts)."""
         if not self.on:
             said = "l36 off (PLUSONE_L36=0): the bitrate down at once, every frame sent"
         else:
-            said = (f"l36 on, hold {self.hold_ms} ms, pay {self.pay or 'off'}{' frames' if self.pay else ''}, "
-                    f"allowance {self.depth} frames at {self.fits} % of the budget")
+            held = (f"hold {self.hold_ms} ms, pay {self.pay or 'off'}{' frames' if self.pay else ''}" if restarts
+                    else "no hold (a change of bitrate is no keyframe on this encoder)")
+            said = f"l36 on, {held}, allowance {self.depth} frames at {self.fits} % of the budget"
         return said + "".join(f"; {wrong}" for wrong in self.wrong)
 
 
@@ -872,8 +884,9 @@ class AppStreamer:
             video = (f"pipewiresrc path={source} do-timestamp=true always-copy=false keepalive-time=100 ! "
                      f"video/x-raw,format={media.CAPTURE_FORMAT},width={width},height={height},"
                      f"max-framerate={fps}/1")
+        self._rates(channel, fps, bitrate)  # (the bitrate it starts at, self.kbps: the budget's share, if told)
         element, options, raw_format = media.ENCODERS[encoder]
-        enc = f"{element} name=enc " + options.format(bitrate=bitrate, gop=fps * media.KEYFRAME_SECONDS)
+        enc = f"{element} name=enc " + options.format(bitrate=self.kbps, gop=fps * media.KEYFRAME_SECONDS)
         convert = media.CONVERT.get(encoder, f"videoconvert n-threads=4 ! video/x-raw,format={raw_format}")
         self.pipeline = Gst.parse_launch(
             f"{video} ! queue max-size-buffers=1 leaky=downstream ! {convert} ! "
@@ -881,9 +894,8 @@ class AppStreamer:
             f"video/x-h264,stream-format=byte-stream,alignment=au ! "
             f"appsink name=out emit-signals=true sync=false async=false max-buffers=0")
         enc = self.enc = self.pipeline.get_by_name("enc")
-        media.cap_keyframes(enc, bitrate, fps)
-        self._rates(channel, fps, bitrate)
-        self._restarts = enc.get_factory().get_name() in media.RESTARTS
+        media.cap_keyframes(enc, self.kbps, fps)
+        self._encoder_restarts(enc.get_factory().get_name() in media.RESTARTS)
         self.keyframes = media.Keyframes(enc, on_flush=self._captured.clear)
         self._in_pad = enc.get_static_pad("sink")
         self._in_probe = self._in_pad.add_probe(Gst.PadProbeType.BUFFER, self._frame_in)
@@ -894,8 +906,9 @@ class AppStreamer:
         self._bus_handler = bus.connect("message::error", self._failed)
         self._feedback = threading.Thread(target=self._listen, daemon=True)
         to = f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams) else "the link"
-        log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {to}")
-        log(f"app display: {self.l36.describe()}")
+        log(f"app display: {width}x{height}@{fps} {encoder} {self.kbps} kbit/s"
+            + (f" (the budget's share; at most {bitrate})" if self.kbps != bitrate else "") + f" -> {to}")
+        log(f"app display: {self.l36.describe(self._restarts)}")
 
     def _rates(self, channel, fps, bitrate):
         """What decides which frames go and at what bitrate (not GStreamer's:
@@ -915,8 +928,10 @@ class AppStreamer:
         # what waits counts against it, and in bytes as they are.
         self._budget_kbps = channel.budget_kbps() if hasattr(channel, "budget_kbps") else None
         self.allowance = Allowance(fps, self.l36.depth)
-        if self._budget_kbps:
-            self._follow(self._budget_kbps, 0)
+        if self._budget_kbps and self.l36.on:
+            self._others = channel.others_kbps() if hasattr(channel, "others_kbps") else 0
+            self.kbps = self.rate.start(self._budget_kbps, self._others)
+            self._follow(self._budget_kbps, self._others)
         self._frame = 0
         self._last_keyframe = 0.0  # one asked for, or sent
         self._keyframes = 0  # sent since the last stats
@@ -935,6 +950,15 @@ class AppStreamer:
         # (Its output timestamps could not be traced back after a flush.)
         self._captured = collections.deque()
         self._running = True
+
+    def _encoder_restarts(self, restarts):
+        """Whether each change of the encoder's bitrate is a keyframe (Intel's,
+        media.RESTARTS): only then is a cut held before the bitrate goes
+        down (HOLD, PAY). Elsewhere (NVENC, x264) a change is made in place:
+        down at once, no frames left out for a keyframe never made."""
+        self._restarts = restarts
+        if not restarts:
+            self.rate.hold = self.rate.pay = 0
 
     def start(self):
         with self._state_lock:

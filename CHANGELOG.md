@@ -9,7 +9,9 @@
   took less: frames late, lost, keyframes asked for, more bitrate
   changes. A cut now leaves out whole frames for as long as it lasts, so
   that what goes stays within it; the bitrate goes down only if the cut
-  holds for a second. And no keyframe goes after another still on its
+  holds for a second (on Intel's encoders, where each change is a
+  keyframe; elsewhere at once), and a stream starts at what the link
+  takes, not at the most. And no keyframe goes after another still on its
   way: the tablet's asks for one meanwhile are left (it asks again if it
   still needs one), a change of bitrate waits for it to go out. A frame
   goes to the tablet whole or not at all: the link dropped what would

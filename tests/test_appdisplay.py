@@ -566,6 +566,7 @@ def test_on_quic_a_frame_is_left_out_before_the_link_would_drop_it():
     # past 100 ms of it (125 KB). Of the bitrate (20 Mbit/s), it was 225 KB.
     link = FakeLink(budget=10000, queued=90 << 10)
     streamer = streamer_on(link)
+    streamer.rate.kbps = streamer.kbps = 20000  # (it started at the budget's share: the budget since cut)
     assert streamer._frame_in(None, None) == appdisplay.Gst.PadProbeReturn.DROP
     assert streamer.skipped == {"queue": 1}
     streamer._budget(None)  # no budget (TCP): the bitrate's, the kernel's bytes as before
@@ -687,6 +688,35 @@ def test_the_hold_is_a_knob_counted_to_the_frame(monkeypatch):
     assert streamer.kbps == 8500  # held...
     offer_frames(streamer, clock, 0.05)
     assert streamer.kbps == 5950  # ...300 ms: down with that frame, not at the listener's next wake (250 ms)
+
+
+def test_no_hold_where_a_change_of_bitrate_is_no_keyframe(monkeypatch):
+    # NVENC, x264: the bitrate changed in place; held, a cut only left out
+    # frames for a keyframe that never comes.
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(appdisplay, "log", lambda *args: None)
+    streamer = streamer_on(FakeLink(budget=10000), bitrate=20000)
+    streamer._encoder_restarts(False)
+    streamer._budget(7000)
+    assert streamer.kbps == 5950  # at once
+    assert streamer.l36.describe(restarts=False).startswith("l36 on, no hold (a change of bitrate is no keyframe")
+    streamer = streamer_on(FakeLink(budget=10000), bitrate=20000)
+    streamer._encoder_restarts(True)  # Intel's
+    streamer._budget(7000)
+    assert streamer.kbps == 8500 and streamer.rate.hold == appdisplay.L36().hold
+
+
+def test_a_stream_starts_at_the_budget_s_share(monkeypatch):
+    # The first frame is a keyframe anyway: no change to hold back. From the
+    # most (the preset's 20 Mbit/s on a 10 Mbit/s budget), the first second
+    # left out half its frames, then a keyframe to go down.
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    streamer = streamer_on(FakeLink(budget=10000, others=1000), bitrate=20000)
+    assert streamer.kbps == streamer.rate.kbps == 7500  # 0.85 of the budget, less the speakers'
+    assert offer_frames(streamer, clock, 1, keyframe_every=60)[0] == 60
+    assert streamer_on(FakeLink(budget=None), bitrate=20000).kbps == 20000  # no budget: the most, as ever
 
 
 def test_a_deep_cut_goes_down_once_the_frames_left_out_pay_for_its_keyframe():
