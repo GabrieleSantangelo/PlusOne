@@ -659,8 +659,9 @@ fn probes(kind: &str) -> bool {
 
 /// What a stream takes, measured each RATE_WINDOW from what its socket
 /// took: how much realtime may wait on it (REALTIME_WAIT of what it takes
-/// while it is full: what its socket took, or its budget if more; at most
-/// wait_most()), and, for a kind with a prior (Bluetooth, a cable), its
+/// while it is full: what its socket took, full throughout; full at some
+/// point only, that or its budget if more; at most wait_most()), and, for a
+/// kind with a prior (Bluetooth, a cable), its
 /// budget, told as a QUIC path's controller tells its own
 /// (cc.rs: past PUBLISH_CHANGE of the last told, a cut at once, up at most
 /// each PUBLISH_EVERY). The budget is what the stream drains: what its
@@ -744,22 +745,27 @@ impl Drain {
         if elapsed < RATE_WINDOW || !self.settled {
             return None;
         }
-        // Full in it: it takes what its socket took at least, its budget if
-        // more; else all there is. (A stream much faster than what goes on
-        // it, a cable, fills its little room at each burst all the same:
-        // what its socket took was only what it was given, and REALTIME_WAIT
-        // of that, under a keyframe, dropped the keyframe's tail each time,
-        // the tablet asked for another, in a loop.)
+        // Full throughout: what its socket took is what it takes. Full at
+        // some point only: that at least, its budget if more (a stream much
+        // faster than what goes on it, a cable, fills its little room at
+        // each burst all the same: what its socket took was only what it
+        // was given, and REALTIME_WAIT of that, under a keyframe, dropped
+        // the keyframe's tail each time, the tablet asked for another, in a
+        // loop). Else all there is. (Its budget, its prior until measured,
+        // with the stream full throughout: a cable the other side read at
+        // 1 MB/s let 1.8 MB of realtime wait, its prior's REALTIME_WAIT,
+        // 1.8 s of what it drained.)
+        let throughout = self.full_at_start && self.full_now && !self.dry;
         let wait = if self.full {
             let took = self.bytes as f64 / elapsed.as_secs_f64();
-            let takes = took.max(self.budget.unwrap_or(0) as f64);
+            let takes = if throughout { took } else { took.max(self.budget.unwrap_or(0) as f64) };
             ((takes * REALTIME_WAIT.as_secs_f64()) as usize).clamp(8 << 10, self.wait_most())
         } else {
             self.wait_most()
         };
         let mut told = None;
         if self.budget.is_some() {
-            if self.full_at_start && self.full_now && !self.dry {
+            if throughout {
                 self.run.push_back((self.bytes, elapsed));
             } else {
                 self.run.clear();  // what the socket held meanwhile is not known: from the next again
@@ -3526,5 +3532,28 @@ mod tests {
         bt.wrote(10_000);
         bt.after(true, false);
         assert_eq!(bt.roll(at(200)).map(|(wait, _)| wait), Some((BT_PRIOR as f64 * 0.15) as usize));
+    }
+
+    #[test]
+    fn a_cable_read_slowly_lets_realtime_wait_only_what_it_drains() {
+        // The tablet reading 1 MB/s of a cable taken for 12 MB/s (USB 2's
+        // prior), the stream full from the first window on: full at its end
+        // only, a window may be a burst's (REALTIME_WAIT of the prior, 1.8
+        // MB); full throughout, what its socket took is what it drains:
+        // REALTIME_WAIT of that, 150 KB, at once. (1.8 MB, 1.8 s of what it
+        // drained, until the drain was measured a second later.)
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut cable = Drain::new(start, Some(12_000_000)).probing(12_000_000);
+        let mut waits = Vec::new();
+        for ms in (200..=1000).step_by(200) {
+            cable.wrote(200_000);
+            cable.after(true, false);
+            waits.extend(cable.roll(at(ms)).map(|(wait, _)| wait));
+        }
+        assert_eq!(waits.len(), 5);
+        assert_eq!(waits[0], 1_800_000, "full at its end only");
+        assert!(waits[1..].iter().all(|wait| wait.abs_diff(150_000) <= 1), "full throughout: {waits:?}");
+        assert_eq!(cable.budget, Some(12_000_000), "not measured yet");
     }
 }
