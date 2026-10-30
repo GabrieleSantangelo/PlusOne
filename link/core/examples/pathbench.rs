@@ -719,7 +719,7 @@ fn main() {
         if session.by_quic() {
             println!("test=av_groups {}", groups(before, session.group_stats()));
         }
-        println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
+        end(&session);
         return;
     }
     if let Some(chained) = chained {
@@ -731,7 +731,7 @@ fn main() {
                 println!("test=chain_{} {}", variant.name, chain(&session, chained, variant));
             }
         }
-        println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
+        end(&session);
         return;
     }
     println!("test=rt_idle {}", realtime(&session, seconds));
@@ -817,6 +817,13 @@ fn main() {
     if session.by_quic() {
         println!("test=groups {}", groups(None, session.group_stats()));
     }
-    println!("test=end dropped={} rate_kbps={:?}", session.dropped(),
-             session.rate().map(|r| r * 8 / 1000));
+    end(&session);
+}
+
+/// The bench's end said (test=end), and the session closed: the tablet
+/// says what is left of its counts (its groups' last lines, Seconds) before
+/// netbench.sh reads them.
+fn end(session: &Arc<Session>) {
+    println!("test=end dropped={} rate_kbps={:?}", session.dropped(), session.rate().map(|r| r * 8 / 1000));
+    session.close();
 }

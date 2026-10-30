@@ -24,7 +24,11 @@
 # packets let go in bursts, as a Wi-Fi aggregates them). NETBENCH_TABLET_CPUS:
 # the tablet on one CPU (NETBENCH_TABLET_CPU, else 0), that share of it each
 # 10 ms (0.3: a slow core, its threads in turn). The tablet's own lines (its
-# groups as they came) follow each run's, each after "tablet: ".
+# groups as they came: within a second when one was held, reset or given
+# up, else every 10 s, and what is left once pathbench closes the session)
+# follow each run's, each after "tablet: ". NETBENCH_TRANSPORTS: those of
+# "tcp quic" each run goes on (quic alone: the video's groups, in half the
+# time).
 set -e
 cd "$(dirname "$0")/.."
 name=${NETBENCH_NAME:-po}
@@ -82,7 +86,7 @@ if [ "${extra:-}" = cross ]; then
     cross_pc="{ (sleep 1; cat /dev/zero | nc $name-tablet 5001 > /dev/null) & } &&"
 fi
 for run in $(seq "$runs"); do
-    for transport in tcp quic; do
+    for transport in ${NETBENCH_TRANSPORTS:-tcp quic}; do
         docker rm -f "$name-tablet" > /dev/null 2>&1 || true
         docker run -d --name "$name-tablet" $tablet_cpus --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" \
             plus-one-netbench sh -c "$shape && $cross_tablet exec /b/tablet --cert /w/tablet/cert.pem --key /w/tablet/key.pem \
