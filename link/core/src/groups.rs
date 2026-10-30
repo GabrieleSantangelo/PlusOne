@@ -40,7 +40,8 @@
 //! again, or a thread behind another), 75 frames lost in 10 minutes live
 //! against 2 to 6 as datagrams. A message waits LATE at most: then the older
 //! streams still open are given up (stopped: their sender resets them) and
-//! what still comes on them is dropped; so too past HELD_MOST bytes waiting.
+//! what still comes on them is dropped; so too past HELD_MOST bytes or
+//! HELD_MESSAGES messages waiting.
 //! Each side says its groups' counts once a second while they go (Seconds).
 //!
 //! Beside them, a stream of the session's own messages, copies of those it
@@ -107,6 +108,12 @@ const AT_RATE: f64 = 1.5;
 /// Bytes of newer groups waiting for an older one on the other side, at
 /// most (Order): LATE of 300 Mbit/s, near enough.
 const HELD_MOST: usize = 4 << 20;
+/// Messages of newer groups waiting, at most (Order): they are opened after
+/// what came meanwhile (the datagrams: the sound, the input), and the
+/// opener takes a message its WINDOW behind the newest at most (seal.rs);
+/// a quarter of it left for what is sealed beside them. Past it they would
+/// be dropped there, all the same.
+const HELD_MESSAGES: usize = crate::seal::WINDOW as usize / 4 * 3;
 /// Counts said once a second at most (Seconds).
 const SECOND: Duration = Duration::from_secs(1);
 /// What the streams' readers hand the orderer, at most, before they wait
@@ -866,15 +873,16 @@ struct Held {
 /// order their groups began. The oldest stream not over (the head) hands
 /// its messages on as they come; a newer one's wait until every older one
 /// is over (finished, reset, the control stream) or given up: once a
-/// message waited LATE, or more than HELD_MOST bytes wait, the head is
-/// given up (stopped: its stop dropped), and what still comes on it is
-/// dropped.
+/// message waited LATE, or more than HELD_MOST bytes or HELD_MESSAGES
+/// messages wait, the head is given up (stopped: its stop dropped), and
+/// what still comes on it is dropped.
 #[derive(Default)]
 struct Order {
     head: u64,
     streams: BTreeMap<u64, Held>,
-    /// Bytes waiting.
+    /// Bytes waiting, and messages.
     held: usize,
+    held_messages: usize,
     stats: Received,
     /// The longest a stream's messages waited, and the most bytes waiting,
     /// since the last line.
@@ -901,6 +909,7 @@ impl Order {
         let stream = self.streams.entry(index).or_default();
         stream.since.get_or_insert(now);
         self.held += message.len();
+        self.held_messages += 1;
         self.held_bytes_most = self.held_bytes_most.max(self.held);
         stream.messages.push(message);
     }
@@ -947,17 +956,19 @@ impl Order {
         }
         for message in head.messages.drain(..) {
             self.held -= message.len();
+            self.held_messages -= 1;
             on(message);
         }
     }
 
-    /// Once a message waited LATE, or too many bytes wait: the head given
-    /// up, and the next, until none is so. When to look again (the oldest
-    /// waiting message's LATE), if any waits.
+    /// Once a message waited LATE, or too many bytes or messages wait: the
+    /// head given up, and the next, until none is so. When to look again
+    /// (the oldest waiting message's LATE), if any waits.
     fn tick<F: FnMut(Bytes)>(&mut self, now: std::time::Instant, on: &mut F) -> Option<std::time::Instant> {
         loop {
             let oldest = self.streams.values().filter_map(|s| s.since).min()?;
-            if now.saturating_duration_since(oldest) < LATE && self.held <= HELD_MOST {
+            if now.saturating_duration_since(oldest) < LATE && self.held <= HELD_MOST
+                && self.held_messages <= HELD_MESSAGES {
                 return Some(oldest + LATE);
             }
             // Its stop dropped with it: its reader stops it.
@@ -1228,6 +1239,26 @@ mod tests {
         order.message(1, bytes("one more"), t, &mut |m| got.push(m));
         assert_eq!(order.tick(t, &mut |m| got.push(m)), None);
         assert_eq!((got.len(), order.held, order.stats.given_up), (3, 0, 1));
+    }
+
+    #[test]
+    fn more_messages_waiting_than_the_opener_takes_behind_give_the_head_up() {
+        // Opened after the datagrams that came meanwhile, a message more than
+        // the opener's WINDOW behind the newest is dropped there: at most
+        // HELD_MESSAGES wait, however few bytes they are.
+        assert!(HELD_MESSAGES < crate::seal::WINDOW as usize);
+        let ((mut order, mut stops), t) = (taken(2), At::now());
+        let mut got = Vec::new();
+        for _ in 0..HELD_MESSAGES {
+            order.message(1, bytes("m"), t, &mut |m| got.push(m));
+        }
+        assert_eq!(order.tick(t, &mut |m| got.push(m)), Some(t + LATE));
+        assert!(got.is_empty());
+        order.message(1, bytes("one more"), t, &mut |m| got.push(m));
+        assert_eq!(order.tick(t, &mut |m| got.push(m)), None);
+        assert_eq!(stops[0].try_recv(), Err(oneshot::error::TryRecvError::Closed));
+        assert_eq!((got.len(), order.held, order.held_messages, order.stats.given_up),
+                   (HELD_MESSAGES + 1, 0, 0, 1));
     }
 
     fn begun(key: bool, handed: At, written: Option<(At, u64, u64)>, bytes: u64, rate: u64) -> Begun {
