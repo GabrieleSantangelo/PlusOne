@@ -683,8 +683,9 @@ fn probes(kind: &str) -> bool {
 
 /// What a stream takes, measured each RATE_WINDOW from what its socket
 /// took: how much realtime may wait on it (REALTIME_WAIT of what it takes
-/// while it is full: what its socket took, or its budget if more; at most
-/// wait_most()), and, for a kind with a prior (Bluetooth, a cable), its
+/// while it is full: what its socket took, full throughout; full at some
+/// point only, that or its budget if more; at most wait_most()), and, for a
+/// kind with a prior (Bluetooth, a cable), its
 /// budget, told as a QUIC path's controller tells its own
 /// (cc.rs: past PUBLISH_CHANGE of the last told, a cut at once, up at most
 /// each PUBLISH_EVERY). The budget is what the stream drains: what its
@@ -768,22 +769,27 @@ impl Drain {
         if elapsed < RATE_WINDOW || !self.settled {
             return None;
         }
-        // Full in it: it takes what its socket took at least, its budget if
-        // more; else all there is. (A stream much faster than what goes on
-        // it, a cable, fills its little room at each burst all the same:
-        // what its socket took was only what it was given, and REALTIME_WAIT
-        // of that, under a keyframe, dropped the keyframe's tail each time,
-        // the tablet asked for another, in a loop.)
+        // Full throughout: what its socket took is what it takes. Full at
+        // some point only: that at least, its budget if more (a stream much
+        // faster than what goes on it, a cable, fills its little room at
+        // each burst all the same: what its socket took was only what it
+        // was given, and REALTIME_WAIT of that, under a keyframe, dropped
+        // the keyframe's tail each time, the tablet asked for another, in a
+        // loop). Else all there is. (Its budget, its prior until measured,
+        // with the stream full throughout: a cable the other side read at
+        // 1 MB/s let 1.8 MB of realtime wait, its prior's REALTIME_WAIT,
+        // 1.8 s of what it drained.)
+        let throughout = self.full_at_start && self.full_now && !self.dry;
         let wait = if self.full {
             let took = self.bytes as f64 / elapsed.as_secs_f64();
-            let takes = took.max(self.budget.unwrap_or(0) as f64);
+            let takes = if throughout { took } else { took.max(self.budget.unwrap_or(0) as f64) };
             ((takes * REALTIME_WAIT.as_secs_f64()) as usize).clamp(8 << 10, self.wait_most())
         } else {
             self.wait_most()
         };
         let mut told = None;
         if self.budget.is_some() {
-            if self.full_at_start && self.full_now && !self.dry {
+            if throughout {
                 self.run.push_back((self.bytes, elapsed));
             } else {
                 self.run.clear();  // what the socket held meanwhile is not known: from the next again
@@ -800,7 +806,9 @@ impl Drain {
                 self.probe_at = now + PROBE_AFTER;
             } else if let (Some(ceiling), Some(was)) = (self.ceiling, self.budget) {
                 // Not measured again for PROBE_AFTER: up toward the prior.
-                if was < ceiling && now >= self.probe_at {
+                // Not while it is full throughout (a measure under way: up
+                // then, the apps would only fill it more).
+                if was < ceiling && now >= self.probe_at && self.run.is_empty() {
                     let up = ((was as f64 * PROBE_UP) as u64).min(ceiling);
                     budget = Some(up);
                     self.measured = up < ceiling;
@@ -1168,7 +1176,8 @@ fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
     let quic = established.quic.take();
     // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
     let transport = if quic.is_some() { "quic" } else { established.stream.transport() };
-    let budget = established.stream.prior().or_else(|| prior(&established.kind)).filter(|_| quic.is_none()).unwrap_or(0);
+    let budget = established.stream.prior().filter(|prior| *prior != 0).or_else(|| prior(&established.kind))
+        .filter(|_| quic.is_none()).unwrap_or(0);
     Ok(Arc::new(Path { id, kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
@@ -3684,5 +3693,56 @@ mod tests {
         bt.wrote(10_000);
         bt.after(true, false);
         assert_eq!(bt.roll(at(200)).map(|(wait, _)| wait), Some((BT_PRIOR as f64 * 0.15) as usize));
+    }
+
+    #[test]
+    fn a_cable_read_slowly_lets_realtime_wait_only_what_it_drains() {
+        // The tablet reading 1 MB/s of a cable taken for 12 MB/s (USB 2's
+        // prior), the stream full from the first window on: full at its end
+        // only, a window may be a burst's (REALTIME_WAIT of the prior, 1.8
+        // MB); full throughout, what its socket took is what it drains:
+        // REALTIME_WAIT of that, 150 KB, at once. (1.8 MB, 1.8 s of what it
+        // drained, until the drain was measured a second later.)
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut cable = Drain::new(start, Some(12_000_000)).probing(12_000_000);
+        let mut waits = Vec::new();
+        for ms in (200..=1000).step_by(200) {
+            cable.wrote(200_000);
+            cable.after(true, false);
+            waits.extend(cable.roll(at(ms)).map(|(wait, _)| wait));
+        }
+        assert_eq!(waits.len(), 5);
+        assert_eq!(waits[0], 1_800_000, "full at its end only");
+        assert!(waits[1..].iter().all(|wait| wait.abs_diff(150_000) <= 1), "full throughout: {waits:?}");
+        assert_eq!(cable.budget, Some(12_000_000), "not measured yet");
+    }
+
+    #[test]
+    fn a_cables_budget_goes_up_only_while_it_is_not_full() {
+        // Measured at 1 MB/s (the tablet reading slowly), then not full,
+        // then full throughout again from before PROBE_AFTER is past: not
+        // up meanwhile, measured again (1 MB/s) once a second of it went.
+        // (It went up 1.5 times while full, the apps told to fill it more:
+        // the probe against the drain.)
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let prior = 12_000_000u64;
+        let slow = prior / 12;
+        let mut cable = Drain::new(start, Some(prior)).probing(prior);
+        let mut told = Vec::new();
+        for ms in (200..=1200).step_by(200) {
+            told.extend(window(&mut cable, at(ms), (slow / 5) as usize, true, false).map(|t| (ms, t)));
+        }
+        assert_eq!(told, [(1200, slow)], "measured");
+        told.clear();
+        for ms in (1400..=2600).step_by(200) {
+            told.extend(window(&mut cable, at(ms), 1000, false, true).map(|t| (ms, t)));
+        }
+        for ms in (2800..=4000).step_by(200) {
+            told.extend(window(&mut cable, at(ms), (slow / 5) as usize, true, false).map(|t| (ms, t)));
+        }
+        assert!(told.is_empty(), "up while full: {told:?}");
+        assert_eq!((cable.budget, cable.measured), (Some(slow), true));
     }
 }
