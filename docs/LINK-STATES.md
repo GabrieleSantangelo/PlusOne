@@ -47,7 +47,7 @@ Device machine with candidates.
 | `DISCOVERY_ROUND` | 3 s | one round of the cascade |
 | `BACKOFF` | 1, 2, 4, … 30 s | between failed rounds while wanted |
 | `UPGRADE_LOOK` | 30 s | while on a path below the best rank seen, look again for better |
-| `FLAP_HOLD` | 60 s | a kind whose path failed, or went suspect while it carried, does not carry again before it, while another is left **[built]** |
+| `FLAP_HOLD` | 60 s | a kind whose path failed, or went suspect while it carried, does not carry again before it, while another is left; not the cable (pulled, it was the user's hand) **[built]** |
 
 ## 1. Discovery (per device, while wanted)
 

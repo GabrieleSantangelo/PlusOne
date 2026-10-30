@@ -1343,24 +1343,24 @@ fn pausable() -> (std::os::unix::net::UnixStream, std::os::unix::net::UnixStream
 
 #[test]
 fn a_path_gone_suspect_is_not_made_the_carrier_again_for_a_while() {
-    // usb the carrier, bt a reserve; usb silent 2.5 s: suspect on both
-    // sides, and bt the carrier at once. Heard again, usb is a reserve,
-    // better, but not made the carrier again (it was, 2 s after, and went
-    // with the next silence: a Wi-Fi coming and going took the session
-    // along each time); unless it is the only one left: bt cut, usb the
-    // carrier at once. Never detached.
+    // p2p (Wi-Fi Direct) the carrier, bt a reserve; p2p silent 2.5 s:
+    // suspect on both sides, and bt the carrier at once. Heard again, p2p
+    // is a reserve, better, but not made the carrier again (it was, 2 s
+    // after, and went with the next silence: a Wi-Fi coming and going took
+    // the session along each time); unless it is the only one left: bt
+    // cut, p2p the carrier at once. Never detached.
     let (pc, tablet, _address) = pair();
     let (pc_told, tablet_told) = (told(&pc), told(&tablet));
     let (session, bt) = stream_path(&pc, &tablet, "bt");
     let (pcs, tablets, paused) = pausable();
     std::thread::spawn({
         let tablet = tablet.clone();
-        move || tablet.accept_stream(Box::new(tablets), "usb").map(|_| ())
+        move || tablet.accept_stream(Box::new(tablets), "p2p").map(|_| ())
     });
-    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "usb").unwrap(), &session), "the same session, another path");
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "p2p").unwrap(), &session), "the same session, another path");
     let theirs = tablet.sessions().pop().unwrap();
     let on = |kind: &str| session.path().as_deref() == Some(kind) && theirs.path().as_deref() == Some(kind);
-    until("on usb on both sides", || on("usb") && session.paths().len() == 2 && theirs.paths().len() == 2);
+    until("on p2p on both sides", || on("p2p") && session.paths().len() == 2 && theirs.paths().len() == 2);
     paused.store(true, std::sync::atomic::Ordering::SeqCst);
     let silent = Instant::now();
     until("on bt on both sides", || on("bt"));
@@ -1368,19 +1368,62 @@ fn a_path_gone_suspect_is_not_made_the_carrier_again_for_a_while() {
     assert!(moved >= Duration::from_millis(1400) && moved < Duration::from_millis(2300), "on bt {moved:?} after the silence");
     std::thread::sleep(Duration::from_millis(2500).saturating_sub(silent.elapsed()));
     paused.store(false, std::sync::atomic::Ordering::SeqCst);
-    let reserved = [("bt".to_owned(), "active"), ("usb".to_owned(), "standby")];
-    until("usb heard again, a reserve", || kinds(&session) == reserved && kinds(&theirs) == reserved);
+    let reserved = [("bt".to_owned(), "active"), ("p2p".to_owned(), "standby")];
+    until("p2p heard again, a reserve", || kinds(&session) == reserved && kinds(&theirs) == reserved);
     std::thread::sleep(Duration::from_secs(4));
-    assert_eq!((kinds(&session), kinds(&theirs)), (reserved.to_vec(), reserved.to_vec()), "usb the carrier again");
+    assert_eq!((kinds(&session), kinds(&theirs)), (reserved.to_vec(), reserved.to_vec()), "p2p the carrier again");
     let cut = Instant::now();
     bt.shutdown(std::net::Shutdown::Both).unwrap();
-    until("on usb, the only one", || on("usb"));
-    assert!(cut.elapsed() < Duration::from_millis(500), "on usb {:?} after bt was cut", cut.elapsed());
+    until("on p2p, the only one", || on("p2p"));
+    assert!(cut.elapsed() < Duration::from_millis(500), "on p2p {:?} after bt was cut", cut.elapsed());
     for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
         let said: Vec<_> = told.try_iter().map(|(event, path, _)| (event, path.unwrap_or_default())).collect();
-        let expected = [("up", "bt"), ("moved", "usb"), ("moved", "bt"), ("moved", "usb")].map(|(e, p)| (e, p.to_owned()));
+        let expected = [("up", "bt"), ("moved", "p2p"), ("moved", "bt"), ("moved", "p2p")].map(|(e, p)| (e, p.to_owned()));
         assert_eq!(said, expected, "{side}");
     }
+}
+
+#[test]
+fn a_cable_is_the_carrier_again_each_time_it_is_plugged_back() {
+    // lan the carrier; the cable plugged: a usb path, the carrier once heard
+    // throughout 2 s, on both sides; pulled: lan at once. Plugged back (a
+    // new usb path each time), the carrier again 2 s on, three times; and
+    // gone silent while it carried (the tablet stalled), lan at once, and
+    // the cable the carrier again once heard throughout 2 s. (Each pull
+    // held the cable off the carrier's place for 60 s, as a Wi-Fi that
+    // flaps: it stayed a reserve while the user plugged it again and
+    // again.)
+    let (pc, tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|theirs| theirs.id == session.id));
+    let theirs = tablet.sessions().pop().unwrap();
+    let on = |kind: &str| session.path().as_deref() == Some(kind) && theirs.path().as_deref() == Some(kind);
+    let alone = || session.paths().len() == 1 && theirs.paths().len() == 1;
+    for plug in 1..=3 {
+        let (by_cable, cable) = stream_path(&pc, &tablet, "usb");
+        assert!(Arc::ptr_eq(&by_cable, &session), "plug {plug}: the same session, another path");
+        let plugged = Instant::now();
+        until("on usb on both sides", || on("usb"));
+        assert!(plugged.elapsed() < Duration::from_millis(4500), "plug {plug}: on usb {:?} after", plugged.elapsed());
+        cable.shutdown(std::net::Shutdown::Both).unwrap();
+        let pulled = Instant::now();
+        until("on lan on both sides", || on("lan") && alone());
+        assert!(pulled.elapsed() < Duration::from_millis(500), "plug {plug}: on lan {:?} after", pulled.elapsed());
+    }
+    let (pcs, tablets, paused) = pausable();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "usb").map(|_| ())
+    });
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "usb").unwrap(), &session), "the same session, another path");
+    until("on usb on both sides", || on("usb"));
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    until("on lan on both sides", || on("lan"));
+    paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    let heard = Instant::now();
+    until("on usb again on both sides", || on("usb"));
+    assert!(heard.elapsed() < Duration::from_millis(4500), "on usb {:?} after it was heard again", heard.elapsed());
+    assert!(!session.is_closed());
 }
 
 #[test]

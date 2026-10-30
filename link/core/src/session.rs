@@ -21,7 +21,8 @@
 //! place at once, what it had not delivered first again on it, no
 //! detaching; a better path (rank()) is a reserve first, the carrier's
 //! once heard throughout HYSTERESIS, unless its kind failed or went
-//! suspect carrying within FLAP_HOLD (then only if no other is left). With
+//! suspect carrying within FLAP_HOLD (then only if no other is left; never
+//! the cable, which comes and goes by the user's hand). With
 //! no path left, or with a peer from before (one path at a time: a better
 //! one coming takes over, the one before is retired), the session waits
 //! RESUME_WAIT for another (the dialer makes one: plus-one-link).
@@ -76,7 +77,8 @@ const HYSTERESIS: Duration = Duration::from_secs(2);
 /// A kind whose path failed, or went suspect while it carried, is not
 /// made the carrier again for this long, while another is left (again
 /// from each time it goes suspect as a reserve meanwhile): a Wi-Fi coming
-/// and going does not take the session along each time.
+/// and going does not take the session along each time. Not the cable
+/// (flaps()).
 const FLAP_HOLD: Duration = Duration::from_secs(60);
 /// A better reserve takes the carrier's place only just heard (this
 /// recently: its pings come each PING_EVERY, and the session's thread
@@ -207,6 +209,16 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn channel_id(message: &Value) -> Result<u16, String> {
     let id = &message["id"];
     id.as_u64().and_then(|id| u16::try_from(id).ok()).ok_or_else(|| format!("no channel's id: {id}"))
+}
+
+/// Whether a kind's path comes and goes by itself (the air's: a Wi-Fi, a
+/// Bluetooth link; the relay's Internet): FLAP_HOLD holds it. Not the
+/// cable: pulled, it was the user's hand, not a flaky link, and plugged
+/// back in it is the carrier as soon as it is heard throughout HYSTERESIS
+/// (held 60 s after each pull, it stayed a reserve while the user plugged
+/// it again and again).
+fn flaps(kind: &str) -> bool {
+    kind != "usb"
 }
 
 /// How good a path is: a better one takes over from a worse.
@@ -828,6 +840,13 @@ impl Paths {
     /// Whether a path of kind is held off the carrier's place (FLAP_HOLD).
     fn held(&self, kind: &str) -> bool {
         self.held.get(kind).is_some_and(|at| at.elapsed() < FLAP_HOLD)
+    }
+
+    /// kind held off the carrier's place from at (FLAP_HOLD), if it flaps.
+    fn hold(&mut self, kind: &str, at: Instant) {
+        if flaps(kind) {
+            self.held.insert(kind.to_owned(), at);
+        }
     }
 }
 
@@ -1910,7 +1929,7 @@ impl Session {
                      path.id, silent.as_secs_f64());
                 self.tell_path(path, PathState::Failed);
                 if self.multipath {
-                    paths.held.insert(path.kind.clone(), Instant::now());
+                    paths.hold(&path.kind, Instant::now());
                 }
             }
         }
@@ -2087,7 +2106,8 @@ impl Session {
             if let Some(best) = self.best_reserve(paths, false) {
                 log!("{}: from {} to {} at once, the {} path suspect", self.label(), paths.lives[0].path.kind,
                      paths.lives[best].path.kind, paths.lives[0].path.kind);
-                paths.held.insert(paths.lives[0].path.kind.clone(), now);
+                let suspect = paths.lives[0].path.kind.clone();
+                paths.hold(&suspect, now);
                 self.carry(paths, best);
             }
             return next;
@@ -3421,6 +3441,20 @@ mod tests {
             assert_eq!(window(&mut tcp, at(ms), 1 << 20, true, false), None);
         }
         assert_eq!(tcp.budget, None);
+    }
+
+    #[test]
+    fn the_cable_is_never_held() {
+        // Pulled, it was the user's hand: plugged back, the carrier as soon
+        // as heard throughout HYSTERESIS. The air's kinds, held (FLAP_HOLD).
+        let mut paths = Paths { lives: Vec::new(), resumed: false, last: None, held: HashMap::new() };
+        let now = Instant::now();
+        paths.hold("usb", now);
+        assert!(!paths.held("usb"));
+        for kind in ["lan", "p2p", "ap", "bt", "relay"] {
+            paths.hold(kind, now);
+            assert!(paths.held(kind), "{kind}");
+        }
     }
 
     #[test]

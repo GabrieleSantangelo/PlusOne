@@ -21,7 +21,8 @@
   ready once it works again, but the session goes back to it only a
   minute later, or at once if nothing else is left: a Wi-Fi coming and
   going no longer takes the desktop and the sound along with each of its
-  drops.
+  drops. Not the cable: pulled and plugged back in, it is used again 2 s
+  later each time (it stayed unused for a minute after each pull).
 - **The desktop at its best by cable**: on the cable the desktop's
   bitrate followed only the tablet's reports, a third off at each frame
   lost, and frames were lost at each keyframe: the link took the cable
