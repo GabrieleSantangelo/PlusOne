@@ -201,7 +201,7 @@ impl NodeInner {
             }
         }
         let session = Session::start(self, established)?;
-        let before = {
+        let (before, over) = {
             let mut sessions = self.sessions.lock().unwrap();
             // Made while the node closed (close() saw none of it): not kept.
             if self.closed.load(Ordering::SeqCst) {
@@ -209,8 +209,22 @@ impl NodeInner {
                 session.close();
                 return Err(std::io::Error::other("the node is closed"));
             }
-            sessions.insert(session.peer.clone(), session.clone())
+            // Over already (the other side's bye right behind its hello):
+            // its end found it nowhere to be taken out of. Not kept, and
+            // the one before ends all the same (the device has no other).
+            if session.is_closed() {
+                (sessions.remove(&session.peer), true)
+            } else {
+                (sessions.insert(session.peer.clone(), session.clone()), false)
+            }
         };
+        if over {
+            if let Some(before) = before {
+                before.close();  // its end finds it nowhere either: Gone told here
+            }
+            self.event(Event::Gone(session.peer.clone(), "over as it began".into()));
+            return Err(std::io::Error::other("the session was over as it began"));
+        }
         // Served since the hello went (the session was not among them yet).
         session.our_features(self.features());
         if let Some(before) = before {
@@ -451,5 +465,130 @@ impl Node {
     /// As connect_as(), by QUIC alone.
     pub fn connect_quic(&self, address: SocketAddr, timeout: Duration, kind: &str) -> Result<Arc<Session>, String> {
         self.0.connect_quic(address, timeout, kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::RawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    fn identity() -> (Identity, String) {
+        let made = rcgen::generate_simple_self_signed(vec!["plus-one".into()]).unwrap();
+        let identity = Identity::new(made.cert.der().to_vec(), made.key_pair.serialize_der()).unwrap();
+        let fingerprint = identity.fingerprint();
+        (identity, fingerprint)
+    }
+
+    fn trusting(fingerprint: String) -> Paired {
+        Arc::new(move |seen: &str| seen == fingerprint)
+    }
+
+    /// A stream that, as its session takes it for its path (its timeouts
+    /// off: prepare()), says so and waits for a word.
+    struct Held {
+        stream: UnixStream,
+        taken: mpsc::Sender<()>,
+        go: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Read for Held {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for Held {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    impl AsRawFd for Held {
+        fn as_raw_fd(&self) -> RawFd {
+            self.stream.as_raw_fd()
+        }
+    }
+
+    impl Stream for Held {
+        fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
+            self.stream.set_nonblocking(on)
+        }
+
+        fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            if timeout.is_none() {
+                let _ = self.taken.send(());
+                let _ = self.go.lock().unwrap().recv();
+            }
+            Stream::set_timeouts(&self.stream, timeout)
+        }
+
+        fn shutdown(&self) {
+            Stream::shutdown(&self.stream)
+        }
+
+        fn try_clone(&self) -> std::io::Result<Box<dyn Stream>> {
+            Ok(Box::new(self.stream.try_clone()?))
+        }
+    }
+
+    #[test]
+    fn a_session_over_before_it_is_kept_is_neither_kept_nor_told_up() {
+        // A session ended (the other side's bye right behind its hello)
+        // before add() kept it: kept all the same, closed, among the
+        // node's for good (plus-one-link's devices showed it connected),
+        // told Up and never Gone. Made sure of: the node's sessions held
+        // from the moment the session has its path until it is over.
+        let (pc_id, pc_fingerprint) = identity();
+        let (tablet_id, tablet_fingerprint) = identity();
+        let pc = Node::new("pc", &pc_id, trusting(tablet_fingerprint)).unwrap();
+        let tablet = Node::new("tablet", &tablet_id, trusting(pc_fingerprint)).unwrap();
+        let (tell, told) = mpsc::channel();
+        let (path_of, running) = mpsc::channel();
+        pc.on_event(move |event| match event {
+            Event::Up(_) => drop(tell.send("up")),
+            Event::Gone(..) => drop(tell.send("gone")),
+            Event::Path(session, _) => drop(path_of.send(session)),
+            _ => {}
+        });
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let accepter = tablet.clone();
+        std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "usb").map(|_| ()));
+        let (taken, has_path) = mpsc::channel();
+        let (go, going) = mpsc::channel();
+        let connecting = {
+            let pc = pc.clone();
+            let held = Held { stream: ours, taken, go: Mutex::new(going) };
+            std::thread::spawn(move || pc.connect_stream(Box::new(held), "usb"))
+        };
+        has_path.recv_timeout(Duration::from_secs(5)).expect("no handshake");
+        let sessions = pc.0.sessions.lock().unwrap();
+        go.send(()).unwrap();
+        let session = running.recv_timeout(Duration::from_secs(5)).expect("no session's thread");
+        let closing = session.clone();
+        std::thread::spawn(move || closing.close());
+        let started = Instant::now();
+        while !session.is_closed() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never over");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(sessions);
+        let made = connecting.join().unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = told.recv_timeout(Duration::from_millis(300)) {
+            events.push(event);
+        }
+        assert_eq!(events, ["gone"], "told of a session over before it was kept");
+        assert!(made.is_err(), "a session over before it was kept, given as made");
+        assert!(pc.sessions().is_empty(), "a session over, kept");
+        pc.close();
+        tablet.close();
     }
 }

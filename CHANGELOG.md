@@ -2,6 +2,12 @@
 
 ## Unreleased (1.0)
 
+- **No tablet shown connected by a session already over**: a session
+  the tablet ended right as it began (it said goodbye straight after
+  hello) could be kept by plus-one-link all the same, closed: the tablet
+  stayed "connected" in its devices, with no path and nothing to open on
+  it, until another session replaced it. Such a session is no longer
+  kept, and plus-one-link tells the apps it is gone.
 - **A channel the tablet closed goes with the session**: a channel
   the tablet closed while the feature on the PC was not reading what it
   had sent kept a thread waiting on that feature, and another holding
