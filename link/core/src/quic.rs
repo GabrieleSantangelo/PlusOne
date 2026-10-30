@@ -45,7 +45,9 @@ const ALPN: &[u8] = b"plus-one-link/1";
 /// session stays on TCP.
 const LOCAL_MTU: u16 = 1452;
 /// Realtime that would wait longer than this for the window: dropped (a
-/// group older than this: reset, groups.rs).
+/// group this long after its first byte went out, at least: reset; a newer
+/// one's messages wait this long at most for it on the other side:
+/// groups.rs).
 pub(crate) const LATE: Duration = Duration::from_millis(100);
 const DATAGRAM_SEND_BUFFER: usize = 512 << 10;
 /// What quinn takes from the session's stream before it is acknowledged,
@@ -271,9 +273,6 @@ impl Quic {
     pub(crate) fn group_stats(&self) -> groups::Stats {
         let mut stats = self.groups.shared.stats();
         stats.datagram_bytes = self.realtime.load(Ordering::Relaxed).saturating_sub(self.groups.shared.handed());
-        stats.lost_bytes = self.cc.losses.lost.load(Ordering::Relaxed);
-        stats.lost_after_cut = self.cc.losses.after_cut.load(Ordering::Relaxed);
-        stats.cuts = self.cc.losses.cuts.load(Ordering::Relaxed);
         stats
     }
 
@@ -297,9 +296,9 @@ impl Quic {
     }
 
     /// Each datagram that comes, and each message of the other side's
-    /// groups (groups.rs), to on; each frame on its control stream (kind,
-    /// channel, body), to control, if we take one (on the runtime: neither
-    /// must block).
+    /// groups (groups.rs: in the order the groups began), to on; each frame
+    /// on its control stream (kind, channel, body), to control, if we take
+    /// one (on the runtime: neither must block).
     pub(crate) fn read_datagrams(&self, on: impl Fn(Bytes) + Send + Sync + 'static,
                                  control: impl Fn(u8, u16, Vec<u8>) + Send + Sync + 'static) {
         let on = Arc::new(on);
@@ -444,7 +443,7 @@ fn dial_with(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, address: S
         // session's TLS hello, which the dialer writes first.
         let (send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let realtime: Arc<AtomicU64> = Arc::default();
-        let groups: Arc<Groups> = Arc::default();
+        let groups = Arc::new(Groups::new(&conn, &cc));
         let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone(), groups.shared.clone())
             .map_err(|e| e.to_string())?;
         let idle = conn.datagram_send_buffer_space();
@@ -483,7 +482,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                         .map_err(|e| e.to_string())?;
                     let (send, recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
                     let realtime: Arc<AtomicU64> = Arc::default();
-                    let groups: Arc<Groups> = Arc::default();
+                    let groups = Arc::new(Groups::new(&conn, &cc));
                     let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone(), groups.shared.clone())
                         .map_err(|e| e.to_string())?;
                     let idle = conn.datagram_send_buffer_space();
@@ -774,6 +773,62 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(3), "{} bytes held", quic.groups.shared.unacked());
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// What comes on got within wait of each other, until none does.
+    fn all_of(got: &std::sync::mpsc::Receiver<Bytes>, wait: Duration) -> Vec<Vec<u8>> {
+        let mut came = Vec::new();
+        while let Ok(message) = got.recv_timeout(wait) {
+            came.push(message.to_vec());
+        }
+        came
+    }
+
+    #[test]
+    fn the_other_sides_groups_come_in_the_order_they_began() {
+        // Channel 5's group begins; channel 6's begins after it and is whole
+        // before the first has its tail: handed on after it all the same (a
+        // frame whole after a newer one is lost to the app). Each stream's
+        // task handing its own on, the newer one's went first.
+        let (_stream, mut quic, _theirs, far) = dialed();
+        let got = read(&far);
+        quic.set_streams(true, false);
+        assert!(quic.send_in_group(5, 1, false, false, &[b'a', 0]));
+        for i in 0..5u8 {
+            assert!(quic.send_in_group(6, 1, false, i == 4, &[b'b', i]));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        for i in 1..5u8 {
+            assert!(quic.send_in_group(5, 1, false, i == 4, &[b'a', i]));
+        }
+        let came = all_of(&got, Duration::from_millis(500));
+        let ordered: Vec<Vec<u8>> = (0..5).map(|i| vec![b'a', i]).chain((0..5).map(|i| vec![b'b', i])).collect();
+        assert_eq!(came, ordered);
+        let stats = quic.group_stats();
+        assert_eq!((stats.groups, stats.late, stats.stopped, stats.dropped), (2, 0, 0, 0), "{stats}");
+    }
+
+    #[test]
+    fn a_newer_group_waits_late_at_most_for_an_older_one_then_that_one_is_given_up() {
+        // Channel 5's group never ends (its sender held up); channel 6's is
+        // whole after it began: handed on LATE after it came, channel 5's
+        // stopped then, what still came on it dropped and its sender told.
+        let (_stream, mut quic, _theirs, far) = dialed();
+        let got = read(&far);
+        quic.set_streams(true, false);
+        assert!(quic.send_in_group(5, 1, false, false, b"a0"));
+        assert_eq!(&got.recv_timeout(Duration::from_millis(500)).unwrap()[..], b"a0");
+        let sent = Instant::now();
+        assert!(quic.send_in_group(6, 1, false, true, b"b0"));
+        assert_eq!(&got.recv_timeout(Duration::from_millis(500)).unwrap()[..], b"b0");
+        let waited = sent.elapsed();
+        assert!(waited >= LATE - Duration::from_millis(20) && waited < LATE + Duration::from_millis(150),
+                "the newer group waited {waited:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(quic.send_in_group(5, 1, false, true, b"a1"));
+        assert!(got.recv_timeout(Duration::from_millis(300)).is_err(), "a given up group's message came");
+        let stats = quic.group_stats();
+        assert_eq!((stats.stopped, stats.late, stats.dropped), (1, 0, 1), "{stats}");
     }
 
     /// The other side takes no group streams for a while (all UNI_STREAMS
