@@ -316,8 +316,10 @@ the transport takes no unidirectional streams; logged once ("video
 streams off"). The desktop's frames go in groups: Plus One opens its
 media channel as Video (`plusone_link.VIDEO`; Realtime from a
 plus-one-link that refuses it) and writes each packet's group head, the
-frame's number its group; with the switch off, or off QUIC, the link takes
-the heads off and the tablet gets what it got before.
+frame's number its group; off QUIC the link takes the heads off and the
+tablet gets what it got before. Plus One reads the same switch: with
+`PLUSONE_LINK_VIDEO_STREAMS=0` it opens the media channel as Realtime,
+its packets exactly as before Video (no head, the payload whole).
 
 `PLUSONE_LINK_DSCP=0` (the process's; on by default) leaves QUIC's
 packets unmarked, as before `dscp.rs`: the endpoint on quinn's own socket,
