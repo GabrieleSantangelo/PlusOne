@@ -145,39 +145,56 @@ pub fn bridge(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'sta
               -> io::Result<UnixStream> {
     let (ours, theirs) = UnixStream::pair()?;
     little_room(&theirs);
-    let (mut inbound, mut outbound) = (ours.try_clone()?, ours);
     // Either side over: both are (the device's reads only time out, and a
     // socket pair's end cannot be seen from the side that only writes).
+    // Said as either side's thread ends, however it ends: a panic too, or
+    // the other's thread not made (the side left, its device silent,
+    // looked for it each second for ever, the device claimed meanwhile).
+    struct Side(std::sync::Arc<std::sync::atomic::AtomicBool>, UnixStream);
+    impl Side {
+        fn over(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl Drop for Side {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.1.shutdown(Shutdown::Both);
+        }
+    }
     let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (over_in, over_out) = (over.clone(), over);
+    let (mut inbound, mut outbound) = (Side(over.clone(), ours.try_clone()?), Side(over, ours));
     std::thread::Builder::new().name("link-bridge-in".into()).spawn(move || {
         let mut buf = vec![0u8; chunk];
         loop {
             match read(&mut buf) {
-                Ok(0) => continue,  // a zero-length packet
-                Ok(n) => {
-                    if inbound.write_all(&buf[..n]).is_err() {
+                Ok(n) if n > 0 => {
+                    if inbound.1.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                // Nothing for a while, or a zero-length packet: only the
+                // session gone ends this.
+                Ok(_) => {
+                    if inbound.over() {
                         break;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::Interrupted => {
-                    // Nothing for a while: only the session gone ends this.
-                    if over_in.load(std::sync::atomic::Ordering::SeqCst) {
+                    if inbound.over() {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        over_in.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = inbound.shutdown(Shutdown::Both);
     })?;
     std::thread::Builder::new().name("link-bridge-out".into()).spawn(move || {
         // A byte short of a transfer: a full one is never a whole number of
         // packets, so it goes as one (usb_pieces would cut it in two).
         let mut buf = vec![0u8; chunk - 1];
         loop {
-            match outbound.read(&mut buf) {
+            match outbound.1.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if write(&buf[..n]).is_err() {
@@ -186,8 +203,6 @@ pub fn bridge(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'sta
                 }
             }
         }
-        over_out.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = outbound.shutdown(Shutdown::Both);
     })?;
     Ok(theirs)
 }
@@ -262,5 +277,26 @@ mod tests {
         let mut buf = [0u8; 13];
         far_in.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"to the device");
+    }
+
+    #[test]
+    fn a_bridge_side_that_panics_ends_the_other() {
+        // What the session writes panics the device's write; the device
+        // silent (its reads only time out): the other side ends all the
+        // same, the device let go of (its read's closure, holding the
+        // sender here, gone), and the session's end sees it over. (Only a
+        // side's thread that returned said so: the other looked for it
+        // each second for ever, the accessory claimed.)
+        let (device, let_go) = std::sync::mpsc::channel::<()>();
+        let stream = bridge(move |_| {
+            let _device = &device;
+            std::thread::sleep(Duration::from_millis(20));
+            Err(io::ErrorKind::TimedOut.into())
+        }, |_| panic!("the device's write, broken"), 4096).unwrap();
+        (&stream).write_all(b"to the device").unwrap();
+        assert_eq!(let_go.recv_timeout(Duration::from_secs(3)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+                   "the device's side still there");
+        let mut buf = [0u8; 1];
+        assert_eq!((&stream).read(&mut buf).unwrap(), 0, "the session's end not over");
     }
 }
