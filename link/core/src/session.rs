@@ -782,7 +782,9 @@ impl Drain {
                 self.probe_at = now + PROBE_AFTER;
             } else if let (Some(ceiling), Some(was)) = (self.ceiling, self.budget) {
                 // Not measured again for PROBE_AFTER: up toward the prior.
-                if was < ceiling && now >= self.probe_at {
+                // Not while it is full throughout (a measure under way: up
+                // then, the apps would only fill it more).
+                if was < ceiling && now >= self.probe_at && self.run.is_empty() {
                     let up = ((was as f64 * PROBE_UP) as u64).min(ceiling);
                     budget = Some(up);
                     self.measured = up < ceiling;
@@ -3555,5 +3557,33 @@ mod tests {
         assert_eq!(waits[0], 1_800_000, "full at its end only");
         assert!(waits[1..].iter().all(|wait| wait.abs_diff(150_000) <= 1), "full throughout: {waits:?}");
         assert_eq!(cable.budget, Some(12_000_000), "not measured yet");
+    }
+
+    #[test]
+    fn a_cables_budget_goes_up_only_while_it_is_not_full() {
+        // Measured at 1 MB/s (the tablet reading slowly), then not full,
+        // then full throughout again from before PROBE_AFTER is past: not
+        // up meanwhile, measured again (1 MB/s) once a second of it went.
+        // (It went up 1.5 times while full, the apps told to fill it more:
+        // the probe against the drain.)
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let prior = 12_000_000u64;
+        let slow = prior / 12;
+        let mut cable = Drain::new(start, Some(prior)).probing(prior);
+        let mut told = Vec::new();
+        for ms in (200..=1200).step_by(200) {
+            told.extend(window(&mut cable, at(ms), (slow / 5) as usize, true, false).map(|t| (ms, t)));
+        }
+        assert_eq!(told, [(1200, slow)], "measured");
+        told.clear();
+        for ms in (1400..=2600).step_by(200) {
+            told.extend(window(&mut cable, at(ms), 1000, false, true).map(|t| (ms, t)));
+        }
+        for ms in (2800..=4000).step_by(200) {
+            told.extend(window(&mut cable, at(ms), (slow / 5) as usize, true, false).map(|t| (ms, t)));
+        }
+        assert!(told.is_empty(), "up while full: {told:?}");
+        assert_eq!((cable.budget, cable.measured), (Some(slow), true));
     }
 }
