@@ -984,7 +984,7 @@ def over_the_link(monkeypatch, answer):
     connection = FakeConnection(answer)
     monkeypatch.setattr(appdisplay, "plusone_link", types.SimpleNamespace(
         Link=lambda: connection, LinkError=plusone_link.LinkError, CONTROL="control", REALTIME="realtime",
-        INPUT="input", MAX_DATAGRAM=plusone_link.MAX_DATAGRAM))
+        INPUT="input", VIDEO="video", HEAD=plusone_link.HEAD, MAX_DATAGRAM=plusone_link.MAX_DATAGRAM))
     return appdisplay.AppDisplay([("10.0.0.2", 1)], APP, (None, None, 60), 20000, "x264"), connection
 
 
@@ -1050,3 +1050,111 @@ def test_on_a_low_budget_no_frame_goes_in_that_the_link_would_cut():
     assert streamer._left_out(100.0) == "queue"
     link.waiting = 20000
     assert streamer._left_out(100.1) is None
+
+
+class SocketConnection:
+    """plus-one-link with the paired tablet, its channels real ones
+    (plusone_link.Channel) on socket pairs, the other ends in app by name
+    (the control's with the app's answer in it); refusing: the classes it
+    says no to, as one from before them does ("no class")."""
+
+    def __init__(self, refusing=()):
+        self.refusing, self.asked, self.app, self.closed = set(refusing), [], {}, False
+
+    def devices(self):
+        return [{"id": APP + "0" * 48, "connected": True}]
+
+    def open(self, device, feature, name, kind):
+        import plusone_link
+        self.asked.append(kind)
+        if kind in self.refusing:
+            raise plusone_link.LinkError("no class")
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.app[name] = theirs
+        if name == "control":
+            theirs.send(json.dumps({"type": "display-ready", "width": 2560, "height": 1600}).encode())
+        return plusone_link.Channel(ours.detach(), device, feature, name, kind, len(self.asked))
+
+    def close(self):
+        self.closed = True
+        for end in self.app.values():
+            end.close()
+
+
+def over_sockets(monkeypatch, refusing=()):
+    """The display's channels as _over_the_link opens them, on sockets: (its
+    packets, the connection), and a streamer on them (no pipeline)."""
+    import plusone_link
+    connection = SocketConnection(refusing)
+    monkeypatch.setattr(plusone_link, "Link", lambda: connection)
+    display = appdisplay.AppDisplay([("10.0.0.2", 1)], APP, (None, None, 60), 20000, "x264")
+    packets, reply = display._over_the_link()
+    assert reply["type"] == "display-ready"
+    return packets, connection, streamer_on(packets)
+
+
+def sent_on(end):
+    """What came on a channel's other end so far."""
+    got = []
+    while True:
+        try:
+            got.append(end.recv(1 << 16, socket.MSG_DONTWAIT))
+        except BlockingIOError:
+            return got
+
+
+PONG = struct.pack("!Bqq", appdisplay.PONG, 1, 2)
+
+
+def test_over_the_link_each_frame_is_a_group_of_its_own(monkeypatch):
+    # q3's option B: the media channel a VIDEO one, each frame's packets a
+    # group (on QUIC, a stream of their own); every message with the link's
+    # head before it, which the link takes off: the app reads them as before.
+    import plusone_link
+    from plusone_link import HEAD, IN_GROUP, KEY, LAST
+    packets, connection, streamer = over_sockets(monkeypatch)
+    assert connection.asked == ["control", "video", "input"] and packets.grouped
+    payload = packets.payload
+    assert payload == plusone_link.MAX_DATAGRAM - appdisplay.VIDEO_HEADER.size - HEAD.size
+    streamer._out(bytes(2 * payload + 100), True, 111)  # a keyframe: three packets
+    streamer._out(bytes(payload + 1), False, 222)        # a frame after it: two
+    streamer._out(bytes(10), False, 333)                 # one
+    packets.send(PONG)                                   # no frame's: of no group
+    got = sent_on(connection.app["media"])
+    assert [HEAD.unpack_from(m) for m in got] == [
+        (IN_GROUP | KEY, 1), (IN_GROUP | KEY, 1), (IN_GROUP | KEY | LAST, 1),
+        (IN_GROUP, 2), (IN_GROUP | LAST, 2),
+        (IN_GROUP | LAST, 3),
+        (0, 0)]
+    # None past MAX_DATAGRAM, head and all; full ones exactly that.
+    assert [len(m) for m in got[:3]] == [plusone_link.MAX_DATAGRAM] * 2 + [
+        HEAD.size + appdisplay.VIDEO_HEADER.size + 100]
+    assert max(len(m) for m in got) <= plusone_link.MAX_DATAGRAM
+    # Behind the head, the packets as the app reads them.
+    assert [appdisplay.VIDEO_HEADER.unpack_from(m, HEAD.size) for m in got[:6]] == [
+        (appdisplay.VIDEO, 1, 1, 0, 3, 111), (appdisplay.VIDEO, 1, 1, 1, 3, 111), (appdisplay.VIDEO, 1, 1, 2, 3, 111),
+        (appdisplay.VIDEO, 0, 2, 0, 2, 222), (appdisplay.VIDEO, 0, 2, 1, 2, 222),
+        (appdisplay.VIDEO, 0, 3, 0, 1, 333)]
+    assert got[6][HEAD.size:] == PONG
+    # What the app sends comes as it was.
+    connection.app["media"].send(PONG)
+    assert packets.receive(1) == PONG
+    packets.close()
+
+
+def test_a_link_with_no_video_class_takes_the_frames_as_before(monkeypatch):
+    # plus-one-link from before VIDEO refuses it: the media channel a
+    # realtime one, its messages as they were (no head, the payload whole).
+    import plusone_link
+    packets, connection, streamer = over_sockets(monkeypatch, refusing={"video"})
+    assert connection.asked == ["control", "video", "realtime", "input"] and not packets.grouped
+    payload = packets.payload
+    assert payload == plusone_link.MAX_DATAGRAM - appdisplay.VIDEO_HEADER.size
+    streamer._out(bytes(2 * payload + 100), True, 111)
+    packets.send(PONG)
+    got = sent_on(connection.app["media"])
+    assert [appdisplay.VIDEO_HEADER.unpack_from(m) for m in got[:3]] == [
+        (appdisplay.VIDEO, 1, 1, 0, 3, 111), (appdisplay.VIDEO, 1, 1, 1, 3, 111), (appdisplay.VIDEO, 1, 1, 2, 3, 111)]
+    assert [len(m) for m in got[:3]] == [plusone_link.MAX_DATAGRAM] * 2 + [appdisplay.VIDEO_HEADER.size + 100]
+    assert got[3:] == [PONG]
+    packets.close()

@@ -776,21 +776,37 @@ class L36:
 class LinkPackets:
     """The desktop's packets over the link (plus-one-link, docs/LINK.md),
     as Datagrams carries them over the link of before: VIDEO, PING and PONG
-    out and KEYFRAME, PONG and STATS in on a realtime channel, INPUT in on
+    out and KEYFRAME, PONG and STATS in on the media channel, INPUT in on
     an input channel (the newest state kept, never queued); queued() is
-    plus-one-link's backlog to the tablet."""
+    plus-one-link's backlog to the tablet. The media channel a VIDEO one
+    (plusone_link: each frame a group, on a QUIC stream of its own where
+    the path takes them; the app reads it as realtime), or REALTIME where
+    plus-one-link has no VIDEO: each message as it is."""
 
     def __init__(self, connection, device, control, media, input):
         self.connection, self.device = connection, device
         self.control, self.media, self.input = control, media, input
-        self.payload = plusone_link.MAX_DATAGRAM - VIDEO_HEADER.size
+        # On VIDEO each message carries the link's head too (taken off
+        # before the wire): no message past MAX_DATAGRAM, head and all.
+        self.grouped = getattr(media, "kind", None) == plusone_link.VIDEO
+        self.payload = (plusone_link.MAX_DATAGRAM - VIDEO_HEADER.size
+                        - (plusone_link.HEAD.size if self.grouped else 0))
         self._open = [media, input]
         self.errors = set()
         self.budget = channels.Budget(connection, device)
 
     def send(self, body):
+        """A message of its own (PING, PONG): on VIDEO, of no group."""
+        self._sent(self.media.send, body)
+
+    def send_in_frame(self, body, frame, keyframe, last):
+        """One of frame's packets (its number), whether it is a keyframe and
+        whether this is its last: on VIDEO, the frame's group."""
+        self._sent(self.media.send_in_group, frame, keyframe, last, body)
+
+    def _sent(self, send, *args):
         try:
-            self.media.send(body)
+            send(*args)
         except OSError as e:
             if e.errno not in self.errors:
                 self.errors.add(e.errno)
@@ -913,7 +929,8 @@ class AppStreamer:
         bus.add_signal_watch()
         self._bus_handler = bus.connect("message::error", self._failed)
         self._feedback = threading.Thread(target=self._listen, daemon=True)
-        to = f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams) else "the link"
+        to = (f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams)
+              else "the link, a frame a group" if getattr(channel, "grouped", False) else "the link")
         log(f"app display: {width}x{height}@{fps} {encoder} {self.kbps} kbit/s"
             + (f" (the budget's share; at most {bitrate})" if self.kbps != bitrate else "") + f" -> {to}")
         log(f"app display: {self.l36.describe(self._restarts)}")
@@ -1190,9 +1207,16 @@ class AppStreamer:
             # pen made ahead of the first stroke, not on the listening thread.
             self.input.prepare()
         self._keyframes += keyframe
+        # Over the link, each packet told its frame (the frame's number, a
+        # keyframe, its last): on VIDEO, the frame a group of its own.
+        in_frame = getattr(self.channel, "send_in_frame", None)
         for index in range(count):
             header = VIDEO_HEADER.pack(VIDEO, int(keyframe), number, index, count, captured)
-            self.channel.send(header + data[index * payload:(index + 1) * payload])
+            packet = header + data[index * payload:(index + 1) * payload]
+            if in_frame is None:
+                self.channel.send(packet)
+            else:
+                in_frame(packet, number, keyframe, index == count - 1)
         self.allowance.take(size, now)
         if keyframe:  # whatever made it (asked, a bitrate change, the periodic one): it answers the app
             self._key_at, self._after_key = now, 0
@@ -1396,9 +1420,16 @@ class AppDisplay:
             device = next((d["id"] for d in connection.devices() if d["id"].startswith(self.app_id)), None)
             if device is None:
                 raise plusone_link.LinkError("not a paired tablet")
-            for name, kind in (("control", plusone_link.CONTROL), ("media", plusone_link.REALTIME),
+            for name, kind in (("control", plusone_link.CONTROL), ("media", plusone_link.VIDEO),
                                ("input", plusone_link.INPUT)):
-                channels.append(connection.open(device, "display", name, kind))
+                try:
+                    channels.append(connection.open(device, "display", name, kind))
+                except plusone_link.LinkError as e:
+                    if kind != plusone_link.VIDEO:
+                        raise
+                    # A plus-one-link from before VIDEO: the frames as realtime, as before it.
+                    log("app display: the frames as realtime, not video:", e)
+                    channels.append(connection.open(device, "display", name, plusone_link.REALTIME))
             packets = LinkPackets(connection, device, *channels)
             packets.control.send(json.dumps({"type": "display"}).encode())
             answer = packets.control.recv(timeout=10)
