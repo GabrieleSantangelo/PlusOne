@@ -1065,3 +1065,30 @@ fn the_sixty_fifth_channel_is_refused() {
     assert!(refused.contains("64 channels"), "{refused}");
     drop(open);
 }
+
+#[test]
+fn a_session_accepted_is_not_cut_by_a_slow_start() {
+    // The listening side shut an accepted connection that was no session
+    // HANDSHAKE_WHOLE (8 s) after it came, by a watch let go of only once
+    // add() was done: a session up already (its handshake late, add()
+    // closing the one before or telling Up meanwhile) had its path cut.
+    // establish() bounds the handshake itself (each read and write under
+    // the same 8 s): no watch now. Here telling Up takes 8.5 s.
+    let (pc_id, pc_fp) = identity();
+    let (tablet_id, tablet_fp) = identity();
+    let tablet = Node::new("tablet", &tablet_id, trusting(&pc_fp)).unwrap();
+    let (detached, left) = mpsc::channel();
+    tablet.on_event(move |event| match event {
+        Event::Up(_) => std::thread::sleep(Duration::from_millis(8500)),
+        Event::Detached(_) => drop(detached.send(())),
+        _ => {}
+    });
+    let address = tablet.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert_eq!(left.recv_timeout(Duration::from_millis(9500)), Err(mpsc::RecvTimeoutError::Timeout),
+               "the tablet's path cut as its session was taken");
+    assert!(session.path().is_some(), "the PC's path cut");
+    pc.close();
+    tablet.close();
+}

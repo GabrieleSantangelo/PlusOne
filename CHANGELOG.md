@@ -2,6 +2,12 @@
 
 ## Unreleased (1.0)
 
+- **A connection slow to start is not cut as it begins**: the side
+  that takes connections (the tablet's app, or plus-one-link with
+  --listen) gave each 8 s to become a session, and counted what it did
+  after it was one too: a session made late in those 8 s could lose its
+  connection at once, and both sides reconnected. The 8 s now cover the
+  handshake alone, on both sides as before.
 - **A tablet away is looked for once, however often the network
   flapped**: each time the tablet's session lost its path, plus-one-link
   started looking for the tablet again, each a second, on top of the

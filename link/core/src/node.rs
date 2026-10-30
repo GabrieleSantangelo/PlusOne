@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A feature's code for the channels the other side opens for it.
@@ -342,18 +342,9 @@ impl Node {
                 let _ = std::thread::Builder::new().name("link-accept".into()).spawn(move || {
                     let from = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
                     crate::stream::tune_tcp(&tcp);
-                    // Closed if it is no session within HANDSHAKE_WHOLE; the
-                    // watch ends as soon as it is one (or not).
-                    let (done, ended) = mpsc::channel::<()>();
-                    if let Ok(watched) = tcp.try_clone() {
-                        let _ = std::thread::Builder::new().name("link-accept-watch".into()).spawn(move || {
-                            if ended.recv_timeout(session::HANDSHAKE_WHOLE) == Err(mpsc::RecvTimeoutError::Timeout) {
-                                let _ = watched.shutdown(std::net::Shutdown::Both);
-                            }
-                        });
-                    }
+                    // No session within HANDSHAKE_WHOLE: given up by
+                    // establish() (each of its reads and writes under it).
                     let result = node.accept(Box::new(tcp), "lan");
-                    drop(done);
                     drop(handshake);
                     if let Err(e) = result {
                         log!("{from}: no session ({e})");
@@ -474,6 +465,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::fd::RawFd;
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
     use std::time::Instant;
 
     fn identity() -> (Identity, String) {
