@@ -11,14 +11,14 @@
 //! request: the user's "use the cable"); each plug asked once.
 
 use plusone_link::log;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SYSFS: &str = "/sys/bus/usb/devices";
 const GOOGLE: &str = "18d1";
@@ -51,7 +51,8 @@ const AOA_SHARE: f64 = 0.2;
 /// (usbfs kills the transfer: an error).
 const READY_WAIT: u32 = 0;
 /// An accessory that could not be opened (its interface held by another,
-/// its endpoints not there yet), or its session not made: tried again
+/// its endpoints not there yet), its session not made, or its thread not
+/// made (Watcher::unspawned): tried again
 /// after this, twice as long after each failure in a row, up to AGAIN_MOST
 /// (it was tried each second, and each failure logged: 68 lines of
 /// "Device or resource busy" in a minute).
@@ -306,12 +307,22 @@ pub struct Watcher {
     /// Forgotten as it leaves the bus (Android comes back with another
     /// number at each change of its USB mode), or as an app asks.
     tried: Mutex<HashSet<(u32, u32)>>,
+    /// Accessories whose thread could not be made (the system out of
+    /// them): when each is tried again, and how long after the next
+    /// failure (AGAIN, twice as long each time in a row, AGAIN_MOST); said
+    /// once. (Never tried again while it stayed plugged in: no session by
+    /// cable.)
+    unspawned: Mutex<HashMap<(u32, u32), (Instant, Duration)>>,
     pub asked: std::sync::atomic::AtomicBool,
 }
 
+/// What makes a thread for an accessory (std's, named; a test's own).
+type Spawn<'a> = &'a dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()>;
+
 impl Watcher {
     pub fn new() -> Watcher {
-        Watcher { bridged: Mutex::default(), tried: Mutex::default(), asked: std::sync::atomic::AtomicBool::new(false) }
+        Watcher { bridged: Mutex::default(), tried: Mutex::default(), unspawned: Mutex::default(),
+                  asked: std::sync::atomic::AtomicBool::new(false) }
     }
 
     /// The user's "use the cable" (or no longer): each plug asked again.
@@ -324,25 +335,46 @@ impl Watcher {
     /// own (it waits for the app). remembered: serials reached by cable before.
     pub fn look(&self, remembered: &dyn Fn(&str) -> bool, switched: &dyn Fn(&Device),
                 connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync>) {
-        self.look_at(devices(), &switch, remembered, switched, connect);
+        self.look_at(devices(), &switch, remembered, switched, connect,
+                     &|run| std::thread::Builder::new().name("link-usb-accessory".into()).spawn(run).map(|_| ()));
     }
 
-    /// As look(), plugged in: those, each asked to switch by switch.
+    /// As look(), plugged in: those, each asked to switch by switch, each
+    /// accessory's thread made by spawn.
     fn look_at(&self, plugged: Vec<Device>, switch: &dyn Fn(&Device) -> io::Result<()>, remembered: &dyn Fn(&str) -> bool,
                switched: &dyn Fn(&Device),
-               connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync>) {
+               connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync>,
+               spawn: Spawn) {
         let asked = self.asked.load(std::sync::atomic::Ordering::Relaxed);
         for device in plugged.iter().cloned() {
             if device.is_accessory() {
                 let key = (device.bus, device.number);
-                if !self.bridged.lock().unwrap().insert(key) {
+                if self.unspawned.lock().unwrap().get(&key).is_some_and(|(next, _)| Instant::now() < *next)
+                    || !self.bridged.lock().unwrap().insert(key) {
                     continue;
                 }
-                let connect = connect.clone();
-                let _ = std::thread::Builder::new().name("link-usb-accessory".into()).spawn(move || {
+                let (connect, node) = (connect.clone(), device.node());
+                let made = spawn(Box::new(move || {
                     sessions_on(&device, &|| devices().iter().any(|d| (d.bus, d.number) == (device.bus, device.number)),
                                 &|| open_accessory(&device), &*connect, &std::thread::sleep, &|said| log!("{said}"));
-                });
+                }));
+                let mut unspawned = self.unspawned.lock().unwrap();
+                match made {
+                    Ok(()) => {
+                        unspawned.remove(&key);
+                    }
+                    Err(e) => {
+                        self.bridged.lock().unwrap().remove(&key);
+                        let again = match unspawned.get(&key) {
+                            Some((_, again)) => *again,
+                            None => {
+                                log!("usb: the accessory at {node}: no thread for it ({e}), tried again");
+                                AGAIN
+                            }
+                        };
+                        unspawned.insert(key, (Instant::now() + again, (again * 2).min(AGAIN_MOST)));
+                    }
+                }
             } else if device.is_android() && (asked || (!device.serial.is_empty() && remembered(&device.serial)))
                 && self.tried.lock().unwrap().insert((device.bus, device.number)) {
                 match switch(&device) {
@@ -358,6 +390,7 @@ impl Watcher {
         let present: HashSet<(u32, u32)> = plugged.iter().map(|d| (d.bus, d.number)).collect();
         self.bridged.lock().unwrap().retain(|key| present.contains(key));
         self.tried.lock().unwrap().retain(|key| present.contains(key));
+        self.unspawned.lock().unwrap().retain(|key, _| present.contains(key));
     }
 }
 
@@ -482,7 +515,7 @@ mod tests {
         };
         let connect: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream, &Device) -> Result<String, String> + Send + Sync> =
             std::sync::Arc::new(|_, _| Err("no".into()));
-        let look = |plugged: Vec<Device>| watcher.look_at(plugged, &switch, &|_| false, &|_| {}, connect.clone());
+        let look = |plugged: Vec<Device>| watcher.look_at(plugged, &switch, &|_| false, &|_| {}, connect.clone(), &|_| Ok(()));
         for _ in 0..3 {
             look(vec![tablet.clone()]);
         }
@@ -731,5 +764,40 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(Arc::strong_count(&alive), 1, "bridges' threads left");
+    }
+
+    #[test]
+    fn an_accessory_whose_thread_is_not_made_is_tried_again_less_and_less() {
+        // Its thread not made (the system out of them): tried again at a
+        // look AGAIN on, then twice as long after each failure in a row;
+        // made at last, not tried again while it stays plugged in. (Never
+        // tried again until it was plugged anew: no session by cable.)
+        let watcher = Watcher::new();
+        let accessory = accessory_at(None);
+        let connect: Arc<dyn Fn(UnixStream, &Device) -> Result<String, String> + Send + Sync> = Arc::new(|_, _| Err("no".into()));
+        let (tries, fails) = (std::cell::Cell::new(0), std::cell::Cell::new(true));
+        let spawn = |_: Box<dyn FnOnce() + Send>| -> io::Result<()> {
+            tries.set(tries.get() + 1);
+            if fails.get() { Err(io::Error::from_raw_os_error(libc::EAGAIN)) } else { Ok(()) }
+        };
+        let look = || watcher.look_at(vec![accessory.clone()], &|_| Ok(()), &|_| false, &|_| {}, connect.clone(), &spawn);
+        look();
+        look();
+        assert_eq!(tries.get(), 1, "tried again before AGAIN");
+        std::thread::sleep(AGAIN + Duration::from_millis(50));
+        look();
+        look();
+        assert_eq!(tries.get(), 2, "not tried again AGAIN on, or more than once");
+        std::thread::sleep(AGAIN + Duration::from_millis(50));
+        look();
+        assert_eq!(tries.get(), 2, "tried again before twice AGAIN");
+        fails.set(false);
+        std::thread::sleep(AGAIN);
+        look();
+        assert_eq!(tries.get(), 3, "not tried again twice AGAIN on");
+        look();
+        assert_eq!(tries.get(), 3, "made, and tried again while plugged in");
+        watcher.look_at(Vec::new(), &|_| Ok(()), &|_| false, &|_| {}, connect.clone(), &spawn);
+        assert!(watcher.unspawned.lock().unwrap().is_empty() && watcher.bridged.lock().unwrap().is_empty(), "kept, gone");
     }
 }
