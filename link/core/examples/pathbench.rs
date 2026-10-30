@@ -255,12 +255,13 @@ fn groups(before: Option<GroupStats>, after: Option<GroupStats>) -> String {
     let (stream, datagram) = (d(after.stream_bytes, b.stream_bytes), d(after.datagram_bytes, b.datagram_bytes));
     let share = stream as f64 / (stream + datagram).max(1) as f64;
     let lost_cut = d(after.lost_after_cut, b.lost_after_cut);
-    format!("groups={} late={} late_kb={:.1} superseded={} dropped={} credit_waits={} stream_kb={:.1} lost_kb={:.1} \
-             lost_cut_kb={:.1} cuts={} share={:.2} retx_cut_kb={:.1}",
+    format!("groups={} late={} late_kb={:.1} superseded={} late_unsent={} dropped={} credit_waits={} window_full={} \
+             wait_ms={} control={} stream_kb={:.1} lost_kb={:.1} lost_cut_kb={:.1} cuts={} share={:.2} retx_cut_kb={:.1}",
             d(after.groups, b.groups), d(after.late, b.late), d(after.late_bytes, b.late_bytes) as f64 / 1e3,
-            d(after.superseded, b.superseded), d(after.dropped, b.dropped), d(after.credit_waits, b.credit_waits),
-            stream as f64 / 1e3, d(after.lost_bytes, b.lost_bytes) as f64 / 1e3, lost_cut as f64 / 1e3,
-            d(after.cuts, b.cuts), share, lost_cut as f64 * share / 1e3)
+            d(after.superseded, b.superseded), d(after.late_unsent, b.late_unsent), d(after.dropped, b.dropped),
+            d(after.credit_waits, b.credit_waits), d(after.window_full, b.window_full), d(after.wait_ms, b.wait_ms),
+            d(after.control, b.control), stream as f64 / 1e3, d(after.lost_bytes, b.lost_bytes) as f64 / 1e3,
+            lost_cut as f64 / 1e3, d(after.cuts, b.cuts), share, lost_cut as f64 * share / 1e3)
 }
 
 /// Until what the last test left on its way is gone (each test measures
@@ -308,14 +309,22 @@ fn main() {
     let rt = realtime(&session, seconds);
     println!("test=rt_both {rt} mbs={:.2}", both.join().unwrap());
     settle(&session);
+    let before = session.group_stats();
     println!("test=video {}", video(&session, seconds, video_kbps, 0));
+    if session.by_quic() {
+        println!("test=video_groups {}", groups(before, session.group_stats()));
+    }
     settle(&session);
+    let before = session.group_stats();
     let up = {
         let session = session.clone();
         std::thread::spawn(move || transfer(&session, "sink", seconds))
     };
     let v = video(&session, seconds, video_kbps, 0);
     println!("test=video_up {v} mbs={:.2}", up.join().unwrap());
+    if session.by_quic() {
+        println!("test=up_groups {}", groups(before, session.group_stats()));
+    }
     settle(&session);
     // The same 4 Mbit/s on both transports: the path alone compared.
     println!("test=video4 {}", video(&session, seconds, Some(4000), 0));
