@@ -1686,7 +1686,14 @@ impl Session {
                         blocked = true;
                         break;
                     }
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => {
+                        // A stream the other side let go of (EPIPE,
+                        // ECONNRESET): what it sent before is taken first,
+                        // a "bye" there ending the session (lost, the
+                        // session waited for another path).
+                        let _ = self.take_in(path, conn, stream, decoder, &mut plain);
+                        return Err(e.to_string());
+                    }
                 }
             }
             // All out, and more queued meanwhile (its wake taken already, while
@@ -1783,45 +1790,46 @@ impl Session {
             if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
                 continue;
             }
-            // The other side's end (its stream's, or TLS's close_notify)
-            // waits for what came before it: a "bye" there ends the
-            // session, not only the path (lost, the session waited
-            // RESUME_WAIT for another, and the PC reached for the tablet).
-            let mut ended = false;
-            'read: loop {
-                match conn.read_tls(stream) {
-                    Ok(0) => {
-                        ended = true;
-                        break;
-                    }
-                    Ok(_) => {
-                        conn.process_new_packets().map_err(|e| e.to_string())?;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.to_string()),
-                }
-                // Out at once: rustls holds only so much read and not taken.
-                loop {
-                    match conn.reader().read(&mut plain) {
-                        Ok(0) => {
-                            ended = true;
-                            break 'read;
-                        }
-                        Ok(n) => decoder.push(&plain[..n]),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => return Err(e.to_string()),
-                    }
-                }
-            }
-            while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
-                path.heard();
-                self.heard_on(path);
-                self.frame(kind, channel, body)?;
-            }
-            if ended {
+            if self.take_in(path, conn, stream, decoder, &mut plain)? {
                 return Err("the other side closed".into());
             }
         }
+    }
+
+    /// What came on the stream, until it would block: every whole frame
+    /// taken, even when the stream ended or failed right after (a "bye"
+    /// there ends the session, not only the path: lost, the session
+    /// waited RESUME_WAIT for another, and the PC reached for the
+    /// tablet). Ok(true): it ended (its end, or TLS's close_notify).
+    fn take_in(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,
+               decoder: &mut Decoder, plain: &mut [u8]) -> Result<bool, String> {
+        let read = 'read: loop {
+            match conn.read_tls(stream) {
+                Ok(0) => break Ok(true),
+                Ok(_) => {
+                    if let Err(e) = conn.process_new_packets() {
+                        break Err(e.to_string());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break Ok(false),
+                Err(e) => break Err(e.to_string()),
+            }
+            // Out at once: rustls holds only so much read and not taken.
+            loop {
+                match conn.reader().read(plain) {
+                    Ok(0) => break 'read Ok(true),
+                    Ok(n) => decoder.push(&plain[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => break 'read Err(e.to_string()),
+                }
+            }
+        };
+        while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
+            path.heard();
+            self.heard_on(path);
+            self.frame(kind, channel, body)?;
+        }
+        read
     }
 
     /// A frame from the stream; an error ends the path (the other side
@@ -2379,6 +2387,34 @@ mod tests {
         feeding.join().unwrap();
     }
 
+    /// What node tells of its sessions' ends, as each comes: "detached",
+    /// or why one is over (Gone).
+    fn told_ends(node: &Node) -> mpsc::Receiver<String> {
+        let (tell, told) = mpsc::channel();
+        node.on_event(move |event| {
+            let said = match event {
+                Event::Detached(_) => "detached".to_owned(),
+                Event::Gone(_, reason) => reason,
+                _ => return,
+            };
+            let _ = tell.send(said);
+        });
+        told
+    }
+
+    /// session's thread, once its first ping is out (nothing more to write
+    /// for a second), held at the top of its round (woken out of its poll)
+    /// until what this gives is dropped: what fake does meanwhile is all
+    /// there as it goes on.
+    fn hold<'a>(session: &'a Session, fake: &mut Fake) -> std::sync::MutexGuard<'a, Option<Established>> {
+        while !matches!(read_frame(&mut fake.conn, &mut fake.stream, &mut fake.decoder).unwrap(),
+                        Some((frame::PING, _, _))) {}
+        let held = session.arriving.lock().unwrap();
+        session.wake.wake();
+        std::thread::sleep(Duration::from_millis(100));
+        held
+    }
+
     #[test]
     fn a_bye_and_the_streams_end_at_once_end_the_session() {
         // The tablet says "bye" and lets go of its stream at once (TLS's
@@ -2390,25 +2426,9 @@ mod tests {
         let _one = one_at_a_time();
         for (bye, notify) in [(true, false), (true, true), (false, false), (false, true)] {
             let devices = devices();
-            let (tell, told) = mpsc::channel();
-            devices.pc.on_event(move |event| {
-                let said = match event {
-                    Event::Detached(_) => "detached".to_owned(),
-                    Event::Gone(_, reason) => reason,
-                    _ => return,
-                };
-                let _ = tell.send(said);
-            });
+            let told = told_ends(&devices.pc);
             let (session, mut fake) = devices.by_cable(false, None);
-            // Its first ping out: it writes nothing more for a second (a
-            // write to the stream let go of would fail before the read).
-            while !matches!(read_frame(&mut fake.conn, &mut fake.stream, &mut fake.decoder).unwrap(),
-                            Some((frame::PING, _, _))) {}
-            // The session's thread held at the top of its round (woken out
-            // of its poll): all of what follows is there as it reads next.
-            let held = session.arriving.lock().unwrap();
-            session.wake.wake();
-            std::thread::sleep(Duration::from_millis(100));
+            let held = hold(&session, &mut fake);
             if bye {
                 fake.say(json!({"t": "bye"}));
             }
@@ -2423,6 +2443,33 @@ mod tests {
             let said = told.recv_timeout(Duration::from_secs(2)).expect("nothing told");
             let expected = if bye { "closed by the other side" } else { "detached" };
             assert_eq!(said, expected, "bye: {bye}, close_notify: {notify}");
+            assert_eq!(session.is_closed(), bye);
+            devices.pc.close();
+        }
+    }
+
+    #[test]
+    fn a_bye_before_a_write_that_fails_ends_the_session() {
+        // The tablet says "bye" and lets go of its stream while the PC has
+        // a ping to send: the write fails (EPIPE) before anything is read,
+        // and the path was lost with the bye unread (detached, the session
+        // waited RESUME_WAIT for another). Now what came is taken first:
+        // the session is over. With no bye, the path is lost as before.
+        let _one = one_at_a_time();
+        for bye in [true, false] {
+            let devices = devices();
+            let told = told_ends(&devices.pc);
+            let (session, mut fake) = devices.by_cable(false, None);
+            let held = hold(&session, &mut fake);
+            session.queue(frame::PING, 0, &0u64.to_be_bytes());
+            if bye {
+                fake.say(json!({"t": "bye"}));
+            }
+            drop(fake);
+            drop(held);
+            let said = told.recv_timeout(Duration::from_secs(2)).expect("nothing told");
+            let expected = if bye { "closed by the other side" } else { "detached" };
+            assert_eq!(said, expected, "bye: {bye}");
             assert_eq!(session.is_closed(), bye);
             devices.pc.close();
         }
