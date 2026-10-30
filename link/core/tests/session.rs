@@ -1297,6 +1297,55 @@ fn shaped(address: SocketAddr, rate: f64, queue: Duration) -> SocketAddr {
     via
 }
 
+#[test]
+fn a_keyframe_longer_than_late_at_the_rate_comes_whole_and_the_frame_after_it_too() {
+    // A keyframe of 400 KB on a path of 2 MB/s (0.2 s of it at least), the
+    // next frame begun at once: LATE after its hand-over it was reset with
+    // most of it still to go out, and the next came alone (the app asked
+    // for another keyframe, as big). Now it has the time its bytes take.
+    let (pc, tablet, _address) = pair();
+    let came: Arc<std::sync::Mutex<Vec<(u32, u16)>>> = Arc::default();
+    let kept = came.clone();
+    tablet.serve("count", 1, move |incoming| {
+        let mut buf = vec![0u8; 2048];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+            if n >= 6 {
+                let frame = u32::from_be_bytes(buf[..4].try_into().unwrap());
+                kept.lock().unwrap().push((frame, u16::from_be_bytes(buf[4..6].try_into().unwrap())));
+            }
+        }
+    });
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let session = pc.connect_quic(shaped(quic, 2_000_000.0, Duration::from_millis(400)), Duration::from_secs(3), "lan")
+        .unwrap();
+    until("datagrams proven", || session.rtt().is_some());
+    let video = session.open("count", "v", Class::Video).unwrap();
+    let piece = |frame: u32, piece: u16| {
+        let mut data = vec![0u8; 1000];
+        data[..4].copy_from_slice(&frame.to_be_bytes());
+        data[4..6].copy_from_slice(&piece.to_be_bytes());
+        data
+    };
+    for i in 0..400u16 {
+        video.send_in_group(1, true, i == 399, &piece(1, i)).unwrap();
+    }
+    video.send_in_group(2, false, true, &piece(2, 0)).unwrap();
+    let started = Instant::now();
+    while !came.lock().unwrap().contains(&(2, 0)) && started.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let came = came.lock().unwrap().clone();
+    let whole: Vec<(u32, u16)> = (0..400).map(|i| (1, i)).chain([(2, 0)]).collect();
+    let stats = session.group_stats().expect("a QUIC path");
+    assert!(came == whole, "{} of the keyframe's 400 pieces came, the next frame's {}; {stats}",
+            came.iter().filter(|(f, _)| *f == 1).count(), came.contains(&(2, 0)));
+    assert_eq!((stats.late, stats.superseded, stats.stopped), (0, 0, 0), "{stats}");
+}
+
 /// Channels opened one after the other while a transfer fills a QUIC path
 /// at 100 KB/s, the PC's video streams on or off: how long each open took.
 fn opens_behind_a_transfer_by_quic(streams: bool) -> Vec<Duration> {

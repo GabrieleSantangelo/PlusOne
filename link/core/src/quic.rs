@@ -45,8 +45,9 @@ const ALPN: &[u8] = b"plus-one-link/1";
 /// session stays on TCP.
 const LOCAL_MTU: u16 = 1452;
 /// Realtime that would wait longer than this for the window: dropped (a
-/// group older than this: reset; a newer one's messages wait this long at
-/// most for an older one on the other side: groups.rs).
+/// group this long after its first byte went out, at least: reset; a newer
+/// one's messages wait this long at most for it on the other side:
+/// groups.rs).
 pub(crate) const LATE: Duration = Duration::from_millis(100);
 const DATAGRAM_SEND_BUFFER: usize = 512 << 10;
 /// What quinn takes from the session's stream before it is acknowledged,
@@ -442,7 +443,7 @@ fn dial_with(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, address: S
         // session's TLS hello, which the dialer writes first.
         let (send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let realtime: Arc<AtomicU64> = Arc::default();
-        let groups = Arc::new(Groups::new(&cc));
+        let groups = Arc::new(Groups::new(&conn, &cc));
         let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone(), groups.shared.clone())
             .map_err(|e| e.to_string())?;
         let idle = conn.datagram_send_buffer_space();
@@ -481,7 +482,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                         .map_err(|e| e.to_string())?;
                     let (send, recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
                     let realtime: Arc<AtomicU64> = Arc::default();
-                    let groups = Arc::new(Groups::new(&cc));
+                    let groups = Arc::new(Groups::new(&conn, &cc));
                     let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone(), groups.shared.clone())
                         .map_err(|e| e.to_string())?;
                     let idle = conn.datagram_send_buffer_space();

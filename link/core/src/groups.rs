@@ -8,14 +8,27 @@
 //! ahead of all. QUIC sends a group's lost data again, within the
 //! controller's rate.
 //!
-//! A group is late LATE after its first message was handed over (the
-//! frame's capture, near enough), but a channel's newest group never is (on
-//! a still desktop it is the screen for a long time): once a newer one
-//! begins, a late group is reset if not all acknowledged, at once when a
-//! newer key group begins (superseded), and when the other side gives it up
-//! (stopped). What of it is not sent then never is, nor is its lost data
-//! sent again, and a late frame holds up no newer one. (After moq-dev/moq's
-//! and moxygen's groups, checked against quinn-proto 0.11.19.)
+//! A channel's newest group is never late (on a still desktop it is the
+//! screen for a long time). Once a newer one began, a group is late when it
+//! has had its time since its first byte went out (deadline()): LATE, or
+//! as long as its own bytes take and two round trips (an acknowledgement, a
+//! lost tail sent again), the longer; LONGEST at most. Its first byte goes
+//! out, near enough, once it is written into quinn and the key groups'
+//! bytes quinn held then went (a frame after a keyframe needs it anyway;
+//! behind other frames it has LATE as before: a queue of them is no reason
+//! to keep it, and nothing else bounds that queue). Nor is it reset while
+//! its last byte went out less than a round trip ago, all quinn held ahead
+//! of it gone first: it is on its way. A group not written yet (no credit
+//! for its stream) is late LATE after it was handed over. LATE counted from
+//! the hand-over reset a keyframe (four times a frame, asked for by the
+//! tablet) with its tail still to go out, and the frames behind it before
+//! their first byte went; the tablet asked again. Late, a group is reset if
+//! not all acknowledged;
+//! at once when a newer key group begins (superseded); and when the other
+//! side gives it up (stopped). What of it is not sent then never is, nor is
+//! its lost data sent again, and a late frame holds up no newer one. (After
+//! moq-dev/moq's and moxygen's groups, checked against quinn-proto
+//! 0.11.19.)
 //!
 //! The other side reads each stream as it comes (a task each) and hands the
 //! messages on as datagrams (read()) in the order of the streams' numbers,
@@ -85,6 +98,12 @@ const MAX_SEALED: usize = crate::session::MAX_DATAGRAM + crate::seal::OVERHEAD;
 /// its newest (a group not among them is long late): more than may be open
 /// at once (MAX_STREAMS), and those waiting for their turn.
 const HISTORY: usize = 2 * MAX_STREAMS as usize;
+/// A group's time once a newer one began, at most, from its first byte
+/// written (a keyframe that takes longer at the rate is hopeless there).
+const LONGEST: Duration = Duration::from_secs(1);
+/// How much longer than at the controller's rate a group's bytes may take
+/// to go: GCC allows up to half more than goes through (cc.rs control).
+const AT_RATE: f64 = 1.5;
 /// Bytes of newer groups waiting for an older one on the other side, at
 /// most (Order): LATE of 300 Mbit/s, near enough.
 const HELD_MOST: usize = 4 << 20;
@@ -227,17 +246,28 @@ pub(crate) struct Groups {
 }
 
 impl Groups {
-    /// A connection's, its controller cc's.
-    pub(crate) fn new(cc: &CcConfig) -> Groups {
-        Groups { writer: OnceLock::new(), control: OnceLock::new(), shared: Arc::new(Shared::new(cc.losses.clone())) }
+    /// conn's, its controller cc's.
+    pub(crate) fn new(conn: &Connection, cc: &CcConfig) -> Groups {
+        Groups { writer: OnceLock::new(), control: OnceLock::new(),
+                 shared: Arc::new(Shared::new(conn.clone(), cc.rate.clone(), cc.losses.clone())) }
     }
 }
 
-/// A group as it began: when its first message was handed over.
+/// A group as it began, and as it goes.
+#[derive(Clone, Debug)]
 struct Begun {
     group: u32,
-    at: std::time::Instant,
     key: bool,
+    /// When its first message was handed over.
+    handed: std::time::Instant,
+    /// When its first byte was written into quinn, the groups' bytes quinn
+    /// held then not acknowledged yet (sent ahead of it, unless it is a key
+    /// group), and of those the key groups'; None before.
+    written: Option<(std::time::Instant, u64, u64)>,
+    /// Its bytes written so far, and the controller's lowest rate since its
+    /// first (bytes a second; 0: none known yet).
+    bytes: u64,
+    rate: u64,
 }
 
 /// Why a group is over.
@@ -247,6 +277,50 @@ enum Over {
     Superseded,
     /// The other side gave it up (stopped it).
     Stopped,
+}
+
+/// When a group that is no longer its channel's newest is late (rtt: the
+/// smoothed round trip): LATE after its first byte went out, or as long as
+/// its bytes take at its rate (AT_RATE over it: what goes through may be
+/// that much less) and two round trips, the longer. Out: written into quinn,
+/// and the key groups' bytes quinn held ahead of it gone at the same rate (a
+/// key group goes ahead of all). But never while its last byte went out
+/// less than a round trip ago, all quinn held ahead of it gone first (on its
+/// way, about to be whole there). At most LONGEST after it was written;
+/// LATE after it was handed over while it is not.
+fn deadline(b: &Begun, rtt: Duration) -> std::time::Instant {
+    let Some((written, ahead, key_ahead)) = b.written else { return b.handed + LATE };
+    if b.rate == 0 {
+        return written + LATE;
+    }
+    let at_rate = |bytes: u64| AT_RATE * bytes as f64 / b.rate as f64;
+    let (ahead, key_ahead) = if b.key { (0.0, 0.0) } else { (at_rate(ahead), at_rate(key_ahead)) };
+    let rtt = rtt.as_secs_f64();
+    let mut due = key_ahead + LATE.as_secs_f64().max(at_rate(b.bytes) + 2.0 * rtt);
+    let last = ahead + at_rate(b.bytes);
+    if last <= due && due < last + rtt {
+        due = last + rtt;
+    }
+    written + Duration::from_secs_f64(due.min(LONGEST.as_secs_f64()))
+}
+
+/// Until when a channel's group lasts, among its groups as they began (the
+/// newest last): Ok(None) while it is the newest, Ok(its deadline()) once a
+/// newer one began, or why it is over already (a newer key group began;
+/// long gone from them). rate: the controller's now (each group keeps the
+/// lowest since it was written).
+fn lasts_in(groups: &mut VecDeque<Begun>, group: u32, rate: u64, rtt: Duration)
+            -> Result<Option<std::time::Instant>, Over> {
+    let Some(i) = groups.iter().rposition(|b| b.group == group) else { return Err(Over::Late) };
+    if groups.iter().skip(i + 1).any(|b| b.key) {
+        return Err(Over::Superseded);
+    }
+    let newest = i + 1 == groups.len();
+    let b = &mut groups[i];
+    if b.written.is_some() && rate > 0 {
+        b.rate = if b.rate == 0 { rate } else { b.rate.min(rate) };
+    }
+    Ok((!newest).then(|| deadline(b, rtt)))
 }
 
 /// The counts the writers and their streams' tasks keep.
@@ -276,13 +350,17 @@ pub(crate) struct Shared {
     /// newest last; told as a group begins.
     begun: Mutex<HashMap<u16, VecDeque<Begun>>>,
     began: Notify,
-    /// The controller's losses.
+    /// The connection (its round trip), its controller's rate and losses.
+    conn: Connection,
+    rate: Arc<AtomicU64>,
     losses: Arc<Losses>,
     /// Bytes written on group streams not all acknowledged yet nor reset
     /// (a stream's count until it is): quinn's send window holds them on
     /// top of the session stream's share (quic.rs send_window), which stays
     /// the bulk's whatever the video holds.
     unacked: AtomicU64,
+    /// Of those, the key groups'.
+    key_unacked: AtomicU64,
     /// Bytes handed over, and not written yet.
     handed: AtomicU64,
     queued: AtomicU64,
@@ -290,10 +368,10 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn new(losses: Arc<Losses>) -> Shared {
-        Shared { window: Mutex::new(crate::quic::SEND_WINDOW), begun: Mutex::default(), began: Notify::new(),
-                 losses, unacked: AtomicU64::new(0), handed: AtomicU64::new(0), queued: AtomicU64::new(0),
-                 count: Counts::default() }
+    fn new(conn: Connection, rate: Arc<AtomicU64>, losses: Arc<Losses>) -> Shared {
+        Shared { window: Mutex::new(crate::quic::SEND_WINDOW), begun: Mutex::default(), began: Notify::new(), conn,
+                 rate, losses, unacked: AtomicU64::new(0), key_unacked: AtomicU64::new(0),
+                 handed: AtomicU64::new(0), queued: AtomicU64::new(0), count: Counts::default() }
     }
 
     /// quinn's send window set to window (the bridge, as the rate moves).
@@ -357,7 +435,7 @@ impl Shared {
             if groups.back().is_some_and(|b| b.group == group) {
                 return;
             }
-            groups.push_back(Begun { group, at: std::time::Instant::now(), key });
+            groups.push_back(Begun { group, key, handed: std::time::Instant::now(), written: None, bytes: 0, rate: 0 });
             if groups.len() > HISTORY {
                 groups.pop_front();
             }
@@ -365,17 +443,28 @@ impl Shared {
         self.began.notify_waiters();
     }
 
-    /// Until when channel's group lasts: Ok(None) while it is the newest,
-    /// Ok(LATE after it began) once a newer one did, or why it is over
-    /// already (a newer key group began; long gone from the history).
-    fn lasts(&self, channel: u16, group: u32) -> Result<Option<Instant>, Over> {
-        let begun = self.begun.lock().unwrap();
-        let Some(groups) = begun.get(&channel) else { return Ok(None) };
-        let Some(i) = groups.iter().rposition(|b| b.group == group) else { return Err(Over::Late) };
-        if groups.iter().skip(i + 1).any(|b| b.key) {
-            return Err(Over::Superseded);
+    /// bytes of channel's group written into quinn now (the first: what it
+    /// has ahead of it noted, the groups' bytes not acknowledged yet, and
+    /// the key groups').
+    fn wrote(&self, channel: u16, group: u32, bytes: u64) {
+        let rate = self.rate.load(Ordering::Relaxed);
+        let (ahead, key_ahead) = (self.unacked(), self.key_unacked.load(Ordering::Relaxed));
+        let mut begun = self.begun.lock().unwrap();
+        let Some(b) = begun.get_mut(&channel).and_then(|groups| groups.iter_mut().rev().find(|b| b.group == group))
+        else { return };
+        if b.written.is_none() {
+            b.written = Some((std::time::Instant::now(), ahead, key_ahead));
+            b.rate = rate;
         }
-        Ok((i + 1 < groups.len()).then(|| Instant::from_std(groups[i].at) + LATE))
+        b.bytes += bytes;
+    }
+
+    /// Until when channel's group lasts (lasts_in).
+    fn lasts(&self, channel: u16, group: u32) -> Result<Option<Instant>, Over> {
+        let (rate, rtt) = (self.rate.load(Ordering::Relaxed), self.conn.rtt());
+        let mut begun = self.begun.lock().unwrap();
+        let Some(groups) = begun.get_mut(&channel) else { return Ok(None) };
+        lasts_in(groups, group, rate, rtt).map(|until| until.map(Instant::from_std))
     }
 
     /// A group over, its stream (if any) reset: counted (unsent: before all
@@ -407,7 +496,8 @@ impl Shared {
 }
 
 /// what, until channel's group is over (Shared::lasts): its output, or why
-/// the group is over.
+/// the group is over. Its end looked at again as other groups begin and
+/// when it comes (the rate and the round trip may have moved it).
 async fn until_over<T>(shared: &Shared, channel: u16, group: u32, what: impl Future<Output = T>) -> Result<T, Over> {
     tokio::pin!(what);
     loop {
@@ -422,7 +512,7 @@ async fn until_over<T>(shared: &Shared, channel: u16, group: u32, what: impl Fut
             biased;
             done = &mut what => return Ok(done),
             _ = &mut began => {}  // another group began: this one's end may be known now
-            _ = sleep_until(lasts) => return Err(Over::Late),
+            _ = sleep_until(lasts) => {}
         }
     }
 }
@@ -469,12 +559,23 @@ impl Groups {
 /// A channel's group being written.
 struct Writing {
     group: u32,
+    key: bool,
     /// Its stream; None once finished or over, or if it never began (its
     /// messages that still come are dropped).
     stream: Option<SendStream>,
     /// Bytes written on it (counted in Shared::unacked until it is all
-    /// acknowledged or reset).
+    /// acknowledged or reset, and key_unacked for a key group).
     bytes: u64,
+}
+
+impl Writing {
+    /// Its bytes no longer held: all acknowledged, or reset.
+    fn held_no_more(key: bool, bytes: u64, shared: &Shared) {
+        shared.unacked.fetch_sub(bytes, Ordering::Relaxed);
+        if key {
+            shared.key_unacked.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Writing {
@@ -484,7 +585,7 @@ impl Writing {
     fn finish(&mut self, channel: u16, shared: &Arc<Shared>) {
         let Some(mut stream) = self.stream.take() else { return };
         let _ = stream.finish();
-        let (group, bytes, shared) = (self.group, self.bytes, shared.clone());
+        let (group, key, bytes, shared) = (self.group, self.key, self.bytes, shared.clone());
         tokio::spawn(async move {
             let acknowledged = stream.stopped();
             let acknowledged = until_over(&shared, channel, group, acknowledged).await;
@@ -493,7 +594,7 @@ impl Writing {
                 Ok(_) => {}  // all acknowledged (or the connection over)
                 Err(why) => shared.over(why, Some(&mut stream), bytes, false),
             }
-            shared.unacked.fetch_sub(bytes, Ordering::Relaxed);
+            Writing::held_no_more(key, bytes, &shared);
         });
     }
 
@@ -502,7 +603,7 @@ impl Writing {
     fn over(&mut self, why: Over, shared: &Shared) {
         if let Some(mut stream) = self.stream.take() {
             shared.over(why, Some(&mut stream), self.bytes, true);
-            shared.unacked.fetch_sub(self.bytes, Ordering::Relaxed);
+            Writing::held_no_more(self.key, self.bytes, shared);
         }
     }
 }
@@ -570,7 +671,7 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
                     None
                 }
             };
-            writing.insert(channel, Writing { group, stream, bytes: 0 });
+            writing.insert(channel, Writing { group, key: piece.key, stream, bytes: 0 });
         }
         let Some(w) = writing.get_mut(&channel) else { continue };
         let over = shared.lasts(channel, group).and_then(|until| match until {
@@ -584,10 +685,15 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
             shared.count.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        // Held in quinn's send window on top of the session stream's share
-        // (quic.rs send_window) until acknowledged: room the bulk leaves.
+        // What quinn holds ahead of it noted (deadline()); held in quinn's
+        // send window on top of the session stream's share (quic.rs
+        // send_window) until acknowledged: room the bulk leaves.
+        shared.wrote(channel, group, length);
         w.bytes += length;
         shared.unacked.fetch_add(length, Ordering::Relaxed);
+        if w.key {
+            shared.key_unacked.fetch_add(length, Ordering::Relaxed);
+        }
         if let Err(why) = write_all(&conn, stream, &piece.framed, channel, group, &shared).await {
             w.over(why, &shared);
             shared.count.dropped.fetch_add(1, Ordering::Relaxed);
@@ -1017,6 +1123,10 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    fn near(a: At, b: At) -> bool {
+        a.max(b).duration_since(a.min(b)) < Duration::from_micros(10)
+    }
+
     fn bytes(text: &str) -> Bytes {
         Bytes::copy_from_slice(text.as_bytes())
     }
@@ -1111,6 +1221,54 @@ mod tests {
         order.message(1, bytes("one more"), t, &mut |m| got.push(m));
         assert_eq!(order.tick(t, &mut |m| got.push(m)), None);
         assert_eq!((got.len(), order.held, order.stats.given_up), (3, 0, 1));
+    }
+
+    fn begun(key: bool, handed: At, written: Option<(At, u64, u64)>, bytes: u64, rate: u64) -> Begun {
+        Begun { group: 1, key, handed, written, bytes, rate }
+    }
+
+    #[test]
+    fn a_group_has_its_time_from_its_first_byte_out_a_big_one_as_long_as_its_bytes_take() {
+        let (t, rtt) = (At::now(), ms(10));
+        // Not written yet (no credit for its stream): LATE after it was
+        // handed over.
+        assert_eq!(deadline(&begun(false, t, None, 0, 0), rtt), t + LATE);
+        // Written 300 ms after (the writer held up), behind a keyframe's
+        // 200 KB not acknowledged yet at 3 MB/s (a half over what goes
+        // through): its first byte out 100 ms later, LATE from there.
+        let w = t + ms(300);
+        assert!(near(deadline(&begun(false, t, Some((w, 200_000, 200_000)), 20_000, 3_000_000), rtt), w + ms(200)));
+        // Behind other frames only: LATE, as ever (nothing else bounds a
+        // queue of them).
+        assert!(near(deadline(&begun(false, t, Some((w, 100_000, 0)), 20_000, 3_000_000), rtt), w + LATE));
+        // Unless its last byte went out less than a round trip before: on
+        // its way, a round trip more.
+        assert!(near(deadline(&begun(false, t, Some((w, 170_000, 0)), 20_000, 3_000_000), rtt), w + ms(105)));
+        // A key group goes ahead of all, and has as long as its bytes take
+        // (400 KB: 200 ms) and two round trips.
+        assert!(near(deadline(&begun(true, t, Some((w, 200_000, 200_000)), 400_000, 3_000_000), rtt), w + ms(220)));
+        // A small one LATE; no rate known yet: LATE from its write.
+        assert!(near(deadline(&begun(true, t, Some((w, 0, 0)), 20_000, 3_000_000), rtt), w + LATE));
+        assert_eq!(deadline(&begun(true, t, Some((w, 0, 0)), 400_000, 0), rtt), w + LATE);
+        // LONGEST at most.
+        assert!(near(deadline(&begun(true, t, Some((w, 0, 0)), 4_000_000, 3_000_000), rtt), w + LONGEST));
+    }
+
+    #[test]
+    fn a_group_lasts_at_the_lowest_rate_since_it_was_written_and_the_newest_ever() {
+        let (t, rtt) = (At::now(), ms(10));
+        let mut groups: VecDeque<Begun> = [begun(true, t, Some((t, 0, 0)), 300_000, 3_000_000)].into();
+        assert_eq!(lasts_in(&mut groups, 1, 3_000_000, rtt), Ok(None));
+        groups.push_back(Begun { group: 2, ..begun(false, t, None, 0, 0) });
+        let at = |groups: &mut VecDeque<Begun>, rate| lasts_in(groups, 1, rate, rtt).unwrap().unwrap();
+        assert!(near(at(&mut groups, 3_000_000), t + ms(170)));
+        // The rate down: longer; up again: as long as at the lowest.
+        assert!(near(at(&mut groups, 1_500_000), t + ms(320)));
+        assert!(near(at(&mut groups, 6_000_000), t + ms(320)));
+        // Long gone, or a newer key group began: over.
+        assert_eq!(lasts_in(&mut groups, 0, 3_000_000, rtt), Err(Over::Late));
+        groups.push_back(Begun { group: 3, ..begun(true, t, None, 0, 0) });
+        assert_eq!(lasts_in(&mut groups, 1, 3_000_000, rtt), Err(Over::Superseded));
     }
 
     #[test]
