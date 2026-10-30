@@ -1455,13 +1455,16 @@ class AppStreamer:
         within the gap it keeps between asks (MIN_KEYFRAME_GAP, as
         DisplaySession.kt's KEYFRAME_AGAIN), the keyframe's time on its way
         out and two round trips. (An ask alone may be for a frame lost on the
-        air after it: a halving each time cost the bitrate for nothing.)"""
-        if self._key_at is None or self._key_dropped is None:
+        air after it: a halving each time cost the bitrate for nothing.)
+        Each read once: the streaming thread sets them as a keyframe goes
+        (the count None if the link did not answer)."""
+        key_at, before = self._key_at, self._key_dropped
+        if key_at is None or before is None:
             return False
-        if now > self._key_at + MIN_KEYFRAME_GAP + self._key_time() + 2 * rtt:
+        if now > key_at + MIN_KEYFRAME_GAP + self._key_time() + 2 * rtt:
             return False
         dropped = self.channel.dropped()
-        return dropped is not None and dropped > self._key_dropped
+        return dropped is not None and dropped > before
 
     def _lost_keyframe(self, now):
         """The last keyframe sent was cut: the next made at KEY_BACKOFF of
