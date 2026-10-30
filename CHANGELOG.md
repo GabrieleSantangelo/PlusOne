@@ -2,6 +2,15 @@
 
 ## Unreleased (1.0)
 
+- **A session ended over there ends here at once**: when one side
+  ended the session (closed by hand, idle, plus-one-link stopping) and
+  its connection closed in the same moment, its goodbye could go unread:
+  the other side took it for a lost connection, said "Reconnecting…"
+  and waited up to 15 s (60 s with something in use) for it to come
+  back, while plus-one-link kept trying to reach the tablet. The goodbye
+  is now read before the connection's end, and the session ends as
+  asked. A connection that ends with no goodbye is still waited for, as
+  before.
 - **The cable asks a device once each time it is plugged in**: with
   "use the cable" on, plus-one-link asked anything of Samsung's (a disk,
   a hub) to become Plus One's accessory, and asked again every 2 s for

@@ -1783,9 +1783,17 @@ impl Session {
             if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
                 continue;
             }
-            loop {
+            // The other side's end (its stream's, or TLS's close_notify)
+            // waits for what came before it: a "bye" there ends the
+            // session, not only the path (lost, the session waited
+            // RESUME_WAIT for another, and the PC reached for the tablet).
+            let mut ended = false;
+            'read: loop {
                 match conn.read_tls(stream) {
-                    Ok(0) => return Err("the other side closed".into()),
+                    Ok(0) => {
+                        ended = true;
+                        break;
+                    }
                     Ok(_) => {
                         conn.process_new_packets().map_err(|e| e.to_string())?;
                     }
@@ -1795,7 +1803,10 @@ impl Session {
                 // Out at once: rustls holds only so much read and not taken.
                 loop {
                     match conn.reader().read(&mut plain) {
-                        Ok(0) => return Err("the other side closed".into()),
+                        Ok(0) => {
+                            ended = true;
+                            break 'read;
+                        }
                         Ok(n) => decoder.push(&plain[..n]),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e.to_string()),
@@ -1806,6 +1817,9 @@ impl Session {
                 path.heard();
                 self.heard_on(path);
                 self.frame(kind, channel, body)?;
+            }
+            if ended {
+                return Err("the other side closed".into());
             }
         }
     }
@@ -2363,6 +2377,55 @@ mod tests {
         assert!(failed > PATH_SILENCE - Duration::from_secs(1), "lost after {failed:?}");
         devices.pc.close();
         feeding.join().unwrap();
+    }
+
+    #[test]
+    fn a_bye_and_the_streams_end_at_once_end_the_session() {
+        // The tablet says "bye" and lets go of its stream at once (TLS's
+        // close_notify between or not): the end came in the same read as
+        // the bye, and lost the path before the bye was taken (detached,
+        // the session waited RESUME_WAIT for another, the PC reached for
+        // the tablet again). Now the bye is taken first: the session is
+        // over. With no bye, the path is lost as before.
+        let _one = one_at_a_time();
+        for (bye, notify) in [(true, false), (true, true), (false, false), (false, true)] {
+            let devices = devices();
+            let (tell, told) = mpsc::channel();
+            devices.pc.on_event(move |event| {
+                let said = match event {
+                    Event::Detached(_) => "detached".to_owned(),
+                    Event::Gone(_, reason) => reason,
+                    _ => return,
+                };
+                let _ = tell.send(said);
+            });
+            let (session, mut fake) = devices.by_cable(false, None);
+            // Its first ping out: it writes nothing more for a second (a
+            // write to the stream let go of would fail before the read).
+            while !matches!(read_frame(&mut fake.conn, &mut fake.stream, &mut fake.decoder).unwrap(),
+                            Some((frame::PING, _, _))) {}
+            // The session's thread held at the top of its round (woken out
+            // of its poll): all of what follows is there as it reads next.
+            let held = session.arriving.lock().unwrap();
+            session.wake.wake();
+            std::thread::sleep(Duration::from_millis(100));
+            if bye {
+                fake.say(json!({"t": "bye"}));
+            }
+            if notify {
+                fake.conn.send_close_notify();
+                while fake.conn.wants_write() {
+                    fake.conn.write_tls(&mut fake.stream).unwrap();
+                }
+            }
+            drop(fake);
+            drop(held);
+            let said = told.recv_timeout(Duration::from_secs(2)).expect("nothing told");
+            let expected = if bye { "closed by the other side" } else { "detached" };
+            assert_eq!(said, expected, "bye: {bye}, close_notify: {notify}");
+            assert_eq!(session.is_closed(), bye);
+            devices.pc.close();
+        }
     }
 
     #[test]
