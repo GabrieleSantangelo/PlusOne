@@ -30,7 +30,8 @@
 //!                                the app), the session made on it
 //!   {"op": "browse"[, "wait": S]}  the tablets announcing the link nearby
 //!                                (mDNS): id (its start), name, address
-//!   {"op": "queued", "device"}   bytes on their way to it, not yet sent
+//!   {"op": "queued", "device"}   bytes on their way to it, not yet sent;
+//!                                dropped, as devices' (one call each frame)
 //!   {"op": "close", "device"}    its session over (its channels with it)
 //!   {"op": "usb"[, "use": false]}  any Android tablet plugged in asked to be
 //!                                Plus One's accessory (usb.rs), from now on;
@@ -328,7 +329,7 @@ impl Daemon {
 
     fn queued(&self, request: &Value) -> Result<Value, String> {
         let session = self.node.session(request["device"].as_str().ok_or("no device")?).ok_or("not connected")?;
-        Ok(json!({"ok": true, "queued": session.queued()}))
+        Ok(json!({"ok": true, "queued": session.queued(), "dropped": session.dropped()}))
     }
 
     /// Sessions with no channel for IDLE: closed.

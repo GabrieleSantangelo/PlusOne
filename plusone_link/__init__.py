@@ -263,6 +263,13 @@ class Link:
         network is."""
         return self._request({"op": "queued", "device": device})[0]["queued"]
 
+    def backlog(self, device):
+        """(queued(), the realtime the link dropped so far, as devices()'
+        "dropped"), in the one request: the count None from a plus-one-link
+        that does not tell it there."""
+        reply = self._request({"op": "queued", "device": device})[0]
+        return reply["queued"], reply.get("dropped")
+
     def open(self, device, feature, name, kind=CONTROL):
         """A channel with the tablet (its id, or a device from devices()); the
         session made first if there is none."""

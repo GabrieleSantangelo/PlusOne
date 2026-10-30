@@ -81,6 +81,8 @@ def test_devices_and_connect(world):
     (device,) = link.devices()
     assert device["connected"] and device["name"] == "Test tablet"
     assert set(device["features"]) == {"echo", "sink", "callback", "frames"}
+    queued, dropped = link.backlog(tablet_id)  # the queue and the drops in one request
+    assert queued >= 0 and dropped == device["dropped"] == 0
 
 
 def test_control_and_realtime_channels(world):
@@ -284,6 +286,14 @@ def test_events_refused_or_garbled_close_their_connection(daemon, reply):
     with pytest.raises((ValueError, LinkError)):
         plusone_link._Events("fake", {"op": "watch"}, lambda event, fd: None, "test-watch")
     assert plusone_link._connect("fake").fileno() == -1
+
+
+@pytest.mark.parametrize("reply, backlog", [({"queued": 5, "dropped": 7}, (5, 7)),
+                                            ({"queued": 5}, (5, None))])  # a plus-one-link from before
+def test_the_backlog_is_the_queue_and_the_drops_in_one_request(daemon, reply, backlog):
+    daemon.send(json.dumps(dict(reply, ok=True)).encode())
+    assert Link("fake").backlog("tab") == backlog
+    assert json.loads(daemon.recv(4096)) == {"op": "queued", "device": "tab"}
 
 
 def test_a_video_channel_is_asked_for_as_video(daemon):
