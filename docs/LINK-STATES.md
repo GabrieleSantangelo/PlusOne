@@ -141,7 +141,8 @@ Invariants:
 - A path is ranked when adopted; a worse path never replaces a working
   better one **[built]**.
 - Realtime never waits behind reliable data on a UDP path; on a stream
-  path it is dropped past `STREAM_BUDGET` rather than queued **[built]**.
+  path it is dropped past `REALTIME_WAIT` of what the stream takes
+  (`STREAM_BUDGET` at most, more on a cable) rather than queued **[built]**.
 
 ## 4. Path machine (per transport, under the session)
 

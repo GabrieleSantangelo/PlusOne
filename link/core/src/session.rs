@@ -106,15 +106,37 @@ const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// frame take about 40 of the 1452 bytes IP and UDP leave), and a UDP one.
 pub const MAX_DATAGRAM: usize = 1380;
 /// Realtime over the stream: dropped while this much urgent waits to be
-/// sent, at most; on a slow stream, while more than REALTIME_WAIT of it
-/// does at the rate the stream takes it (Bluetooth: 256 KiB were seconds).
+/// sent, at most (more on a stream whose budget drains more in
+/// REALTIME_WAIT: Drain::wait_most); on a slow stream, while more than
+/// REALTIME_WAIT of it does at the rate the stream takes it (Bluetooth:
+/// 256 KiB were seconds).
 const STREAM_BUDGET: usize = 256 << 10;
+/// The most realtime may wait on any stream (a cable whose prior, from a
+/// USB 3 link's speed, is hundreds of MB/s): a keyframe of the largest.
+const STREAM_WAIT_MOST: usize = 4 << 20;
 const REALTIME_WAIT: Duration = Duration::from_millis(150);
 /// The stream's rate is measured over this long, while it is full.
 const RATE_WINDOW: Duration = Duration::from_millis(200);
 /// A Bluetooth path's budget until its stream is measured full (bytes a
 /// second): 0.9 Mbit/s, under what RFCOMM carries (1-2 Mbit/s).
 const BT_PRIOR: u64 = 900_000 / 8;
+/// A cable's (the USB accessory's), the same, when its stream does not
+/// know better (Stream::prior: plus-one-link's, from the speed its USB link
+/// was made at; the app's cannot read it): 80 Mbit/s, under what USB 2
+/// carries by accessory (17.5 MB/s one way), over what any feature asks
+/// (the desktop's 20 Mbit/s). With none, the desktop's bitrate followed its
+/// own reports, a third off at each frame lost: 3-11 Mbit/s on the cable,
+/// 20 on Wi-Fi. A cable has no congestion, only the other side's reading:
+/// its drain is its controller, measured down as the other side reads
+/// slowly, and back up toward the prior once it no longer does (PROBE_*).
+const USB_PRIOR: u64 = 80_000_000 / 8;
+/// A cable's budget measured under its prior, not measured again (not
+/// full throughout DRAIN_SPAN) for this long: PROBE_UP times higher, up to
+/// the prior, and so on each PROBE_AFTER (the other side read slowly a
+/// moment, and reads again: a measure is only made with the stream full,
+/// which the apps under the budget never fill again).
+const PROBE_AFTER: Duration = Duration::from_secs(2);
+const PROBE_UP: f64 = 1.5;
 /// What a stream drains is measured over the last this long it was full
 /// throughout: its socket's room, either way, is then a few percent of it
 /// (of a window's alone, as much as half).
@@ -532,6 +554,9 @@ struct Path {
     /// measured since.
     budget: AtomicU64,
     drained: AtomicBool,
+    /// Its prior (bytes a second, 0: none): a probing kind's budget goes
+    /// back up to it (Drain::probing).
+    prior: u64,
 }
 
 /// A path's end: its stream shut down, its QUIC connection closed, its
@@ -603,16 +628,28 @@ impl Path {
 }
 
 /// What a stream path of kind is taken to carry until it is measured
-/// (bytes a second): Bluetooth's; none for the others (a cable carries
-/// more than any feature asks, TCP is paced: pace.rs).
+/// (bytes a second): Bluetooth's, a cable's; none for the others (TCP is
+/// paced: pace.rs).
 fn prior(kind: &str) -> Option<u64> {
-    (kind == "bt").then_some(BT_PRIOR)
+    match kind {
+        "bt" => Some(BT_PRIOR),
+        "usb" => Some(USB_PRIOR),
+        _ => None,
+    }
+}
+
+/// Whether a kind's budget, measured under its prior, goes back up toward
+/// it (PROBE_AFTER): a cable's, whose drain is the other side's reading
+/// alone. Not Bluetooth's: the air's, its measure is what it carries.
+fn probes(kind: &str) -> bool {
+    kind == "usb"
 }
 
 /// What a stream takes, measured each RATE_WINDOW from what its socket
-/// took: how much realtime may wait on it (REALTIME_WAIT of its rate while
-/// it is full, STREAM_BUDGET at most), and, for a kind with a prior
-/// (Bluetooth), its budget, told as a QUIC path's controller tells its own
+/// took: how much realtime may wait on it (REALTIME_WAIT of what it takes
+/// while it is full: what its socket took, or its budget if more; at most
+/// wait_most()), and, for a kind with a prior (Bluetooth, a cable), its
+/// budget, told as a QUIC path's controller tells its own
 /// (cc.rs: past PUBLISH_CHANGE of the last told, a cut at once, up at most
 /// each PUBLISH_EVERY). The budget is what the stream drains: what its
 /// socket took over the last DRAIN_SPAN of windows, one after the other,
@@ -642,16 +679,37 @@ struct Drain {
     measured: bool,
     told: u64,
     told_at: Instant,
+    /// A kind that probes (probes()): its prior, the budget goes back up to
+    /// it; and when it next does, measured under it.
+    ceiling: Option<u64>,
+    probe_at: Instant,
 }
 
 impl Drain {
     fn new(now: Instant, prior: Option<u64>) -> Drain {
         Drain { start: now, bytes: 0, full: false, full_at_start: false, full_now: false, dry: false, settled: false,
-                run: VecDeque::new(), budget: prior, measured: false, told: prior.unwrap_or(0), told_at: now }
+                run: VecDeque::new(), budget: prior, measured: false, told: prior.unwrap_or(0), told_at: now,
+                ceiling: None, probe_at: now }
+    }
+
+    /// As one of a kind that probes: back up to ceiling (its prior) once
+    /// measured under it and not measured again for PROBE_AFTER.
+    fn probing(mut self, ceiling: u64) -> Drain {
+        self.ceiling = Some(ceiling).filter(|ceiling| *ceiling != 0);
+        self
     }
 
     fn wrote(&mut self, bytes: usize) {
         self.bytes += bytes;
+    }
+
+    /// How much realtime may wait on the stream at most: STREAM_BUDGET, or
+    /// REALTIME_WAIT of its budget if more (a cable drains a keyframe at the
+    /// desktop's bitrate, more than STREAM_BUDGET, in a few ms), up to
+    /// STREAM_WAIT_MOST.
+    fn wait_most(&self) -> usize {
+        let budget = self.budget.map_or(0, |budget| (budget as f64 * REALTIME_WAIT.as_secs_f64()) as usize);
+        STREAM_BUDGET.max(budget.min(STREAM_WAIT_MOST))
     }
 
     /// A round's writes done: the socket full (more waits it would not
@@ -674,11 +732,18 @@ impl Drain {
         if elapsed < RATE_WINDOW || !self.settled {
             return None;
         }
-        // Full in it: what it took is its rate; else it takes all there is.
+        // Full in it: it takes what its socket took at least, its budget if
+        // more; else all there is. (A stream much faster than what goes on
+        // it, a cable, fills its little room at each burst all the same:
+        // what its socket took was only what it was given, and REALTIME_WAIT
+        // of that, under a keyframe, dropped the keyframe's tail each time,
+        // the tablet asked for another, in a loop.)
         let wait = if self.full {
-            ((self.bytes as f64 / elapsed.as_secs_f64() * REALTIME_WAIT.as_secs_f64()) as usize).clamp(8 << 10, STREAM_BUDGET)
+            let took = self.bytes as f64 / elapsed.as_secs_f64();
+            let takes = took.max(self.budget.unwrap_or(0) as f64);
+            ((takes * REALTIME_WAIT.as_secs_f64()) as usize).clamp(8 << 10, self.wait_most())
         } else {
-            STREAM_BUDGET
+            self.wait_most()
         };
         let mut told = None;
         if self.budget.is_some() {
@@ -691,11 +756,23 @@ impl Drain {
             while self.run.front().is_some_and(|(_, length)| span - *length >= DRAIN_SPAN) {
                 span -= self.run.pop_front().map_or(Duration::ZERO, |(_, length)| length);
             }
+            let mut budget = None;
             if span >= DRAIN_SPAN {
                 let bytes: usize = self.run.iter().map(|(bytes, _)| *bytes).sum();
-                let budget = (bytes as f64 / span.as_secs_f64()).max(DRAIN_LEAST) as u64;
-                self.budget = Some(budget);
+                budget = Some((bytes as f64 / span.as_secs_f64()).max(DRAIN_LEAST) as u64);
                 self.measured = true;
+                self.probe_at = now + PROBE_AFTER;
+            } else if let (Some(ceiling), Some(was)) = (self.ceiling, self.budget) {
+                // Not measured again for PROBE_AFTER: up toward the prior.
+                if was < ceiling && now >= self.probe_at {
+                    let up = ((was as f64 * PROBE_UP) as u64).min(ceiling);
+                    budget = Some(up);
+                    self.measured = up < ceiling;
+                    self.probe_at = now + PROBE_AFTER;
+                }
+            }
+            if let Some(budget) = budget {
+                self.budget = Some(budget);
                 let moved = budget.abs_diff(self.told) as f64 > crate::cc::PUBLISH_CHANGE * self.told as f64;
                 if moved && (budget < self.told || now.duration_since(self.told_at) >= crate::cc::PUBLISH_EVERY) {
                     (self.told, self.told_at) = (budget, now);
@@ -1036,14 +1113,14 @@ fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
     let quic = established.quic.take();
     // A QUIC path's stream is a socket pair's end (quic.rs): QUIC first.
     let transport = if quic.is_some() { "quic" } else { established.stream.transport() };
-    let budget = prior(&established.kind).filter(|_| quic.is_none()).unwrap_or(0);
+    let budget = established.stream.prior().or_else(|| prior(&established.kind)).filter(|_| quic.is_none()).unwrap_or(0);
     Ok(Arc::new(Path { id, kind: established.kind.clone(), stream: established.stream.try_clone()?, udp,
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
                        gone: AtomicBool::new(false), leaving: AtomicBool::new(false), ended: AtomicBool::new(false),
                        state: AtomicU8::new(PathState::Active as u8), budget: AtomicU64::new(budget),
-                       drained: AtomicBool::new(false) }))
+                       drained: AtomicBool::new(false), prior: budget }))
 }
 
 /// Blocking, during the hellos: the next frame (None: read more).
@@ -1206,8 +1283,8 @@ impl Session {
     }
 
     /// What the path's congestion controller allows now (bytes a second):
-    /// a QUIC path's (cc.rs), a Bluetooth path's what its stream drains
-    /// (Drain); None on a path with none of its own (TCP, a cable).
+    /// a QUIC path's (cc.rs), a Bluetooth path's or a cable's what its
+    /// stream drains (Drain); None on a path with none of its own (TCP).
     pub fn rate(&self) -> Option<u64> {
         self.current().and_then(|path| path.budget().0)
     }
@@ -1781,9 +1858,10 @@ impl Session {
             live.insert(0, carrier.path.clone());
         }
         *self.pace.lock().unwrap() = crate::pace::Pace::new(now);
-        carrier.drain = Drain::new(now, Some(carrier.path.budget.load(Ordering::Relaxed)).filter(|prior| *prior != 0));
+        let drain = Drain::new(now, Some(carrier.path.budget.load(Ordering::Relaxed)).filter(|prior| *prior != 0));
+        carrier.drain = if probes(&carrier.path.kind) { drain.probing(carrier.path.prior) } else { drain };
         (carrier.next_ping, carrier.next_udp_ping, carrier.taken_at) = (now, now, now);
-        self.stream_budget.store(STREAM_BUDGET, Ordering::Relaxed);
+        self.stream_budget.store(carrier.drain.wait_most(), Ordering::Relaxed);
         let budget = carrier.drain.budget.or_else(|| {
             carrier.path.quic.as_ref().map(|quic| quic.rate()).filter(|rate| self.multipath && *rate > 0)
         });
@@ -3337,11 +3415,82 @@ mod tests {
         assert_eq!(window(&mut drain, at(3010), 2_000, false, true), None);
         assert_eq!(window(&mut drain, at(3210), 30_000, true, false), None);
         assert!(drain.run.is_empty());
-        // A stream with no prior (a cable): never a budget.
-        let mut cable = Drain::new(start, prior("usb"));
+        // A stream with no prior (TCP's, paced: pace.rs): never a budget.
+        let mut tcp = Drain::new(start, prior("lan"));
         for ms in (200..=1400).step_by(200) {
-            assert_eq!(window(&mut cable, at(ms), 1 << 20, true, false), None);
+            assert_eq!(window(&mut tcp, at(ms), 1 << 20, true, false), None);
         }
-        assert_eq!(cable.budget, None);
+        assert_eq!(tcp.budget, None);
+    }
+
+    #[test]
+    fn a_cables_budget_measured_down_goes_back_up() {
+        // The tablet reading slowly a second (the cable's stream full
+        // throughout at 1 MB/s): its budget that, told at once. It reads
+        // again (never full since, the apps under the budget): 2 s on, 1.5
+        // times that, told, and so on each 2 s, up to its prior (12 MB/s). (Measured once, a cable's budget stayed what one
+        // stall drained, the desktop under it for good.) Bluetooth's stays
+        // what it drained: the air's.
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        for (kind, prior) in [("usb", 12_000_000u64), ("bt", BT_PRIOR)] {
+            let drain = Drain::new(start, Some(prior));
+            let mut drain = if probes(kind) { drain.probing(prior) } else { drain };
+            let slow = prior / 12;  // 1 MB/s on the cable
+            let mut told = Vec::new();
+            for ms in (200..=1200).step_by(200) {
+                told.extend(window(&mut drain, at(ms), (slow / 5) as usize, true, false).map(|t| (ms, t)));
+            }
+            assert_eq!(told, [(1200, slow)], "{kind}: measured");
+            told.clear();
+            for ms in (1400..=20_000).step_by(200) {
+                told.extend(window(&mut drain, at(ms), 1000, false, true).map(|t| (ms, t)));
+            }
+            if kind == "usb" {
+                // The last step, to the prior, within PUBLISH_CHANGE of the
+                // last told: not told.
+                assert_eq!(told, [(3200, 1_500_000), (5200, 2_250_000), (7200, 3_375_000), (9200, 5_062_500), (11200, 7_593_750),
+                                  (13200, 11_390_625)]);
+                assert_eq!((drain.budget, drain.measured), (Some(prior), false), "its prior again");
+            } else {
+                assert!(told.is_empty(), "{kind}: up again: {told:?}");
+                assert_eq!((drain.budget, drain.measured), (Some(slow), true));
+            }
+        }
+    }
+
+    #[test]
+    fn a_cable_lets_realtime_wait_what_it_drains() {
+        // A cable: its prior (80 Mbit/s) its budget until measured. A
+        // keyframe's burst fills its little room (the window full) though
+        // it takes 390 KB/s alone: realtime may wait REALTIME_WAIT of the
+        // budget, 1.5 MB, not of what its socket took (58 KB, under the
+        // keyframe: its tail dropped each time). Full throughout for a
+        // second at 2 MB/s (the tablet slow to read): its budget that, and
+        // realtime waits REALTIME_WAIT of it.
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut cable = Drain::new(start, prior("usb"));
+        assert_eq!((cable.budget, cable.wait_most()), (Some(USB_PRIOR), 1_500_000));
+        cable.wrote(78_000);
+        cable.after(true, false);
+        assert_eq!(cable.roll(at(200)), Some((1_500_000, None)), "a keyframe's burst");
+        cable.wrote(5_000);
+        cable.after(false, true);
+        assert_eq!(cable.roll(at(400)), Some((1_500_000, None)), "run dry");
+        assert_eq!(window(&mut cable, at(600), 400_000, true, false), None);
+        for ms in [800, 1000, 1200, 1400] {
+            assert_eq!(window(&mut cable, at(ms), 400_000, true, false), None);
+        }
+        assert_eq!(window(&mut cable, at(1600), 400_000, true, false), Some(2_000_000));
+        assert_eq!(cable.wait_most(), STREAM_BUDGET.max(300_000));
+        cable.wrote(400_000);
+        cable.after(true, false);
+        assert_eq!(cable.roll(at(1800)).map(|(wait, _)| wait), Some(300_000));
+        // Bluetooth's the same: what its socket took, its budget if more.
+        let mut bt = Drain::new(start, prior("bt"));
+        bt.wrote(10_000);
+        bt.after(true, false);
+        assert_eq!(bt.roll(at(200)).map(|(wait, _)| wait), Some((BT_PRIOR as f64 * 0.15) as usize));
     }
 }

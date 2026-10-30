@@ -14,8 +14,8 @@
 //!                                QUIC one), transport ("quic", "tcp",
 //!                                "stream": a cable's, Bluetooth's; null
 //!                                with no path), rate_kbps (its
-//!                                controller's, or what Bluetooth's stream
-//!                                drains), dropped, paths (each, the
+//!                                controller's, or what Bluetooth's or a
+//!                                cable's stream drains), dropped, paths (each, the
 //!                                one in use first: id, kind,
 //!                                transport, state "active" (in use),
 //!                                "standby" (a reserve), "suspect",
@@ -278,20 +278,7 @@ impl Daemon {
     fn watch_usb(self: &Arc<Self>) {
         let me = self.clone();
         let connect: Arc<dyn Fn(std::os::unix::net::UnixStream, &usb::Device) -> Result<String, String> + Send + Sync> =
-            Arc::new(move |stream, _device| {
-                // The session goes on over the cable (the carrier or a
-                // reserve) until its stream on it ends: usb.rs waits for
-                // that before the cable carries the next. (Given up 5 s on
-                // with the session not on the cable, a reserve that stayed
-                // one was taken for over, and the accessory it held for
-                // free.)
-                let session = me.node.connect_stream(Box::new(stream), "usb")?;
-                log!("usb: a session with {} by cable", session.name);
-                if let Some(serial) = me.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
-                    me.remember_usb(&serial);
-                }
-                Ok(session.peer.clone())
-            });
+            Arc::new(move |stream, device| me.by_cable(stream, device));
         loop {
             std::thread::sleep(usb::EVERY);
             let state = self.remembered();
@@ -301,6 +288,29 @@ impl Daemon {
                           &|device| *self.switched.lock().unwrap() = Some(device.serial.clone()),
                           connect.clone());
         }
+    }
+
+    /// A session made on the accessory's stream (or a path for the one
+    /// there is): its device id. Taken to carry what the cable's speed
+    /// says until what it drains is measured (usb::Device::prior; the
+    /// session's own prior for a cable if not known), said once. The
+    /// session goes on over the cable (the carrier or a reserve) until its
+    /// stream on it ends: usb.rs waits for that before the cable carries
+    /// the next. (Given up 5 s on with the session not on the cable, a
+    /// reserve that stayed one was taken for over, and the accessory it
+    /// held for free.)
+    fn by_cable(&self, stream: std::os::unix::net::UnixStream, device: &usb::Device) -> Result<String, String> {
+        let (stream, speed): (Box<dyn plusone_link::stream::Stream>, String) = match (device.prior(), device.speed) {
+            (Some(prior), Some(speed)) => (Box::new(plusone_link::stream::Rated::new(stream, prior)),
+                                           format!("{speed} Mbit/s, taken to carry {} until measured", prior * 8 / 1_000_000)),
+            _ => (Box::new(stream), "its speed not known".into()),
+        };
+        let session = self.node.connect_stream(stream, "usb")?;
+        log!("usb: a session with {} by cable ({speed})", session.name);
+        if let Some(serial) = self.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
+            self.remember_usb(&serial);
+        }
+        Ok(session.peer.clone())
     }
 
     fn remember_usb(&self, serial: &str) {
@@ -402,8 +412,8 @@ impl Daemon {
 
     fn event(self: &Arc<Self>, event: Event) {
         // Not on QUIC, whose controller tells it soon: the path's budget
-        // now (Bluetooth's: what its stream drains, its prior until
-        // measured), or none (TCP, a cable: the apps follow their own way).
+        // now (Bluetooth's, a cable's: what its stream drains, its prior
+        // until measured), or none (TCP: the apps follow their own way).
         let budget = |session: &plusone_link::Session| {
             (!session.by_quic()).then(|| json!({"event": "budget", "device": session.peer,
                                                "kbps": session.rate().map(|rate| rate * 8 / 1000)}))
@@ -1002,6 +1012,36 @@ mod tests {
         assert_eq!(device["rate_kbps"], 900, "{device}");
         let path = &device["paths"][0];
         assert_eq!((&path["budget_bps"], &path["budget_from"]), (&json!(900_000), &json!("prior")), "{path}");
+        daemon.node.close();
+        tablet.close();
+    }
+
+    #[test]
+    fn a_cable_path_has_a_budget() {
+        // Its prior until what its stream drains is measured, told with up
+        // as Bluetooth's: a fifth of its USB speed (96 Mbit/s at USB 2's
+        // high speed), or the session's own for a cable (80 Mbit/s) with
+        // its speed not known. The desktop follows it, at its most. (null:
+        // the desktop followed its own reports, a third off at each frame
+        // lost, 3-11 Mbit/s on a cable that carries tens of MB/s.)
+        let (daemon, tablet) = paired_daemon("cable-budget");
+        let (watching, _watched) = app(&daemon);
+        assert_eq!(ask(&watching, json!({"op": "watch"}))["ok"], true);
+        for (speed, kbps) in [(Some(480.0), 96_000), (None, 80_000)] {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let accepter = tablet.clone();
+            std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "usb").map(|_| ()));
+            let id = daemon.by_cable(ours, &usb::accessory_at(speed)).unwrap();
+            let told = events_until(&watching, &["up", "budget"]);
+            assert_eq!((&told["up"]["path"], &told["budget"]["kbps"]), (&json!("usb"), &json!(kbps)), "{speed:?}: {told:?}");
+            let (app, _served) = app(&daemon);
+            let device = &ask(&app, json!({"op": "devices"}))["devices"][0];
+            assert_eq!(device["rate_kbps"], kbps, "{speed:?}: {device}");
+            let path = &device["paths"][0];
+            assert_eq!((&path["budget_bps"], &path["budget_from"]), (&json!(kbps * 1000), &json!("prior")), "{path}");
+            assert_eq!(ask(&app, json!({"op": "close", "device": id}))["ok"], true);
+            events_until(&watching, &["gone"]);
+        }
         daemon.node.close();
         tablet.close();
     }

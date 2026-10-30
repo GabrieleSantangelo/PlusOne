@@ -22,6 +22,18 @@
   minute later, or at once if nothing else is left: a Wi-Fi coming and
   going no longer takes the desktop and the sound along with each of its
   drops.
+- **The desktop at its best by cable**: on the cable the desktop's
+  bitrate followed only the tablet's reports, a third off at each frame
+  lost, and frames were lost at each keyframe: the link took the cable
+  for as slow as what went on it, and dropped what would have waited
+  longer than that allowed. The picture ran at 3-11 Mbit/s by cable, 20
+  on Wi-Fi. The cable now has a budget like Bluetooth's, from the speed
+  of its USB link (96 Mbit/s on USB 2) until what the tablet reads is
+  measured, down while the tablet reads slowly and back up once it does
+  again; the desktop and the speakers follow it, and the link lets
+  realtime wait as long as the cable takes to carry it: a keyframe is no
+  longer cut on a cable that carries tens of MB/s. Each cable session
+  says its speed in the log.
 - **The cable carries the next session once the last one let it go**:
   plus-one-link took a session kept on the cable as a spare connection
   for over after 5 s, and tried to open the cable again every second

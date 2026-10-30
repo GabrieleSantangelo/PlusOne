@@ -860,6 +860,14 @@ fn slow_session() -> (Node, Node, Arc<plusone_link::Session>) {
 /// in pieces of about RFCOMM's frames (what goes back as fast as it
 /// comes): the session on it.
 fn bluetooth(pc: &Node, tablet: &Node, bytes: u64) -> Arc<plusone_link::Session> {
+    paced_stream(pc, tablet, "bt", bytes, 1024)
+}
+
+/// A stream path of kind from pc to tablet, bridged as a cable's or
+/// Bluetooth's is (stream::bridge: the session's end of it with little
+/// room), that takes bytes a second, chunk at a time, from the PC (what
+/// goes back as fast as it comes): the session on it.
+fn paced_stream(pc: &Node, tablet: &Node, kind: &str, bytes: u64, chunk: usize) -> Arc<plusone_link::Session> {
     let (cable, far) = std::os::unix::net::UnixStream::pair().unwrap();
     cable.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let (mut reading, mut writing) = (cable.try_clone().unwrap(), cable);
@@ -875,10 +883,10 @@ fn bluetooth(pc: &Node, tablet: &Node, bytes: u64) -> Arc<plusone_link::Session>
             std::thread::sleep(Duration::from_micros(data.len() as u64 * 1_000_000 / bytes));
             writing.write_all(data)
         },
-        1024).unwrap();
-    let accepter = tablet.clone();
-    std::thread::spawn(move || accepter.accept_stream(Box::new(far), "bt").map(|_| ()));
-    pc.connect_stream(Box::new(pcs_end), "bt").unwrap()
+        chunk).unwrap();
+    let (accepter, taken) = (tablet.clone(), kind.to_owned());
+    std::thread::spawn(move || accepter.accept_stream(Box::new(far), &taken).map(|_| ()));
+    pc.connect_stream(Box::new(pcs_end), kind).unwrap()
 }
 
 #[test]
@@ -923,6 +931,54 @@ fn a_bluetooth_paths_budget_is_what_its_stream_drains() {
         pc.close();
         tablet.close();
     }
+}
+
+#[test]
+fn a_cable_drops_no_realtime_it_drains() {
+    // A cable (20 MB/s, its bridge's room little, as usb.rs makes it) and a
+    // desktop at 3 Mbit/s whose keyframe, 78 KB, comes each 200 ms: a burst
+    // the cable drains in 4 ms. None dropped, all of it back (echoed), and
+    // the cable's budget its prior (80 Mbit/s, no feature asks more) for
+    // the apps to follow. (Its rate taken from what its socket took while
+    // the burst filled its room, 390 KB/s, a keyframe's tail waited longer
+    // than REALTIME_WAIT of it: dropped, each one, as the live cable did;
+    // and no budget, the desktop followed its own reports, a third off at
+    // each frame lost.)
+    let (pc, tablet, _address) = pair();
+    let session = paced_stream(&pc, &tablet, "usb", 20_000_000, 64 << 10);
+    assert_eq!(session.rate(), Some(80_000_000 / 8), "the cable's budget");
+    let realtime = session.open("echo", "video", Class::Realtime).unwrap();
+    const BURSTS: u32 = 15;
+    const PACKETS: u32 = 60;
+    let receiving = {
+        let realtime = realtime.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            let mut got = 0;
+            while let Ok(Some(n)) = realtime.recv(&mut buf, Some(Duration::from_millis(1500))) {
+                if n == 0 {
+                    break;
+                }
+                got += 1;
+                if got == BURSTS * PACKETS {
+                    break;
+                }
+            }
+            got
+        })
+    };
+    for burst in 0..BURSTS {
+        for packet in 0..PACKETS {
+            let mut message = vec![0u8; 1300];
+            message[..4].copy_from_slice(&(burst * PACKETS + packet).to_be_bytes());
+            realtime.send(&message).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let got = receiving.join().unwrap();
+    assert_eq!((got, session.dropped()), (BURSTS * PACKETS, 0), "back, and dropped");
+    let path = session.paths().pop().expect("no path");
+    assert_eq!((path.budget_bps, path.budget_from), (Some(80_000_000), "prior"), "{path:?}");
 }
 
 #[test]

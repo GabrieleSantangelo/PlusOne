@@ -24,6 +24,12 @@ pub trait Stream: Read + Write + AsRawFd + Send + Sync {
     fn transport(&self) -> &'static str {
         "stream"
     }
+    /// What it is taken to carry until what it drains is measured (bytes a
+    /// second), if it knows better than its kind's prior (session.rs): a
+    /// cable at the speed its USB link was made at (Rated).
+    fn prior(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl Stream for TcpStream {
@@ -69,6 +75,64 @@ impl Stream for UnixStream {
 
     fn try_clone(&self) -> io::Result<Box<dyn Stream>> {
         Ok(Box::new(UnixStream::try_clone(self)?))
+    }
+}
+
+/// A bridge's stream with what its device is taken to carry until what it
+/// drains is measured (Stream::prior): the cable at the speed its USB link
+/// was made at (plus-one-link's usb.rs).
+pub struct Rated {
+    stream: UnixStream,
+    prior: u64,
+}
+
+impl Rated {
+    pub fn new(stream: UnixStream, prior: u64) -> Rated {
+        Rated { stream, prior }
+    }
+}
+
+impl Read for Rated {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Rated {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl AsRawFd for Rated {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
+impl Stream for Rated {
+    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(on)
+    }
+
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        Stream::set_timeouts(&self.stream, timeout)
+    }
+
+    fn shutdown(&self) {
+        Stream::shutdown(&self.stream);
+    }
+
+    fn try_clone(&self) -> io::Result<Box<dyn Stream>> {
+        Ok(Box::new(Rated { stream: self.stream.try_clone()?, prior: self.prior }))
+    }
+
+    fn prior(&self) -> Option<u64> {
+        Some(self.prior)
     }
 }
 

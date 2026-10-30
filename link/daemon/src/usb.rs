@@ -38,6 +38,14 @@ const STRINGS: [&str; 6] = ["Plus One", "Plus One", "The tablet as the PC's seco
 /// quarter of the calls for the same bytes (a call costs about as much as
 /// a 16 KiB transfer).
 const CHUNK: usize = 64 << 10;
+/// Of the speed its USB link was made at (sysfs's speed), what a cable is
+/// taken to carry each way until what it drains is measured (the session's
+/// prior for it, Stream::prior): measured (2026-10-27) at USB 2.0's high
+/// speed, 480 Mbit/s, 17.5 MB/s one way and 18.7 each way at once, 0.29
+/// of it (the accessory reads 16 KiB at a time); a fifth, 12 MB/s (96
+/// Mbit/s), at high speed; at USB 3's 5 Gbit/s 125 MB/s, not measured: its
+/// drain then says (a cable has no congestion, only the tablet's reading).
+const AOA_SHARE: f64 = 0.2;
 /// The app's READY waited for with no timeout (usbfs's 0): nothing wakes
 /// meanwhile, however long no app answers; the cable pulled ends the read
 /// (usbfs kills the transfer: an error).
@@ -81,11 +89,21 @@ pub struct Device {
     pub serial: String,
     bus: u32,
     number: u32,
+    /// The speed its USB link was made at (Mbit/s: 480 at USB 2's high
+    /// speed, 5000 and more at USB 3's), if sysfs says.
+    pub speed: Option<f64>,
 }
 
 impl Device {
     fn node(&self) -> String {
         format!("/dev/bus/usb/{:03}/{:03}", self.bus, self.number)
+    }
+
+    /// What a cable at its speed is taken to carry each way until what it
+    /// drains is measured (bytes a second): AOA_SHARE of it; None if its
+    /// speed is not known (the session's own prior for a cable then).
+    pub fn prior(&self) -> Option<u64> {
+        self.speed.filter(|speed| *speed > 0.0).map(|speed| (speed * 1e6 / 8.0 * AOA_SHARE) as u64)
     }
 
     pub fn is_accessory(&self) -> bool {
@@ -142,7 +160,8 @@ pub fn devices() -> Vec<Device> {
         }
         let (Ok(bus), Ok(number)) = (read(&path.join("busnum")).parse(), read(&path.join("devnum")).parse()) else { continue };
         found.push(Device { vendor: read(&path.join("idVendor")), product: read(&path.join("idProduct")),
-                            serial: read(&path.join("serial")), bus, number, path });
+                            serial: read(&path.join("serial")), bus, number, speed: read(&path.join("speed")).parse().ok(),
+                            path });
     }
     found
 }
@@ -384,6 +403,13 @@ fn sessions_on(device: &Device, present: &dyn Fn() -> bool, open: &dyn Fn() -> i
 /// How often the bus is looked at.
 pub const EVERY: Duration = Duration::from_secs(2);
 
+/// An accessory at speed (Mbit/s), for a test of plus-one-link's.
+#[cfg(test)]
+pub fn accessory_at(speed: Option<f64>) -> Device {
+    Device { path: PathBuf::from("/nonexistent"), vendor: GOOGLE.into(), product: ACCESSORY[0].into(), serial: String::new(),
+             bus: 3, number: 28, speed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,7 +430,19 @@ mod tests {
                 fs::write(interface.join("interface"), format!("{named}\n")).unwrap();
             }
         }
-        Device { path, vendor: vendor.into(), product: "0001".into(), serial: format!("S{number}"), bus: 2, number }
+        Device { path, vendor: vendor.into(), product: "0001".into(), serial: format!("S{number}"), bus: 2, number,
+                 speed: None }
+    }
+
+    #[test]
+    fn a_cable_is_taken_to_carry_a_fifth_of_its_speed() {
+        // USB 2's high speed: 12 MB/s (96 Mbit/s; it carries 17.5 one way).
+        let mut tablet = device("2-12", GOOGLE, 12, &[]);
+        for (speed, prior) in [(Some(480.0), Some(12_000_000)), (Some(5000.0), Some(125_000_000)), (Some(12.0), Some(300_000)),
+                               (None, None), (Some(0.0), None)] {
+            tablet.speed = speed;
+            assert_eq!(tablet.prior(), prior, "{speed:?}");
+        }
     }
 
     #[test]
