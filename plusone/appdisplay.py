@@ -1429,13 +1429,19 @@ class AppStreamer:
         # With l36, the keyframe's own time is the last one's at the budget,
         # if longer (one three times the reckoning was answered every 270 ms
         # live); and one the link cut, asked for again soon after, was lost:
-        # the next smaller, alone (_lost_keyframe), not the same again.
+        # the next smaller, alone (_lost_keyframe), not the same again. That
+        # ask is weighed even within the gap, though not answered there: the
+        # app's next ask comes its own 250 ms after the one the keyframe
+        # answered, so less than 250 ms after the keyframe went once that
+        # took a frame or more, and the one after falls past _cut's window.
         if self._key_flying:
             self._asks_held += 1
             return
         now = time.monotonic()
         rtt = self.channel.rtt() if hasattr(self.channel, "rtt") else None
         if self.l36.on:
+            if self._cut(now, rtt or 0):
+                self._lost_keyframe(now)
             gap = max(MIN_KEYFRAME_GAP, 1.5 * (rtt or 0) + max(media.VBV_FRAMES / self.fps, self._key_time()))
         else:
             gap = max(MIN_KEYFRAME_GAP, 1.5 * rtt + media.VBV_FRAMES / self.fps) if rtt else MIN_KEYFRAME_GAP
@@ -1443,8 +1449,6 @@ class AppStreamer:
             return
         self._last_keyframe = now
         if self.l36.on:
-            if self._cut(now, rtt or 0):
-                self._lost_keyframe(now)
             self._key_wanted = True  # with the first frame in that it fits with
         else:
             self.keyframes.request()

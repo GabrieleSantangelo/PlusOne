@@ -1153,6 +1153,27 @@ def test_an_ask_is_a_keyframe_lost_only_soon_after_and_with_the_link_s_drops(mon
         assert streamer._key_wanted and streamer.rate.kbps == 8500 and streamer._alone_from is None
 
 
+def test_a_keyframe_the_link_cut_is_backed_off_at_an_ask_the_gap_leaves(monkeypatch):
+    # The keyframe went 30 ms after the ask it answered (a frame in, the
+    # encoder's time); the app asks again its own 250 ms after that ask: 225
+    # ms after the keyframe, within the gap. Weighed all the same; answered
+    # at the next ask, 250 ms on (by then past _cut's window), not halved twice.
+    streamer, link, clock, made, _said = keyframe_streamer(monkeypatch)
+    link.round_trip = 0.01
+    clock.now = 10.0
+    streamer.force_keyframe()
+    streamer._key_wanted = False
+    clock.now += 0.03
+    streamer._out(bytes(60000), True, 0)
+    link.drops += 20
+    clock.now = 10.255
+    streamer.force_keyframe()
+    assert not streamer._key_wanted and streamer.rate.kbps == 4250 and streamer._alone_from == clock.now
+    clock.now = 10.51
+    streamer.force_keyframe()
+    assert streamer._key_wanted and streamer.rate.kbps == 4250 and streamer._keys_lost == 1
+
+
 def test_no_keyframe_answers_faster_than_the_last_one_takes_to_go(monkeypatch):
     # No budget (TCP): its time at the bitrate. Three times the reckoning at
     # 20 Mbit/s is 0.2 s, and a round trip and a half of 100 ms.
