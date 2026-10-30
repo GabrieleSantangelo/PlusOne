@@ -46,10 +46,17 @@ connection and the rest.
 
 The session tries what it has candidates for at once, the better ones
 first by a few hundred ms (as Happy Eyeballs), uses the best that answers,
-and keeps at most one other ready (power: a Bluetooth link kept up for
-nothing costs both batteries). A better path showing up (the cable plugged
-in) takes over; the active one going (the Wi-Fi gone) hands over to the
-next. Each path's round trip is measured all along (its pings).
+and keeps the others it has ready (power: a Bluetooth link kept up for
+nothing costs both batteries). With both sides' hellos saying
+`"paths": 1`, a session keeps up to three paths, one of each kind: the
+carrier, and reserves pinged once a second, nothing else. A better path
+showing up (the cable plugged in) is a reserve first, the carrier once it
+was heard throughout 2 s, the one before a reserve (make before break);
+the carrier going (the Wi-Fi gone, or silent 1.5 s) hands over to the
+best reserve at once, no detaching; a kind that failed or went silent
+carrying does not carry again for 60 s while another is left. Each side
+picks its carrier alone and reads every path. Each path's round trip is
+measured all along (its pings).
 
 ## Discovery, with or without multicast
 
@@ -110,8 +117,10 @@ goes over the cable, Wi-Fi Direct or Bluetooth instead.
 - **The hello** says the features each side has, each with its version
   (`{"display": 2, "speakers": 1, ...}`): an older app means a feature
   missing, not "update everything".
-- **Liveness in one place**: a ping each second on the active path; three
-  missed and the path is gone; no path left and the device is gone, for
+- **Liveness in one place**: a ping each second on each path; 1.5 s with
+  nothing heard and the path is suspect (the carrier's place goes to a
+  reserve heard lately), 5 s and it is lost; no path left and the session
+  waits 15 s for another (60 s with a channel open), then is over, for
   every channel at once.
 
 ## Channels
@@ -419,6 +428,7 @@ came 1-1.8 s late, handed on after newer input that came by UDP (286
 messages older than one before them). How the bench is made:
 `tools/switchbench.sh`'s head; each cycle's numbers: `cycles.jsonl` among
 its logs (`SWITCHBENCH_OUT`).
+
 
 ## Phases
 

@@ -39,14 +39,15 @@ Device machine with candidates.
 |---|---|---|
 | `HANDSHAKE` | 5 s a read, 8 s whole | TLS and hellos on a new connection |
 | `PATH_SILENCE` | 5 s | nothing heard on a path (stream frames and datagrams alike): the path is lost **[built]** |
-| `PATH_SUSPECT` | 1.5 s | nothing heard: look for a better/other path already, keep this one (told and logged **[built]**; nothing looked for yet) |
+| `PATH_SUSPECT` | 1.5 s | nothing heard: look for a better/other path already, keep this one (told and logged **[built]**; the carrier suspect, a reserve heard lately carries at once **[built]**; nothing looked for yet) |
+| `HYSTERESIS` | 2 s | a reserve better than the carrier carries once heard throughout this long **[built]** |
 | `UDP_PROOF` | 3 s | a pong this recent: datagrams go both ways **[built]** |
 | `RESUME_WAIT` | 15 s; 60 s with a channel open | a session with no path this long is over (60 s: time to move both devices to another network by hand) **[built]** |
 | `IDLE` | 60 s | a session with no channel, not wanted, not by cable: closed **[built]** |
 | `DISCOVERY_ROUND` | 3 s | one round of the cascade |
 | `BACKOFF` | 1, 2, 4, … 30 s | between failed rounds while wanted |
 | `UPGRADE_LOOK` | 30 s | while on a path below the best rank seen, look again for better |
-| `FLAP_HOLD` | 60 s | a path lost twice in this long is not taken again before it (unless it is the only one) |
+| `FLAP_HOLD` | 60 s | a kind whose path failed, or went suspect while it carried, does not carry again before it, while another is left **[built]** |
 
 ## 1. Discovery (per device, while wanted)
 
@@ -127,13 +128,14 @@ over the old `update` request).
 | State | Does | Leaves on → to |
 |---|---|---|
 | **New** | TLS 1.3, both certificates pinned; hellos: names, features, UDP port, the session id we have with this device (`resume`) | both hellos name the same id → that session's **Moving**/**Active** (a path for it); else a new session → **Active**, and the one before (if any) **Over** **[built]** |
-| **Active(p)** | channels flow; reliable frames numbered, kept until acknowledged (pings carry the ack) **[built]**; pings each second, on the stream and on UDP **[built]** | `PATH_SILENCE` or the stream's end → **Detached** **[built]**; a better path adopted → **Moving** **[built]**; `bye` sent or heard → **Over** **[built]** |
-| **Moving(p→q)** | q prepared; what p had not delivered sent again on q first, duplicates dropped by number **[built]**; stale datagrams dropped; the features told `moved`, with q's `path` and `transport` (TCP to QUIC at the same kind is a move too: the tablet's label says it) (the desktop's decoder asks a keyframe by itself) | → **Active(q)**; p closed once the other side is heard on q (it took q too), or `HANDOVER_CAP` (3 s) after at the latest, not at once: the other side takes q a moment after us, and would take p's end for a path lost (**Detached**, "Reconnecting…"); p's datagrams still read until then **[built]** |
+| **Active(p)** | channels flow; reliable frames numbered, kept until acknowledged (pings carry the ack) **[built]**; pings each second, on the stream and on UDP **[built]**; with a peer whose hello says `"paths": 1`, up to 3 paths, one of each kind: p carries, the others are reserves (pinged each second, nothing else), every path read **[built]** | p lost (`PATH_SILENCE`, the stream's end) or suspect, a reserve there → **Moving** to the best at once (one `FLAP_HOLD` held only if no other) **[built]**; none → **Detached** **[built]**; a better path adopted (a reserve heard throughout `HYSTERESIS`, not held; with a peer from before, at once) → **Moving** **[built]**; `bye` sent or heard → **Over** **[built]** |
+| **Moving(p→q)** | q prepared; what p had not delivered sent again on q first, duplicates dropped by number **[built]**; stale datagrams dropped; the features told `moved`, with q's `path` and `transport` (TCP to QUIC at the same kind is a move too: the tablet's label says it) (the desktop's decoder asks a keyframe by itself) | → **Active(q)**; p, if still there, a reserve (with a peer that keeps several: make before break) **[built]**; else, and for one of q's kind, p closed once the other side is heard on q (it took q too), or `HANDOVER_CAP` (3 s) after at the latest, not at once: the other side takes q a moment after us, and would take p's end for a path lost (**Detached**, "Reconnecting…"); p's datagrams still read until then **[built]** |
 | **Detached** | no path; reliable frames queue; realtime and input are dropped (counted) **[built]**; the dialer reconnects (Device: Reconnecting) **[built]** | a path → **Active**; `RESUME_WAIT` → **Over** **[built]** |
 | **Over** | every channel ends (its feature reads 0), the other side told if it can be (`bye`) **[built]** | — |
 
 Invariants:
-- One session per device, one active path per session.
+- One session per device, one path carrying (with a peer from before, one
+  path at all); each side picks its own carrier and reads every path.
 - Reliable frames reach the feature once each, in order, across any
   number of path changes.
 - A path is ranked when adopted; a worse path never replaces a working
@@ -156,7 +158,7 @@ Invariants:
 | **Dialing** | TCP connect / AOA switch and READY/GO **[built]** / L2CAP connect / Wi-Fi Direct group | connected → Handshaking; failed or timeout → (Device decides: next candidate) |
 | **Handshaking** | TLS and hellos (`HANDSHAKE`) | done → Probing |
 | **Probing** | UDP pings every 200 ms while not proven **[built]**; datagrams go on the stream meanwhile **[built]** | a pong → Up (datagrams on UDP); `UDP_PROOF` without → Up(stream-only) (a network dropping UDP still works) **[built]** |
-| **Up** | pings each second **[built]** | nothing heard `PATH_SUSPECT` → Suspect **[built]**; UDP pongs stop `UDP_PROOF` → Up(stream-only) **[built]** |
+| **Up** | pings each second **[built]**; carrying, or a reserve (`standby`): its pings alone, the stream's and a datagram together **[built]** | nothing heard `PATH_SUSPECT` → Suspect **[built]**; UDP pongs stop `UDP_PROOF` → Up(stream-only) **[built]**; one better of its kind adopted, or one path too many → closed (TLS's close_notify: `closed`, not lost) **[built]** |
 | **Suspect** | still used **[built]**; the Device looks for another path at once (cable, last address on another network, mDNS) | heard again → Up **[built]**; `PATH_SILENCE` → Lost **[built]**; a better/working path adopted → (the session moves) |
 | **Lost** | closed; the transport's resources freed (the USB interface released, the group removed) **[built for usb]** | — |
 
