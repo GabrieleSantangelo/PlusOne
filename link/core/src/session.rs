@@ -139,6 +139,15 @@ const USB_PRIOR: u64 = 80_000_000 / 8;
 /// which the apps under the budget never fill again).
 const PROBE_AFTER: Duration = Duration::from_secs(2);
 const PROBE_UP: f64 = 1.5;
+/// A cable's budget gone up (PROBE_UP) and measured back down (the other
+/// side reads no faster): up again twice as long after, and so on up to
+/// this; each PROBE_AFTER again once a time up holds (not measured back
+/// down PROBE_AFTER on). (A tablet reading slower than the desktop asked
+/// had its budget 1.5 times over every 4.4 s, realtime dropped for 0.8 s
+/// each time, for as long as it lasted.)
+const PROBE_MOST: Duration = Duration::from_secs(32);
+/// That interval said in the log as it changes, this often at most.
+const PROBE_SAID: Duration = Duration::from_secs(10);
 /// What a stream drains is measured over the last this long it was full
 /// throughout: its socket's room, either way, is then a few percent of it
 /// (of a window's alone, as much as half).
@@ -693,23 +702,40 @@ struct Drain {
     told: u64,
     told_at: Instant,
     /// A kind that probes (probes()): its prior, the budget goes back up to
-    /// it; and when it next does, measured under it.
+    /// it; when it next does, measured under it; how long after each time
+    /// (PROBE_AFTER to PROBE_MOST); what the last time took it up to, until
+    /// it held or was measured back down; that interval last said, and when.
     ceiling: Option<u64>,
     probe_at: Instant,
+    probe_every: Duration,
+    probed: Option<u64>,
+    said_every: Duration,
+    said_at: Option<Instant>,
 }
 
 impl Drain {
     fn new(now: Instant, prior: Option<u64>) -> Drain {
         Drain { start: now, bytes: 0, full: false, full_at_start: false, full_now: false, dry: false, settled: false,
                 run: VecDeque::new(), budget: prior, measured: false, told: prior.unwrap_or(0), told_at: now,
-                ceiling: None, probe_at: now }
+                ceiling: None, probe_at: now, probe_every: PROBE_AFTER, probed: None, said_every: PROBE_AFTER, said_at: None }
     }
 
     /// As one of a kind that probes: back up to ceiling (its prior) once
-    /// measured under it and not measured again for PROBE_AFTER.
+    /// measured under it and not measured again for PROBE_AFTER (or longer:
+    /// PROBE_MOST).
     fn probing(mut self, ceiling: u64) -> Drain {
         self.ceiling = Some(ceiling).filter(|ceiling| *ceiling != 0);
         self
+    }
+
+    /// How long its budget waits between times up, when it changed since
+    /// last said and PROBE_SAID after that at the earliest (for the log).
+    fn probe_note(&mut self, now: Instant) -> Option<Duration> {
+        if self.probe_every == self.said_every || self.said_at.is_some_and(|at| now.duration_since(at) < PROBE_SAID) {
+            return None;
+        }
+        (self.said_every, self.said_at) = (self.probe_every, Some(now));
+        Some(self.probe_every)
     }
 
     fn wrote(&mut self, bytes: usize) {
@@ -777,18 +803,33 @@ impl Drain {
             let mut budget = None;
             if span >= DRAIN_SPAN {
                 let bytes: usize = self.run.iter().map(|(bytes, _)| *bytes).sum();
-                budget = Some((bytes as f64 / span.as_secs_f64()).max(DRAIN_LEAST) as u64);
+                let measured = (bytes as f64 / span.as_secs_f64()).max(DRAIN_LEAST) as u64;
+                budget = Some(measured);
                 self.measured = true;
-                self.probe_at = now + PROBE_AFTER;
+                // Gone up and measured back down: the next time up twice as
+                // long after; measured as high as it went: it held.
+                if let Some(went) = self.probed.take() {
+                    self.probe_every = if measured < went { (self.probe_every * 2).min(PROBE_MOST) } else { PROBE_AFTER };
+                }
+                self.probe_at = now + self.probe_every;
             } else if let (Some(ceiling), Some(was)) = (self.ceiling, self.budget) {
-                // Not measured again for PROBE_AFTER: up toward the prior.
-                // Not while it is full throughout (a measure under way: up
-                // then, the apps would only fill it more).
-                if was < ceiling && now >= self.probe_at && self.run.is_empty() {
-                    let up = ((was as f64 * PROBE_UP) as u64).min(ceiling);
-                    budget = Some(up);
-                    self.measured = up < ceiling;
-                    self.probe_at = now + PROBE_AFTER;
+                // Not measured again for its interval: the last time up held,
+                // and up again toward the prior. Not while it is full
+                // throughout (a measure under way: up then, the apps would
+                // only fill it more).
+                if now >= self.probe_at && self.run.is_empty() {
+                    if self.probed.take().is_some() {
+                        self.probe_every = PROBE_AFTER;
+                    }
+                    if was < ceiling {
+                        let up = ((was as f64 * PROBE_UP) as u64).min(ceiling);
+                        budget = Some(up);
+                        self.measured = up < ceiling;
+                        // Held if not measured back down by PROBE_AFTER (a
+                        // measure takes DRAIN_SPAN): then up again at once.
+                        self.probed = Some(up);
+                        self.probe_at = now + PROBE_AFTER;
+                    }
                 }
             }
             if let Some(budget) = budget {
@@ -2335,6 +2376,11 @@ impl Session {
             if let (Some(rate), Some(node)) = (told, self.node.upgrade()) {
                 node.budget(self, rate);
             }
+            if let Some(every) = carrier.drain.probe_note(Instant::now()) {
+                let why = if every > PROBE_AFTER { "measured back down each time" } else { "the last time held" };
+                log!("{}: the {} path's budget goes up each {} s at most ({why})", self.label(), carrier.path.kind,
+                     every.as_secs());
+            }
         }
         let now = Instant::now();
         for (index, live) in lives.iter_mut().enumerate() {
@@ -3586,5 +3632,74 @@ mod tests {
         }
         assert!(told.is_empty(), "up while full: {told:?}");
         assert_eq!((cable.budget, cable.measured), (Some(slow), true));
+    }
+
+    /// A cable the other side reads drains(t) bytes a second of (t: since
+    /// start), for until, in steps of 10 ms: the apps sending 0.9 of its
+    /// budget as it goes, realtime dropped past what may wait (as queue()
+    /// drops it). The runs of drops (from, to), the probe's intervals said
+    /// (when, which), and the budget at each window's end.
+    #[allow(clippy::type_complexity)]
+    fn slow_cable(drain: &mut Drain, start: Instant, until: Duration, drains: impl Fn(Duration) -> f64)
+                  -> (Vec<(Duration, Duration)>, Vec<(Duration, Duration)>, Vec<(Duration, u64)>) {
+        let step = Duration::from_millis(10);
+        let (mut queued, mut wait) = (0f64, drain.wait_most() as f64);
+        let (mut drops, mut said, mut budgets) = (Vec::<(Duration, Duration)>::new(), Vec::new(), Vec::new());
+        let mut t = Duration::ZERO;
+        while t < until {
+            t += step;
+            let sent = drain.budget.unwrap_or(0) as f64 * 0.9 * step.as_secs_f64();
+            let taken = sent.min((wait - queued).max(0.0));
+            if taken < sent - 1e-6 {
+                if drops.last().is_some_and(|(_, to)| t - *to <= step) {
+                    drops.last_mut().unwrap().1 = t;
+                } else {
+                    drops.push((t, t));
+                }
+            }
+            queued += taken;
+            let took = queued.min(drains(t) * step.as_secs_f64());
+            queued -= took;
+            drain.wrote(took as usize);
+            drain.after(queued > 1e-6, queued <= 1e-6);
+            if t.as_millis() % RATE_WINDOW.as_millis() == 0 {
+                if let Some((new, _)) = drain.roll(start + t) {
+                    wait = new as f64;
+                }
+                said.extend(drain.probe_note(start + t).map(|every| (t, every)));
+                budgets.push((t, drain.budget.unwrap_or(0)));
+            }
+        }
+        (drops, said, budgets)
+    }
+
+    #[test]
+    fn a_cable_read_slowly_goes_up_less_and_less_often() {
+        // The tablet reads 1 MB/s of a cable taken for 12 MB/s for 2
+        // minutes, then 20 MB/s. Measured down to 1 MB/s, its budget went
+        // up 1.5 times 2 s after each measure, was measured back down,
+        // realtime dropped for 0.8 s every 4.4 s meanwhile (27 times in the
+        // 2 minutes). Now up again 4 s after, then 8, 16, 32, 32 (7 times),
+        // said as that changes (10 s apart at least); the tablet fast
+        // again, up the next time, held, then each 2 s to the prior, and
+        // nothing dropped.
+        let start = Instant::now();
+        let prior = 12_000_000u64;
+        let mut cable = Drain::new(start, Some(prior)).probing(prior);
+        let slow = Duration::from_secs(120);
+        let (drops, said, budgets) =
+            slow_cable(&mut cable, start, Duration::from_secs(180), |t| if t <= slow { 1e6 } else { 20e6 });
+        let starts: Vec<f64> = drops.iter().filter(|(from, _)| *from < slow).map(|(from, _)| from.as_secs_f64()).collect();
+        let gaps: Vec<f64> = starts.windows(2).map(|two| two[1] - two[0]).collect();
+        assert!(starts.len() <= 8, "dropped {} times in 2 minutes: {starts:?}", starts.len());
+        assert!(gaps.windows(2).all(|two| two[1] + 0.3 >= two[0]) && gaps.last().is_some_and(|gap| *gap >= 32.0),
+                "the drops not ever rarer: {gaps:?}");
+        assert!(drops.iter().all(|(from, to)| *to - *from < Duration::from_millis(2500)), "{drops:?}");
+        let intervals: Vec<u64> = said.iter().map(|(_, every)| every.as_secs()).collect();
+        assert_eq!(intervals, [4, 8, 16, 32, 2], "said: {said:?}");
+        assert!(said.windows(2).all(|two| two[1].0 - two[0].0 >= PROBE_SAID), "said: {said:?}");
+        assert!(drops.iter().all(|(from, _)| *from < slow + Duration::from_secs(1)), "dropped with the tablet fast: {drops:?}");
+        let again = budgets.iter().find(|(t, budget)| *t > slow && *budget == prior).map(|(t, _)| *t);
+        assert!(again.is_some_and(|t| t < slow + PROBE_MOST + Duration::from_secs(12)), "the prior again at {again:?}");
     }
 }
