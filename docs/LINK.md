@@ -462,6 +462,18 @@ back to lan, about 10 ms of the pen's input still on bt's stream (3
 messages) is handed on after newer input that came over lan's UDP: input
 on a stream has no counter (P5's sealed frames on streams).
 
+The cable (`tools/switchbench.sh cable`, 10 cycles, 2026-10-30): a usb
+stream path (400 Mbit/s, the session's end of it with a bridge's little
+room) pulled (its streams ended at both ends at once) and plugged back
+4 s later, lan up, reserves kept. Each time the session is on the cable
+again 2.47 s after it is back (2.49 at worst: HYSTERESIS and its next
+ping; with `FLAP_HOLD` on the cable it stayed a reserve 60 s after each
+pull, as live); pulled, on lan 9 ms after, the video's gap 38 ms (55 at
+worst), half a frame lost (the one on its way), the sound's 7.5 ms. On
+the cable once back: no frame lost, broken or late, no sound missing;
+the pen's input both ways (2 messages lost at the pull, those on the
+killed stream; one handed on after newer each time, as from bt).
+
 ## Phases
 
 1. The core (`link/`): session, channels, keys, liveness over TCP and UDP;

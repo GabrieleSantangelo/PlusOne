@@ -5,7 +5,9 @@
 # 4 ms, 60 ms of queue: a home Wi-Fi), p2p (100 Mbit/s, 1 ms, 30 ms: Wi-Fi
 # Direct) and bt (1 Mbit/s, 15 ms, 50 ms), the last carried by socat
 # between a UNIX socket on each side: a stream path with no IP at its ends,
-# as an RFCOMM socket handed over is. link/core's examples/switchbench on
+# as an RFCOMM socket handed over is; and a fourth, usb (400 Mbit/s, no
+# delay, 5 ms), carried the same way: the cable's stream, as usb.rs
+# bridges the accessory to a socket with little room. link/core's examples/switchbench on
 # each side: the PC's sends a desktop's video (8 Mbit/s, or what the path's
 # budget allows), its sound and control messages, and makes the paths as
 # plus-one-link does; the tablet's sends the pen's input, and each records
@@ -24,7 +26,12 @@
 #   bt    lan taken down, only the Bluetooth-like stream to fall back on; from
 #         bt, lan tried each 2 s, the session back on it before each cycle;
 #   flap  lan down 2 s and up 2 s, ten times in a row, then ten again; p2p up
-#         (SWITCHBENCH_FLAP=p2p: p2p flapping, lan up).
+#         (SWITCHBENCH_FLAP=p2p: p2p flapping, lan up);
+#   cable the cable pulled (its streams ended at both ends at once, as
+#         SWITCHBENCH_HOW=kill) and plugged back 4 s later (made again by
+#         the PC as a reserve, each second it has none: reserves always),
+#         lan up: each time, the session on the cable again ("Back on the
+#         path"), the video and the pen's input both ways on it.
 # SWITCHBENCH_HOW: drop (every packet lost both ways: a network out of
 # reach, silence; the default), link (the PC's interface down: what a
 # Wi-Fi lost tells the system), kill (dropped, and each side's TCP
@@ -55,7 +62,8 @@ case $scenario in
     wifi) paths="lan p2p" upgrade="" hold=${SWITCHBENCH_HOLD:-10} ;;
     bt) paths="lan bt" upgrade="--upgrade-from bt" hold=${SWITCHBENCH_HOLD:-10} ;;
     flap) paths="lan p2p" upgrade="" hold=${SWITCHBENCH_HOLD:-2} ;;
-    *) echo "a scenario: wifi, bt or flap" >&2; exit 2 ;;
+    cable) paths="lan usb" upgrade="" hold=${SWITCHBENCH_HOLD:-4} how=kill ;;
+    *) echo "a scenario: wifi, bt, flap or cable" >&2; exit 2 ;;
 esac
 case $how in
     drop|link|kill) ;;
@@ -65,7 +73,7 @@ esac
 quic=""
 [ "${SWITCHBENCH_QUIC:-}" != 1 ] || quic=--quic
 reserve=""
-[ "${SWITCHBENCH_RESERVE:-}" != 1 ] || reserve=--reserve
+[ "${SWITCHBENCH_RESERVE:-}" != 1 ] && [ "$scenario" != cable ] || reserve=--reserve
 flapped=${SWITCHBENCH_FLAP:-lan}
 case $flapped in
     lan|p2p) ;;
@@ -78,7 +86,7 @@ mkdir -p "$out/pc" "$out/tablet" "$work/w"
 out=$(cd "$out" && pwd)
 cleanup() {
     docker rm -f "$name-pc" "$name-tablet" > /dev/null 2>&1 || true
-    for network in lan p2p bt; do
+    for network in lan p2p bt usb; do
         docker network rm "$name-$network" > /dev/null 2>&1 || true
     done
     rm -rf "$work"
@@ -111,16 +119,17 @@ END
 chmod -R a+rX "$work/w"
 # A network's /24, and how it is shaped each way: delay, rate, queue, burst.
 prefix() {
-    case $1 in lan) echo "${net}1" ;; p2p) echo "${net}2" ;; bt) echo "${net}3" ;; esac
+    case $1 in lan) echo "${net}1" ;; p2p) echo "${net}2" ;; bt) echo "${net}3" ;; usb) echo "${net}4" ;; esac
 }
 shape() {
     case $1 in
         lan) echo "$(prefix lan) 4 40mbit 60 64kb" ;;
         p2p) echo "$(prefix p2p) 1 100mbit 30 64kb" ;;
         bt) echo "$(prefix bt) 15 1mbit 50 4kb" ;;
+        usb) echo "$(prefix usb) 0 400mbit 5 256kb" ;;
     esac
 }
-for network in lan p2p bt; do
+for network in lan p2p bt usb; do
     docker network create --internal --subnet "$(prefix $network).0/24" "$name-$network" > /dev/null
 done
 for side in pc tablet; do
@@ -128,10 +137,10 @@ for side in pc tablet; do
     [ "$side" = pc ] || host=20
     docker run -d --init --name "$name-$side" --network "$name-lan" --ip "$(prefix lan).$host" --cap-add NET_ADMIN \
         -v "$bin:/b:ro" -v "$work/w:/w:ro" -v "$out/$side:/out" plus-one-switchbench sleep infinity > /dev/null
-    for network in p2p bt; do
+    for network in p2p bt usb; do
         docker network connect --ip "$(prefix $network).$host" "$name-$network" "$name-$side"
     done
-    for network in lan p2p bt; do
+    for network in lan p2p bt usb; do
         docker exec "$name-$side" sh /w/net.sh shape $(shape $network)
     done
     docker exec "$name-$side" sh -c 'mkdir -p /run/sb && chmod 777 /run/sb'
@@ -144,10 +153,16 @@ docker exec -d "$name-tablet" socat -b 4096 \
     "TCP-LISTEN:4710,bind=$tablet_bt,reuseaddr,fork,nodelay,sndbuf=8192" UNIX-CONNECT:/run/sb/bt.sock
 docker exec -d "$name-pc" socat -b 4096 \
     UNIX-LISTEN:/run/sb/bt.sock,fork,mode=777,unlink-early "TCP:$tablet_bt:4710,nodelay,sndbuf=8192"
+# The cable's, the same on the usb network, in transfers of 64 KiB (usb.rs's).
+tablet_usb=$(prefix usb).20
+docker exec -d "$name-tablet" socat -b 65536 \
+    "TCP-LISTEN:4711,bind=$tablet_usb,reuseaddr,fork,nodelay" UNIX-CONNECT:/run/sb/usb.sock
+docker exec -d "$name-pc" socat -b 65536 \
+    UNIX-LISTEN:/run/sb/usb.sock,fork,mode=777,unlink-early "TCP:$tablet_usb:4711,nodelay"
 user="$(id -u):$(id -g)"
 docker exec -d -u "$user" "$name-tablet" sh -c "exec /b/switchbench tablet --cert /w/tablet/cert.pem \
     --key /w/tablet/key.pem --trust $(cat "$work/w/pc/fp") --out /out --listen 0.0.0.0:47101 \
-    --bt /run/sb/bt.sock > /out/stdout.txt 2> /out/link.log"
+    --bt /run/sb/bt.sock --usb /run/sb/usb.sock > /out/stdout.txt 2> /out/link.log"
 waited=0
 until grep -q listening "$out/tablet/stdout.txt" 2> /dev/null; do
     sleep 0.2
@@ -157,7 +172,7 @@ done
 targets=""
 for path in $paths; do
     case $path in
-        bt) targets="$targets --path bt=unix:/run/sb/bt.sock" ;;
+        bt|usb) targets="$targets --path $path=unix:/run/sb/$path.sock" ;;
         *) targets="$targets --path $path=$(prefix "$path").20:47101" ;;
     esac
 done
@@ -220,6 +235,7 @@ for cycle in $(seq "$cycles"); do
         wifi) settle "lan p2p"; path=$(current) ;;
         bt) settle lan; path=lan ;;
         flap) [ $((cycle % 10)) != 1 ] || { settle "lan p2p"; sleep 3; }; path=$flapped ;;
+        cable) settle usb; path=usb ;;
     esac
     echo "$cycle down $path $how $(act down "$path")" >> "$out/actions.txt"
     sleep "$hold"

@@ -20,9 +20,11 @@
 //! (got-*.csv) in DIR, with CLOCK_MONOTONIC's ns, the same in each
 //! container of a host: tools/switchbench-summary.py sums them up cycle by
 //! cycle. A "bt" path is a stream (a UNIX socket, as an
-//! RFCOMM socket handed over), its socket's room as small as RFCOMM's.
+//! RFCOMM socket handed over), its socket's room as small as RFCOMM's; a
+//! "usb" one too, the session's end of it with a bridge's little room (as
+//! usb.rs bridges the accessory, and the app its own end).
 //!   switchbench tablet --cert PEM --key PEM --trust FINGERPRINT --out DIR
-//!                      [--listen ADDRESS] [--bt SOCKET]
+//!                      [--listen ADDRESS] [--bt SOCKET] [--usb SOCKET]
 //!   switchbench pc --cert PEM --key PEM --trust FINGERPRINT --out DIR
 //!                  --path KIND=ADDRESS|KIND=unix:SOCKET [--path ...]
 //!                  [--quic] [--video KBPS] [--upgrade-from KIND[,KIND]]
@@ -103,7 +105,14 @@ impl Lines {
     }
 }
 
-fn stream_room(stream: &UnixStream) {
+/// A stream path's socket, as its kind's is: a cable's, the session's end
+/// of a bridge (little room its way out, stream::little_room); else as
+/// small as RFCOMM's.
+fn stream_room(stream: &UnixStream, kind: &str) {
+    if kind == "usb" {
+        plusone_link::stream::little_room(stream);
+        return;
+    }
     for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
         let size = STREAM_ROOM;
         unsafe {
@@ -238,7 +247,8 @@ fn tablet(value: &dyn Fn(&str) -> Option<String>, node: Node, peer: String, out:
     let listen = value("--listen").unwrap_or_else(|| "0.0.0.0:47101".into()).parse().expect("an address");
     let bound = node.listen(listen).unwrap();
     node.listen_quic(bound).unwrap();
-    if let Some(socket) = value("--bt") {
+    for kind in ["bt", "usb"] {
+        let Some(socket) = value(&format!("--{kind}")) else { continue };
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let node = node.clone();
@@ -246,9 +256,9 @@ fn tablet(value: &dyn Fn(&str) -> Option<String>, node: Node, peer: String, out:
             for stream in listener.incoming().flatten() {
                 let node = node.clone();
                 std::thread::spawn(move || {
-                    stream_room(&stream);
-                    if let Err(e) = node.accept_stream(Box::new(stream), "bt") {
-                        eprintln!("a bt stream: no session ({e})");
+                    stream_room(&stream, kind);
+                    if let Err(e) = node.accept_stream(Box::new(stream), kind) {
+                        eprintln!("a {kind} stream: no session ({e})");
                     }
                 });
             }
@@ -281,7 +291,7 @@ fn dial(node: &Node, candidate: &Candidate, events: &Lines) -> bool {
     let made = match &candidate.target {
         Target::Tcp(address) => node.connect_as(*address, DIAL_WAIT, &candidate.kind).map(|_| ()),
         Target::Unix(socket) => UnixStream::connect(socket).map_err(|e| e.to_string()).and_then(|stream| {
-            stream_room(&stream);
+            stream_room(&stream, &candidate.kind);
             node.connect_stream(Box::new(stream), &candidate.kind).map(|_| ())
         }),
     };
