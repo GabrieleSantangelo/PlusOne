@@ -2,6 +2,20 @@
 
 ## Unreleased (1.0)
 
+- **A connection lost, the session goes on over another at once**: the
+  PC and the tablet kept one connection at a time. Plugging the cable in
+  closed the Wi-Fi's; pulling it, or the Wi-Fi going, left the session
+  with none until plus-one-link reached the tablet again: the tablet said
+  "Reconnecting…", the desktop and the sound stopped for 1-2 s when the
+  cable or Bluetooth was pulled, 5 s or more when the network went
+  silent. Now they keep up to three at once, one of each kind (the cable,
+  Wi-Fi Direct, the network, Bluetooth): the one in use, and the others
+  ready, each checked once a second and nothing more. The one in use lost
+  (or silent for 1.5 s), the session goes on over the best of the others
+  at once, with no "Reconnecting…", and nothing said meanwhile lost. A
+  better one coming (the cable) is used once it has worked for 2 s, the
+  one before kept ready. With an app or a plus-one-link from before, one
+  connection at a time, as before.
 - **A session ended over there ends here at once**: when one side
   ended the session (closed by hand, idle, plus-one-link stopping) and
   its connection closed in the same moment, its goodbye could go unread:

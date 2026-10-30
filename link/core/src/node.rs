@@ -25,18 +25,20 @@ const QUIC_TRY: Duration = Duration::from_secs(3);
 pub enum Event {
     /// A session with a paired device, up.
     Up(Arc<Session>),
-    /// Its path lost: it waits session::RESUME_WAIT for another (the
-    /// dialer's to make).
+    /// Its path lost, and no other left to take its place: it waits
+    /// session::RESUME_WAIT for another (the dialer's to make).
     Detached(Arc<Session>),
-    /// On another path now (session.path()).
+    /// On another path now (session.path(): the carrier, with a peer that
+    /// keeps several).
     Moved(Arc<Session>),
     /// Its path's budget moved (architecture §3.11; bytes a second): what
     /// realtime and bulk may use now, as a QUIC path's controller allows,
     /// or a Bluetooth path's stream drains (told as it begins too).
     Budget(Arc<Session>, u64),
     /// One of its paths changed state (session::PathState): taken (active,
-    /// with Up or Moved), suspect, active again, failed (before Detached,
-    /// unless another takes over).
+    /// with Up or Moved; standby, a reserve), suspect, active or standby
+    /// again, failed (before Detached, unless another takes over), closed
+    /// (let go of on purpose).
     Path(Arc<Session>, PathInfo),
     /// A device's session over: (its fingerprint, why).
     Gone(String, String),
@@ -76,8 +78,10 @@ impl NodeInner {
 
     fn hello(&self) -> Value {
         // flow: control channels flow-controlled (session.rs, WINDOW);
+        // paths: several paths kept at once, the carrier and its reserves
+        // (session.rs, MAX_PATHS; with both hellos saying it);
         // quic: the UDP port we take QUIC on, if we do (quic.rs).
-        let mut hello = json!({"t": "hello", "name": self.name, "features": self.features(), "flow": 1});
+        let mut hello = json!({"t": "hello", "name": self.name, "features": self.features(), "flow": 1, "paths": 1});
         let port = self.quic_port.load(Ordering::SeqCst);
         if port != 0 {
             hello["quic"] = json!(port);

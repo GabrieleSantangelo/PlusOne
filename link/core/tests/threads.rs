@@ -261,3 +261,87 @@ fn a_channel_waiting_for_room_while_away_sleeps_until_a_path_comes() {
     pc.close();
     tablet.close();
 }
+
+#[test]
+fn paths_lost_and_made_again_leave_nothing_behind() {
+    // A session on two paths at once, lan (TCP through a proxy, with its
+    // UDP) and a cable (a socket pair). Twenty times the path it is on is
+    // cut on both sides: the other takes its place at once, never
+    // detached; a path of the kind cut is made again. With both up again,
+    // the link's threads and the descriptors are where they were.
+    let _one = one_at_a_time();
+    let (pc, tablet, address) = pair();
+    let detached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for node in [&pc, &tablet] {
+        let detached = detached.clone();
+        node.on_event(move |event| {
+            if let plusone_link::Event::Detached(_) = event {
+                detached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+    // Each path made, and what cuts it; lan's dialed no more than once a
+    // second (the tablet's gate lets one address start one handshake a
+    // second, after a few).
+    let dialed = std::cell::Cell::new(Instant::now() - Duration::from_secs(2));
+    let lan = || {
+        std::thread::sleep(Duration::from_millis(1100).saturating_sub(dialed.get().elapsed()));
+        dialed.set(Instant::now());
+        let (via, cut) = proxy(address);
+        let session = pc.connect(via, Duration::from_secs(2)).unwrap();
+        (session, Box::new(cut) as Box<dyn FnOnce()>)
+    };
+    let usb = || {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let end = ours.try_clone().unwrap();
+        let accepter = tablet.clone();
+        std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "usb").map(|_| ()));
+        let session = pc.connect_stream(Box::new(ours), "usb").unwrap();
+        (session, Box::new(move || drop(end.shutdown(std::net::Shutdown::Both))) as Box<dyn FnOnce()>)
+    };
+    let (session, cut_lan) = lan();
+    // The tablet's session kept before another path goes on with it.
+    let started = Instant::now();
+    while tablet.sessions().first().is_none_or(|theirs| theirs.id != session.id) {
+        assert!(started.elapsed() < Duration::from_secs(5), "no session on the tablet");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (_, cut_usb) = usb();
+    let mut cuts: std::collections::HashMap<&str, Box<dyn FnOnce()>> = [("lan", cut_lan), ("usb", cut_usb)].into();
+    let both = || {
+        let up = |s: &plusone_link::Session| s.paths().len() == 2;
+        up(&session) && tablet.sessions().first().is_some_and(|s| up(s))
+    };
+    let started = Instant::now();
+    while !both() || session.paths().iter().any(|p| p.state.name() == "suspect") {
+        assert!(started.elapsed() < Duration::from_secs(5), "two paths never up: {:?}", session.paths());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));  // every thread named, UDP proven
+    let before = (threads("link-").len(), descriptors());
+    for cycle in 0..20 {
+        let carrier = session.path().expect("no path");
+        let kind: &str = if carrier == "lan" { "lan" } else { "usb" };
+        (cuts.remove(kind).expect("a path cut twice"))();
+        let started = Instant::now();
+        while session.path().as_deref() == Some(kind) || session.paths().len() != 1 {
+            assert!(started.elapsed() < Duration::from_secs(2), "cycle {cycle}: still on {kind}: {:?}", session.paths());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (again, cut) = if kind == "lan" { lan() } else { usb() };
+        assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
+        cuts.insert(kind, cut);
+        let started = Instant::now();
+        while !both() {
+            assert!(started.elapsed() < Duration::from_secs(5), "cycle {cycle}: {kind} never back: {:?}", session.paths());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let after = back_to(before);
+    assert_eq!(detached.load(std::sync::atomic::Ordering::SeqCst), 0, "detached");
+    assert!(after.0 <= before.0 && after.1 <= before.1,
+            "the link's threads and the descriptors: {before:?} with both paths up, {after:?} after 20 cycles");
+    pc.close();
+    tablet.close();
+}

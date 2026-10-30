@@ -1,5 +1,5 @@
 //! A session with a paired device: its keys, its channels and their
-//! reliable messages, over one path at a time, which may change while the
+//! reliable messages, over the paths there are, which may change while the
 //! session lasts (the cable plugged in or pulled, the Wi-Fi lost and back).
 //!
 //! A path: a TLS 1.3 stream (the session's messages, the control
@@ -7,19 +7,31 @@
 //! there is IP under it, a UDP socket or the QUIC connection's datagrams
 //! (input and realtime, sealed with the session's keys from the first TLS
 //! exporter). A path silent PATH_SUSPECT is suspect (told), and lost
-//! after PATH_SILENCE; a path lost, the session
-//! waits RESUME_WAIT for another (the dialer makes one: plus-one-link);
-//! a better one coming (the cable) takes over. Each side numbers its
-//! reliable frames (the session's messages, the control channels'); a ping
-//! says up to which the other's came, and what a lost path did not
-//! deliver is sent again on the next, the duplicates dropped.
+//! after PATH_SILENCE. Each side numbers its reliable frames (the
+//! session's messages, the control channels'); a ping says up to which the
+//! other's came, and what a lost path did not deliver is sent again on the
+//! next, the duplicates dropped.
+//!
+//! With a peer whose hello says "paths": 1 (as ours does), the session
+//! keeps up to MAX_PATHS at once, one of each kind: the carrier, which
+//! carries what each side sends, and reserves, pinged each PING_EVERY and
+//! nothing else. Each side reads every path (each one's frames numbered
+//! from what the other has, at most: the duplicates dropped) and picks its
+//! carrier alone: the carrier lost or suspect, the best reserve takes its
+//! place at once, what it had not delivered first again on it, no
+//! detaching; a better path (rank()) is a reserve first, the carrier's
+//! once heard throughout HYSTERESIS. With no path left, or with a peer
+//! from before (one path at a time: a better one coming takes over, the
+//! one before is retired), the session waits RESUME_WAIT for another (the
+//! dialer makes one: plus-one-link).
 //!
 //! Threads, none of them busy while nothing moves:
-//! - the session's: it alone touches the path's TLS connection; reads,
-//!   writes what the others queued (woken by an eventfd), pings each
-//!   second, takes a path handed over, waits for one when it is lost;
-//! - the path's datagrams': opens what arrives and hands it to its channel
-//!   (a QUIC path's, on quinn's runtime: quic.rs);
+//! - the session's: it alone touches the paths' TLS connections; reads
+//!   them all, writes what the others queued on the carrier (woken by an
+//!   eventfd), pings each second, takes the paths that come, waits for one
+//!   when none is left;
+//! - each path's datagrams': opens what arrives and hands it to its
+//!   channel (a QUIC path's, on quinn's runtime: quic.rs);
 //! - one per channel: what the feature writes, to the other side.
 
 use crate::frame::{self, Decoder};
@@ -53,6 +65,13 @@ pub const RESUME_WAIT_IN_USE: Duration = Duration::from_secs(60);
 /// A path a better one took over from ends once the other side is heard
 /// on the new one (Session::heard_on), or at the latest this long after.
 const HANDOVER_CAP: Duration = Duration::from_secs(3);
+/// With a peer that keeps several paths ("paths": 1 in both hellos): this
+/// many at once at most, one of each kind (the carrier and its reserves).
+const MAX_PATHS: usize = 3;
+/// A reserve better than the carrier takes its place once heard throughout
+/// this long (its own pings): not at once (a path that came and went at
+/// once carried nothing meanwhile).
+const HYSTERESIS: Duration = Duration::from_secs(2);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
@@ -396,14 +415,19 @@ struct Reliable {
     acknowledged: u64,  // the newest of theirs we said we have
 }
 
-/// A path's state (LINK-STATES §4): heard lately; nothing heard for
-/// PATH_SUSPECT (still used); lost (PATH_SILENCE, its stream's error or
-/// end), its last.
+/// A path's state (LINK-STATES §4): the carrier, heard lately; nothing
+/// heard for PATH_SUSPECT (still used); lost (PATH_SILENCE, its stream's
+/// error or end), its last; a reserve, heard lately (a peer that keeps
+/// several paths: pinged, nothing else); let go of on purpose, its last
+/// (a better one of its kind took its place, one too many, or the other
+/// side let go of it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathState {
     Active,
     Suspect,
     Failed,
+    Standby,
+    Closed,
 }
 
 impl PathState {
@@ -412,6 +436,8 @@ impl PathState {
             PathState::Active => "active",
             PathState::Suspect => "suspect",
             PathState::Failed => "failed",
+            PathState::Standby => "standby",
+            PathState::Closed => "closed",
         }
     }
 
@@ -419,6 +445,8 @@ impl PathState {
         match state {
             1 => PathState::Suspect,
             2 => PathState::Failed,
+            3 => PathState::Standby,
+            4 => PathState::Closed,
             _ => PathState::Active,
         }
     }
@@ -472,8 +500,12 @@ struct Path {
     proven_us: AtomicU64,  // a pong's (0: none yet)
     rtt_us: AtomicU64,
     realtime_us: AtomicU64,  // since started: the last realtime or input datagram sent (0: none)
-    /// Not the session's path any more (lost, or a better one took over).
+    /// Not the session's path any more (lost, or a better one took over;
+    /// with a peer that keeps several, out of them).
     gone: AtomicBool,
+    /// A better one of its kind took its place: it ends once the other
+    /// side is heard on that one (a peer that keeps several paths).
+    leaving: AtomicBool,
     /// Shut down (end_path): its datagrams are read until then, after a
     /// handover too (they are sealed with the session's keys, replays
     /// dropped by the opener's window).
@@ -538,6 +570,12 @@ impl Path {
             (None, 0) => (None, "none"),
             (None, rate) => (Some(rate), if self.drained.load(Ordering::Relaxed) { "drain" } else { "prior" }),
         }
+    }
+
+    /// How good it is: one higher takes over from one lower (QUIC over TCP
+    /// at the same kind).
+    fn rank(&self) -> (u8, bool) {
+        (rank(&self.kind), self.quic.is_some())
     }
 
     fn info(&self) -> PathInfo {
@@ -659,6 +697,68 @@ impl Drain {
     }
 }
 
+/// A path as the session's thread drives it: its TLS connection and its
+/// stream (it alone touches them), what came on it and is not a whole
+/// frame yet, what its stream drains (the carrier's measured), its pings
+/// due, when it went suspect, since when it has been heard throughout (a
+/// reserve takes the carrier's place HYSTERESIS after), when its stream
+/// last took something, how the last round left it, and, if a better one
+/// of its kind took its place, that one and when it ends at the latest.
+struct Live {
+    path: Arc<Path>,
+    conn: rustls::Connection,
+    stream: Box<dyn Stream>,
+    decoder: Decoder,
+    drain: Drain,
+    next_ping: Instant,
+    next_udp_ping: Instant,
+    suspect_since: Option<Instant>,
+    steady_since: Instant,
+    taken_at: Instant,
+    blocked: bool,
+    took: bool,
+    leaving: Option<(Arc<Path>, Instant)>,
+}
+
+/// What the session's thread keeps of its paths: those it drives, the
+/// carrier first; whether one was taken before (the next carrier sends
+/// again what that one had not delivered, and tells Moved); the last
+/// carrier lost and why, until it is said (detached, or another taken).
+struct Paths {
+    lives: Vec<Live>,
+    resumed: bool,
+    last: Option<(String, String)>,
+}
+
+/// Why a path left the session's thread.
+enum Lost {
+    /// Its stream's error or end, its silence: failed.
+    Failed(String),
+    /// The other side let go of it (TLS's close_notify).
+    Notified,
+    /// Let go of here (a better one of its kind took its place, one too many).
+    LetGo(&'static str),
+}
+
+impl Lost {
+    fn reason(&self) -> String {
+        match self {
+            Lost::Failed(reason) => reason.clone(),
+            Lost::Notified => "the other side closed".into(),
+            Lost::LetGo(why) => (*why).into(),
+        }
+    }
+}
+
+/// A path's stream after what came on it was taken (Session::take_in).
+enum In {
+    Open,
+    /// Its end.
+    Ended,
+    /// TLS's close_notify: the other side let go of it on purpose.
+    Notified,
+}
+
 pub struct Session {
     /// The other side's certificate's fingerprint, and what its hello said.
     pub peer: String,
@@ -688,8 +788,18 @@ pub struct Session {
     room: Condvar,
     reliable: Mutex<Reliable>,
     wake: Wake,
+    /// The path the session runs on: the carrier.
     path: Mutex<Option<Arc<Path>>>,
+    /// Every path the session's thread drives now, the carrier first (it
+    /// alone with a peer from before): Session::paths, adopt()'s choice.
+    live: Mutex<Vec<Arc<Path>>>,
+    /// The other side keeps several paths ("paths": 1 in its hello).
+    multipath: bool,
+    /// With a peer from before: the path that takes over next.
     arriving: Mutex<Option<Established>>,
+    /// With a peer that keeps several: the paths adopted, for the session's
+    /// thread to take (a reserve, or the carrier's place).
+    joining: Mutex<Vec<Established>>,
     /// The path a handover left, and when it ends at the latest (retire()).
     retiring: Mutex<Option<(Arc<Path>, Instant)>>,
     retiring_any: AtomicBool,
@@ -749,6 +859,17 @@ impl Established {
         if let Some(quic) = &self.quic {
             quic.close();
         }
+    }
+
+    /// As close(), TLS's close_notify first (not waiting for room): a peer
+    /// that keeps several paths takes its end for a path let go of, not
+    /// one failed (FLAP_HOLD).
+    fn close_notified(mut self) {
+        self.conn.send_close_notify();
+        if self.stream.set_nonblocking(true).is_ok() {
+            while self.conn.wants_write() && self.conn.write_tls(&mut self.stream).is_ok_and(|n| n > 0) {}
+        }
+        self.close();
     }
 }
 
@@ -896,7 +1017,7 @@ fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
-                       gone: AtomicBool::new(false), ended: AtomicBool::new(false),
+                       gone: AtomicBool::new(false), leaving: AtomicBool::new(false), ended: AtomicBool::new(false),
                        state: AtomicU8::new(PathState::Active as u8), budget: AtomicU64::new(budget),
                        drained: AtomicBool::new(false) }))
 }
@@ -949,7 +1070,11 @@ impl Session {
             reliable: Mutex::new(Reliable { next: 1, ..Default::default() }),
             wake: Wake::new()?,
             path: Mutex::default(),
+            live: Mutex::default(),
+            // Ours says it too (NodeInner::hello).
+            multipath: hello["paths"].as_u64() == Some(1),
             arriving: Mutex::default(),
+            joining: Mutex::default(),
             retiring: Mutex::default(),
             retiring_any: AtomicBool::new(false),
             next_path: AtomicU32::new(1),
@@ -960,6 +1085,7 @@ impl Session {
         // Its first path ready before anyone sees the session.
         let path = prepare(&mut established, session.next_path.fetch_add(1, Ordering::Relaxed))?;
         *session.path.lock().unwrap() = Some(path.clone());
+        *session.live.lock().unwrap() = vec![path.clone()];
         let me = session.clone();
         std::thread::Builder::new().name("link-session".into()).spawn(move || me.run(established, path))?;
         Ok(session)
@@ -973,6 +1099,9 @@ impl Session {
             established.close();
             return false;
         }
+        if self.multipath {
+            return self.join(established);
+        }
         let now = self.path.lock().unwrap().clone();
         // Taken if better: a higher rank, or QUIC over TCP at the same one.
         let better = |path: &Path| (rank(&established.kind), established.quic.is_some()) > (rank(&path.kind), path.quic.is_some());
@@ -983,6 +1112,35 @@ impl Session {
         if let Some(before) = self.arriving.lock().unwrap().replace(established) {
             before.close();
         }
+        self.wake.wake();
+        true
+    }
+
+    /// With a peer that keeps several paths: taken (a reserve, or the
+    /// carrier's place: the session's thread, join_all()) if the session
+    /// has none of its kind (and fewer than MAX_PATHS, or a reserve worse
+    /// than it), if it is better than the one of its kind (QUIC over TCP)
+    /// or that one is suspect, or if the other side has no path; else
+    /// closed, as before.
+    fn join(&self, established: Established) -> bool {
+        let refused = !established.forced && {
+            let carrier = self.current();
+            let live = self.live.lock().unwrap();
+            let staying: Vec<&Arc<Path>> =
+                live.iter().filter(|p| !p.gone.load(Ordering::SeqCst) && !p.leaving.load(Ordering::SeqCst)).collect();
+            let theirs = (rank(&established.kind), established.quic.is_some());
+            match staying.iter().find(|p| p.kind == established.kind) {
+                Some(same) => same.state() != PathState::Suspect && theirs <= same.rank(),
+                None => staying.len() >= MAX_PATHS && staying.iter()
+                    .filter(|p| carrier.as_ref().is_none_or(|carrier| !Arc::ptr_eq(carrier, p)))
+                    .all(|p| p.rank() >= theirs),
+            }
+        };
+        if refused {
+            established.close_notified();
+            return false;
+        }
+        self.joining.lock().unwrap().push(established);
         self.wake.wake();
         true
     }
@@ -1035,10 +1193,10 @@ impl Session {
         self.current().filter(|path| path.udp_works()).map(|path| Duration::from_micros(path.rtt_us.load(Ordering::Relaxed)))
     }
 
-    /// Its paths as they are now: the one it runs on (none while it waits
-    /// for one).
+    /// Its paths as they are now: the one it runs on first, then its
+    /// reserves (none while it waits for one).
     pub fn paths(&self) -> Vec<PathInfo> {
-        self.current().map(|path| path.info()).into_iter().collect()
+        self.live.lock().unwrap().iter().map(|path| path.info()).collect()
     }
 
     /// Bytes sent and not yet on the air (the UDP socket's, the queue's,
@@ -1095,8 +1253,14 @@ impl Session {
         if let Some(path) = self.path.lock().unwrap().take() {
             end_path(&path);
         }
+        for path in self.live.lock().unwrap().drain(..) {
+            end_path(&path);
+        }
         if let Some(arriving) = self.arriving.lock().unwrap().take() {
             arriving.close();
+        }
+        for joining in self.joining.lock().unwrap().drain(..) {
+            joining.close();
         }
         self.retire(None);
         self.wake.wake();
@@ -1430,80 +1594,74 @@ impl Session {
 
     // -- the session's thread --------------------------------------------------------
 
-    /// Path after path, until the session is over.
+    /// Path after path, until the session is over (with a peer that keeps
+    /// several, the carrier and its reserves at once): each round over the
+    /// paths there are; none left, another waited for.
     fn run(self: Arc<Self>, first: Established, path: Arc<Path>) {
-        let mut next = Some((first, Some(path)));
-        let mut resumed = false;
-        while let Some((established, path)) = next.take() {
-            let kind = established.kind.clone();
-            let reason = self.run_path(established, path, resumed);
-            resumed = true;
+        let mut paths = Paths { lives: Vec::new(), resumed: false, last: None };
+        let mut plain = vec![0u8; 64 << 10];
+        let kind = first.kind.clone();
+        // The path given, not kept here: its socket goes with it.
+        match self.take_up(first, Some(path)) {
+            Ok(live) => {
+                paths.lives.push(live);
+                self.carry(&mut paths, 0);
+            }
+            Err(reason) => {
+                self.live.lock().unwrap().clear();
+                paths.last = Some((kind, reason));
+                paths.resumed = true;
+            }
+        }
+        loop {
             if self.is_closed() {
-                self.path.lock().unwrap().take();  // taken after end() let go of the one before
+                break;
             }
-            if self.is_closed() || self.closing.load(Ordering::SeqCst) {
-                return;  // close() ends it
+            if self.multipath {
+                self.join_all(&mut paths);
+            } else {
+                self.arrive(&mut paths);
             }
-            if let Some(better) = self.arriving.lock().unwrap().take() {
-                log!("{}: from {kind} to {}", self.label(), better.kind);
-                next = Some((better, None));
-                continue;
-            }
-            log!("{}: the {kind} path is lost ({reason}); waiting for another", self.label());
-            *self.path.lock().unwrap() = None;
-            if let Some(node) = self.node.upgrade() {
-                node.detached(&self);
-            }
-            let wait = if self.channels() > 0 { RESUME_WAIT_IN_USE } else { RESUME_WAIT };
-            let until = Instant::now() + wait;
-            while next.is_none() {
-                if self.is_closed() {
-                    return;
-                }
-                next = self.arriving.lock().unwrap().take().map(|established| (established, None));
-                if next.is_some() {
+            if paths.lives.is_empty() {
+                // Closing: close() ends it. Else another path, or the end.
+                if self.closing.load(Ordering::SeqCst) || !self.away(&mut paths) {
                     break;
                 }
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    self.end(&format!("no path for {} s", wait.as_secs()));
-                    return;
-                }
-                // Woken by a path coming (adopt) or the session's end.
-                let _ = sys::readable(self.wake.fd(), Some(left));
-                self.wake.clear();
+                continue;
             }
-            if let Some((established, _)) = &next {
-                log!("{}: on again, by {}", self.label(), established.kind);
+            let until = if self.multipath { self.choose(&mut paths) } else { None };
+            if paths.lives.is_empty() {
+                continue;
+            }
+            let mut lost = self.round(&mut paths, until, &mut plain);
+            // The last first: the indexes before stay as they were.
+            lost.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+            lost.dedup_by_key(|(index, _)| *index);
+            for (index, why) in lost {
+                self.lose(&mut paths, index, why);
             }
         }
+        // Over (or closing): every path ended and let go of (taken after
+        // end() let go of those before).
+        self.path.lock().unwrap().take();
+        self.live.lock().unwrap().clear();
+        for live in paths.lives.drain(..) {
+            live.path.gone.store(true, Ordering::SeqCst);
+            end_path(&live.path);
+        }
+        self.retire(None);
     }
 
-    /// One path, until it is lost, a better one is handed over, or the
-    /// session is over: why it ended.
-    fn run_path(self: &Arc<Self>, mut established: Established, path: Option<Arc<Path>>, resumed: bool) -> String {
-        let path = match path.map(Ok).unwrap_or_else(|| prepare(&mut established, self.next_path.fetch_add(1, Ordering::Relaxed))) {
-            Ok(path) => path,
-            Err(e) => {
-                self.retire(None);
-                return e.to_string();
-            }
+    /// A connection made a path the session's thread drives (path: made
+    /// already, the first): its datagrams read from now on (a QUIC path's
+    /// budget told while it carries), what came with its hello taken. An
+    /// error (what came broke the protocol): the path ended.
+    fn take_up(self: &Arc<Self>, mut established: Established, path: Option<Arc<Path>>) -> Result<Live, String> {
+        let path = match path {
+            Some(path) => path,
+            None => prepare(&mut established, self.next_path.fetch_add(1, Ordering::Relaxed)).map_err(|e| e.to_string())?,
         };
-        let Established { mut conn, mut stream, mut decoder, .. } = established;
-        if resumed {
-            // What the path before did not deliver goes first; datagrams
-            // waiting for it are stale now.
-            let reliable = self.reliable.lock().unwrap();
-            self.outbox.lock().unwrap().restart(reliable.unacked.iter().map(|(_, bytes)| bytes.clone()));
-        }
-        *self.path.lock().unwrap() = Some(path.clone());
-        *self.pace.lock().unwrap() = crate::pace::Pace::new(Instant::now());
-        if resumed {
-            if let Some(node) = self.node.upgrade() {
-                node.moved(self);
-            }
-        }
-        self.tell_path(&path, PathState::Active);
+        let Established { mut conn, stream, decoder, .. } = established;
         if path.udp.is_some() {
             let (me, path) = (self.clone(), path.clone());
             let _ = std::thread::Builder::new().name("link-datagrams".into()).spawn(move || me.run_datagrams(path));
@@ -1515,7 +1673,9 @@ impl Session {
                 me.datagram_in(&here, &mut buf, None, &mut Vec::new());
             });
             // Its budget told as it moves, until the path goes (quic.close();
-            // not after a better one took over: retire()).
+            // not after a better one took over: retire()), while it carries
+            // (a reserve's controller is its own: the apps follow the
+            // carrier's).
             let (me, budget, here) = (Arc::downgrade(self), quic.budget(), path.clone());
             let _ = std::thread::Builder::new().name("link-budget".into()).spawn(move || {
                 let mut told = 0;
@@ -1525,6 +1685,9 @@ impl Session {
                         continue;
                     }
                     let Some(me) = me.upgrade() else { return };
+                    if me.multipath && !me.carries(&here) {
+                        continue;
+                    }
                     if let Some(node) = me.node.upgrade() {
                         node.budget(&me, rate);
                     }
@@ -1532,26 +1695,327 @@ impl Session {
             });
         }
         conn.set_buffer_limit(None);
-        let reason = self.drive(&path, &mut conn, &mut stream, &mut decoder).err();
+        let now = Instant::now();
+        let prior = Some(path.budget.load(Ordering::Relaxed)).filter(|prior| *prior != 0);
+        let mut live = Live { path, conn, stream, decoder, drain: Drain::new(now, prior), next_ping: now, next_udp_ping: now,
+                              suspect_since: None, steady_since: now, taken_at: now, blocked: false, took: false,
+                              leaving: None };
+        // Frames that came with the hello.
+        let greeted = (|| {
+            while let Some((kind, channel, body)) = live.decoder.next().map_err(|e| e.to_string())? {
+                self.heard_on(&live.path);
+                self.frame(kind, channel, body)?;
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(e) = greeted {
+            live.path.gone.store(true, Ordering::SeqCst);
+            end_path(&live.path);
+            return Err(e);
+        }
+        Ok(live)
+    }
+
+    /// Whether path is the one the session runs on now.
+    fn carries(&self, path: &Path) -> bool {
+        self.path.lock().unwrap().as_deref().is_some_and(|carrier| std::ptr::eq(carrier, path))
+    }
+
+    /// path out of Session::paths.
+    fn unlive(&self, path: &Arc<Path>) {
+        self.live.lock().unwrap().retain(|other| !Arc::ptr_eq(other, path));
+    }
+
+    /// paths.lives[index] the carrier from now on, first among them (the
+    /// one before, if any, a reserve in its place): after another path,
+    /// what that one had not delivered goes first again on it, the
+    /// datagrams waiting for that one are dropped, and the move is told
+    /// (Moved); its pace and its stream's measure from the start, its
+    /// budget told as it begins (a stream's prior; with a peer that keeps
+    /// several, a QUIC path's controller's now).
+    fn carry(self: &Arc<Self>, paths: &mut Paths, index: usize) {
+        paths.lives.swap(0, index);
+        let now = Instant::now();
+        if paths.resumed {
+            let reliable = self.reliable.lock().unwrap();
+            self.outbox.lock().unwrap().restart(reliable.unacked.iter().map(|(_, bytes)| bytes.clone()));
+        }
+        let carrier = &mut paths.lives[0];
+        carrier.leaving = None;
+        carrier.path.leaving.store(false, Ordering::SeqCst);
+        *self.path.lock().unwrap() = Some(carrier.path.clone());
+        {
+            let mut live = self.live.lock().unwrap();
+            live.retain(|other| !Arc::ptr_eq(other, &carrier.path));
+            live.insert(0, carrier.path.clone());
+        }
+        *self.pace.lock().unwrap() = crate::pace::Pace::new(now);
+        carrier.drain = Drain::new(now, Some(carrier.path.budget.load(Ordering::Relaxed)).filter(|prior| *prior != 0));
+        (carrier.next_ping, carrier.next_udp_ping, carrier.taken_at) = (now, now, now);
+        self.stream_budget.store(STREAM_BUDGET, Ordering::Relaxed);
+        let budget = carrier.drain.budget.or_else(|| {
+            carrier.path.quic.as_ref().map(|quic| quic.rate()).filter(|rate| self.multipath && *rate > 0)
+        });
+        if paths.resumed {
+            if let Some(node) = self.node.upgrade() {
+                node.moved(self);
+            }
+        }
+        let state = |live: &Live, carries| match (live.suspect_since, carries) {
+            (Some(_), _) => PathState::Suspect,
+            (None, true) => PathState::Active,
+            (None, false) => PathState::Standby,
+        };
+        self.tell_path(&paths.lives[0].path, state(&paths.lives[0], true));
+        if index != 0 {
+            self.tell_path(&paths.lives[index].path, state(&paths.lives[index], false));
+        }
+        if let (Some(rate), Some(node)) = (budget, self.node.upgrade()) {
+            node.budget(self, rate);
+        }
+        paths.resumed = true;
+    }
+
+    /// paths.lives[index] lost (or let go of: Lost): out of the session's
+    /// paths, ended, told (failed; closed, with a peer that keeps several,
+    /// if either side let go of it on purpose); if it carried, the best
+    /// reserve takes its place at once.
+    fn lose(self: &Arc<Self>, paths: &mut Paths, index: usize, lost: Lost) {
+        let live = paths.lives.remove(index);
+        let path = &live.path;
         path.gone.store(true, Ordering::SeqCst);
-        // Lost (not left for a better one, nor ended with the session): failed.
-        if let Some(reason) = reason.as_ref().filter(|_| !self.is_closed() && !self.closing.load(Ordering::SeqCst)) {
-            let silent = Duration::from_micros(path.silent());
-            let suspect = match path.state() {
-                PathState::Suspect => format!(", suspect for {:.1} s", silent.saturating_sub(PATH_SUSPECT).as_secs_f64()),
-                _ => String::new(),
+        self.unlive(path);
+        let reason = lost.reason();
+        let ending = self.is_closed() || self.closing.load(Ordering::SeqCst);
+        if !ending {
+            if self.multipath && (live.leaving.is_some() || !matches!(lost, Lost::Failed(_))) {
+                log!("{}: the {} path ({}) is let go of ({reason})", self.label(), path.kind, path.id);
+                self.tell_path(path, PathState::Closed);
+            } else {
+                let silent = Duration::from_micros(path.silent());
+                let suspect = match path.state() {
+                    PathState::Suspect => format!(", suspect for {:.1} s", silent.saturating_sub(PATH_SUSPECT).as_secs_f64()),
+                    _ => String::new(),
+                };
+                log!("{}: the {} path ({}) failed ({reason}), {:.1} s after the last heard{suspect}", self.label(), path.kind,
+                     path.id, silent.as_secs_f64());
+                self.tell_path(path, PathState::Failed);
+            }
+        }
+        if !self.multipath {
+            self.retire(None);
+        }
+        end_path(path);
+        if index != 0 {
+            return;
+        }
+        paths.last = Some((path.kind.clone(), reason));
+        if self.multipath && !ending {
+            if let Some(best) = self.best_reserve(paths, true) {
+                log!("{}: from {} to {} at once, the {} path lost", self.label(), path.kind, paths.lives[best].path.kind,
+                     path.kind);
+                paths.last = None;
+                self.carry(paths, best);
+            }
+        }
+    }
+
+    /// paths.lives[index] let go of on purpose: TLS's close_notify first
+    /// (not waiting for room), the other side takes its end for a path let
+    /// go of, not one failed.
+    fn let_go(self: &Arc<Self>, paths: &mut Paths, index: usize, why: &'static str) {
+        let live = &mut paths.lives[index];
+        live.conn.send_close_notify();
+        while live.conn.wants_write() && live.conn.write_tls(&mut live.stream).is_ok_and(|n| n > 0) {}
+        self.lose(paths, index, Lost::LetGo(why));
+    }
+
+    /// The reserve that takes the carrier's place: the best heard lately
+    /// (rank()); the carrier lost, any left rather than none (one suspect,
+    /// one being let go of).
+    fn best_reserve(&self, paths: &Paths, carrier_lost: bool) -> Option<usize> {
+        paths.lives.iter().enumerate().skip(if carrier_lost { 0 } else { 1 })
+            .filter(|(_, live)| carrier_lost || (live.leaving.is_none() && live.suspect_since.is_none()))
+            .max_by_key(|(_, live)| (live.leaving.is_none(), live.suspect_since.is_none(), live.path.rank()))
+            .map(|(index, _)| index)
+    }
+
+    /// With a peer from before: the path adopt() took (better than the one
+    /// now, the only one, or the other side's only one) takes over, the one
+    /// now retired (retire()).
+    fn arrive(self: &Arc<Self>, paths: &mut Paths) {
+        let Some(established) = self.arriving.lock().unwrap().take() else { return };
+        let to = established.kind.clone();
+        if !paths.lives.is_empty() {
+            let old = paths.lives.remove(0);
+            log!("{}: from {} to {to}", self.label(), old.path.kind);
+            old.path.gone.store(true, Ordering::SeqCst);
+            self.unlive(&old.path);
+            // Not ended: its datagrams still read, its stream (the path's
+            // own clone of it) open until the other side is heard on the
+            // new one.
+            self.retire(Some(old.path.clone()));
+        } else if let Some((kind, _)) = paths.last.take() {
+            log!("{}: from {kind} to {to}", self.label());
+        }
+        match self.take_up(established, None) {
+            Ok(live) => {
+                self.live.lock().unwrap().push(live.path.clone());
+                paths.lives.push(live);
+                self.carry(paths, 0);
+            }
+            Err(reason) => {
+                self.retire(None);
+                paths.last = Some((to, reason));
+            }
+        }
+    }
+
+    /// With a peer that keeps several paths: those adopt() took, each a
+    /// reserve; the carrier's place if there is none, if the other side
+    /// has no path (forced), or if the one of its kind it takes the place
+    /// of carried (that one let go of once the other side is heard on this
+    /// one, as a handover's: retire()); one too many, the worst reserve is
+    /// let go of.
+    fn join_all(self: &Arc<Self>, paths: &mut Paths) {
+        let joining = std::mem::take(&mut *self.joining.lock().unwrap());
+        for established in joining {
+            let (kind, forced) = (established.kind.clone(), established.forced);
+            let live = match self.take_up(established, None) {
+                Ok(live) => live,
+                Err(e) => {
+                    log!("{}: a {kind} path not taken ({e})", self.label());
+                    continue;
+                }
             };
-            log!("{}: the {} path ({}) failed ({reason}), {:.1} s after the last heard{suspect}", self.label(), path.kind,
-                 path.id, silent.as_secs_f64());
-            self.tell_path(&path, PathState::Failed);
+            let same = paths.lives.iter().position(|other| other.path.kind == kind && other.leaving.is_none());
+            let alone = paths.lives.is_empty();
+            self.live.lock().unwrap().push(live.path.clone());
+            paths.lives.push(live);
+            let new = paths.lives.len() - 1;
+            if let Some(same) = same {
+                let by = paths.lives[new].path.clone();
+                paths.lives[same].path.leaving.store(true, Ordering::SeqCst);
+                paths.lives[same].leaving = Some((by, Instant::now() + HANDOVER_CAP));
+            }
+            if alone || forced || same == Some(0) {
+                match (alone, paths.last.take()) {
+                    (true, Some((from, _))) => log!("{}: from {from} to {kind}", self.label()),
+                    (true, None) => {}
+                    (false, _) => log!("{}: from {} to {kind} at once ({})", self.label(), paths.lives[0].path.kind,
+                                       if forced { "the other side has no path" } else { "a better one of its kind" }),
+                }
+                self.carry(paths, new);
+                continue;
+            }
+            log!("{}: a {kind} path ({}) taken as a reserve", self.label(), paths.lives[new].path.id);
+            self.tell_path(&paths.lives[new].path, PathState::Standby);
+            if paths.lives.iter().filter(|live| live.leaving.is_none()).count() > MAX_PATHS {
+                let worst = paths.lives.iter().enumerate().skip(1).filter(|(_, live)| live.leaving.is_none())
+                    .min_by_key(|(_, live)| live.path.rank()).map(|(index, _)| index);
+                if let Some(worst) = worst {
+                    self.let_go(paths, worst, "one path too many");
+                }
+            }
         }
-        // A better path took over: this one is retired, not ended (retire()).
-        let handed_over = reason.is_none() && !self.is_closed() && self.arriving.lock().unwrap().is_some();
-        self.retire(handed_over.then(|| path.clone()));
-        if !handed_over {
-            end_path(&path);
+    }
+
+    /// With a peer that keeps several paths, before each round: one a
+    /// better one of its kind took the place of is let go of once the
+    /// other side is heard on that one (or HANDOVER_CAP after); the
+    /// carrier suspect, the best reserve heard lately takes its place at
+    /// once; else a better reserve heard throughout HYSTERESIS does. When
+    /// to look again, if something is due (the round's wait: no timer of
+    /// its own).
+    fn choose(self: &Arc<Self>, paths: &mut Paths) -> Option<Instant> {
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        let soon = |at: Instant, next: &mut Option<Instant>| *next = Some(next.map_or(at, |next| next.min(at)));
+        let mut index = 0;
+        while index < paths.lives.len() {
+            let done = match &paths.lives[index].leaving {
+                Some((by, until)) => {
+                    let done = by.heard_us.load(Ordering::Relaxed) > 1 || by.gone.load(Ordering::SeqCst) || now >= *until;
+                    if !done {
+                        soon(*until, &mut next);
+                    }
+                    done
+                }
+                None => false,
+            };
+            if done {
+                self.let_go(paths, index, "a better one of its kind took its place");
+            } else {
+                index += 1;
+            }
         }
-        reason.unwrap_or_else(|| "a better path".into())
+        if paths.lives.len() < 2 {
+            return next;
+        }
+        if paths.lives[0].suspect_since.is_some() {
+            if let Some(best) = self.best_reserve(paths, false) {
+                log!("{}: from {} to {} at once, the {} path suspect", self.label(), paths.lives[0].path.kind,
+                     paths.lives[best].path.kind, paths.lives[0].path.kind);
+                self.carry(paths, best);
+            }
+            return next;
+        }
+        let carrier = paths.lives[0].path.rank();
+        let mut best: Option<usize> = None;
+        for (index, live) in paths.lives.iter().enumerate().skip(1) {
+            // Heard (the other side drives it too), and throughout HYSTERESIS.
+            if live.leaving.is_some() || live.suspect_since.is_some() || live.path.heard_us.load(Ordering::Relaxed) <= 1
+                || live.path.rank() <= carrier {
+                continue;
+            }
+            let ready = live.steady_since + HYSTERESIS;
+            if now < ready {
+                soon(ready, &mut next);
+            } else if best.is_none_or(|best| live.path.rank() > paths.lives[best].path.rank()) {
+                best = Some(index);
+            }
+        }
+        if let Some(best) = best {
+            log!("{}: from {} to {}, a better path", self.label(), paths.lives[0].path.kind, paths.lives[best].path.kind);
+            self.carry(paths, best);
+        }
+        next
+    }
+
+    /// No path left: told (Detached), and another waited for RESUME_WAIT
+    /// (RESUME_WAIT_IN_USE with a channel open), asleep until one comes or
+    /// the session ends; false if it is over.
+    fn away(self: &Arc<Self>, paths: &mut Paths) -> bool {
+        let (kind, reason) = paths.last.take().unwrap_or_default();
+        log!("{}: the {kind} path is lost ({reason}); waiting for another", self.label());
+        *self.path.lock().unwrap() = None;
+        if let Some(node) = self.node.upgrade() {
+            node.detached(self);
+        }
+        let wait = if self.channels() > 0 { RESUME_WAIT_IN_USE } else { RESUME_WAIT };
+        let until = Instant::now() + wait;
+        loop {
+            if self.is_closed() {
+                return false;
+            }
+            let came = if self.multipath {
+                self.joining.lock().unwrap().first().map(|established| established.kind.clone())
+            } else {
+                self.arriving.lock().unwrap().as_ref().map(|established| established.kind.clone())
+            };
+            if let Some(kind) = came {
+                log!("{}: on again, by {kind}", self.label());
+                return true;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.end(&format!("no path for {} s", wait.as_secs()));
+                return false;
+            }
+            // Woken by a path coming (adopt) or the session's end.
+            let _ = sys::readable(self.wake.fd(), Some(left));
+            self.wake.clear();
+        }
     }
 
     /// path's state from now on (the session's thread alone moves it),
@@ -1620,70 +2084,57 @@ impl Session {
         true
     }
 
-    fn drive(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,
-             decoder: &mut Decoder) -> Result<(), String> {
-        let mut plain = vec![0u8; 64 << 10];
-        // What the stream takes (Drain): how much realtime may wait on it,
-        // and its budget if its kind has a prior (the path has it from the
-        // start), told as it begins (as a QUIC path's controller tells its own).
-        let mut drain = Drain::new(Instant::now(), Some(path.budget.load(Ordering::Relaxed)).filter(|prior| *prior != 0));
-        self.stream_budget.store(STREAM_BUDGET, Ordering::Relaxed);
-        if let (Some(prior), Some(node)) = (drain.budget, self.node.upgrade()) {
-            node.budget(self, prior);
-        }
-        let mut next_ping = Instant::now();
-        let mut next_udp_ping = Instant::now();
-        let mut suspect_since = None;
-        // The stream took something last, or had nothing waiting for it.
-        let mut taken_at = Instant::now();
-        // Frames that came with the hello.
-        while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
-            self.heard_on(path);
-            self.frame(kind, channel, body)?;
-        }
-        loop {
-            if self.is_closed() {
-                return Ok(());
-            }
-            if self.arriving.lock().unwrap().is_some() {
-                return Ok(());  // a better path: the session's thread takes it
-            }
-            // Out: what was queued, once the last of it left: the urgent
-            // first, then a slice of the reliable (Outbox::take).
-            let mut paced = None;
-            if !conn.wants_write() {
-                let reliable = {
-                    let mut pace = self.pace.lock().unwrap();
-                    let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
-                    if room && pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
-                };
-                let (mut out, fresh, taken, made_room) = {
-                    let mut outbox = self.outbox.lock().unwrap();
-                    let (out, fresh, taken) = outbox.take(reliable);
-                    (out, fresh, taken, std::mem::take(&mut outbox.made_room))
-                };
-                if made_room {
-                    self.room.notify_all();
-                }
-                if !fresh.is_empty() {
-                    self.number(fresh, &mut out);
-                }
+    /// One round of the session's thread over its paths, the carrier
+    /// first: what was queued goes out on the carrier, once the last of it
+    /// left (the urgent first, then a slice of the reliable:
+    /// Outbox::take); each path's TLS out to its socket; the carrier's
+    /// stream measured (Drain); each path's silence looked at; the pings
+    /// (a reserve's, each PING_EVERY, nothing else); a wait for what comes
+    /// on any of them or for the next thing due (until, at the latest);
+    /// what came taken. The paths lost meanwhile, and why.
+    fn round(self: &Arc<Self>, paths: &mut Paths, until: Option<Instant>, plain: &mut [u8]) -> Vec<(usize, Lost)> {
+        let lives = &mut paths.lives;
+        let mut lost = Vec::new();
+        let mut paced = None;
+        if !lives[0].conn.wants_write() {
+            let reliable = {
                 let mut pace = self.pace.lock().unwrap();
-                pace.spent(taken);
-                paced = pace.wait();
-                if !out.is_empty() {
-                    conn.writer().write_all(&out).map_err(|e| e.to_string())?;
+                let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
+                if room && pace.may_send(Instant::now()) { WRITE_SLICE } else { 0 }
+            };
+            let (mut out, fresh, taken, made_room) = {
+                let mut outbox = self.outbox.lock().unwrap();
+                let (out, fresh, taken) = outbox.take(reliable);
+                (out, fresh, taken, std::mem::take(&mut outbox.made_room))
+            };
+            if made_room {
+                self.room.notify_all();
+            }
+            if !fresh.is_empty() {
+                self.number(fresh, &mut out);
+            }
+            let mut pace = self.pace.lock().unwrap();
+            pace.spent(taken);
+            paced = pace.wait();
+            if !out.is_empty() {
+                if let Err(e) = lives[0].conn.writer().write_all(&out) {
+                    lost.push((0, Lost::Failed(e.to_string())));
+                    return lost;
                 }
             }
-            let (mut blocked, mut took) = (false, false);
-            while conn.wants_write() {
-                match conn.write_tls(stream) {
+        }
+        for (index, live) in lives.iter_mut().enumerate() {
+            (live.blocked, live.took) = (false, false);
+            while live.conn.wants_write() {
+                match live.conn.write_tls(&mut live.stream) {
                     Ok(written) => {
-                        drain.wrote(written);
-                        took |= written > 0;
+                        if index == 0 {
+                            live.drain.wrote(written);
+                        }
+                        live.took |= written > 0;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        blocked = true;
+                        live.blocked = true;
                         break;
                     }
                     Err(e) => {
@@ -1691,142 +2142,209 @@ impl Session {
                         // ECONNRESET): what it sent before is taken first,
                         // a "bye" there ending the session (lost, the
                         // session waited for another path).
-                        let _ = self.take_in(path, conn, stream, decoder, &mut plain);
-                        return Err(e.to_string());
+                        let _ = self.take_in(live, plain);
+                        lost.push((index, Lost::Failed(e.to_string())));
+                        break;
                     }
                 }
             }
-            // All out, and more queued meanwhile (its wake taken already, while
-            // the stream was full): round again at once, after a look at what
-            // came, not at the next ping (a transfer went a burst a second).
-            // Not for reliable frames that may not go: paced, or as much
-            // unacknowledged as may be (the acknowledgement comes on the
-            // stream, and wakes the poll).
-            let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
-            let more = !blocked && {
-                let outbox = self.outbox.lock().unwrap();
-                !outbox.urgent.is_empty() || (outbox.reliable_bytes > 0 && paced.is_none() && room)
-            };
-            drain.after(blocked, !blocked && !more);
-            if let Some((wait, told)) = drain.roll(Instant::now()) {
-                self.stream_budget.store(wait, Ordering::Relaxed);
-                path.budget.store(drain.budget.unwrap_or(0), Ordering::Relaxed);
-                path.drained.store(drain.measured, Ordering::Relaxed);
-                if let (Some(rate), Some(node)) = (told, self.node.upgrade()) {
-                    node.budget(self, rate);
-                }
+        }
+        if !lost.is_empty() {
+            return lost;
+        }
+        // All out, and more queued meanwhile (its wake taken already, while
+        // the stream was full): round again at once, after a look at what
+        // came, not at the next ping (a transfer went a burst a second).
+        // Not for reliable frames that may not go: paced, or as much
+        // unacknowledged as may be (the acknowledgement comes on the
+        // stream, and wakes the poll).
+        let carrier = &mut lives[0];
+        let room = self.reliable.lock().unwrap().unacked_bytes < UNACKED_MOST;
+        let more = !carrier.blocked && {
+            let outbox = self.outbox.lock().unwrap();
+            !outbox.urgent.is_empty() || (outbox.reliable_bytes > 0 && paced.is_none() && room)
+        };
+        carrier.drain.after(carrier.blocked, !carrier.blocked && !more);
+        if let Some((wait, told)) = carrier.drain.roll(Instant::now()) {
+            self.stream_budget.store(wait, Ordering::Relaxed);
+            carrier.path.budget.store(carrier.drain.budget.unwrap_or(0), Ordering::Relaxed);
+            carrier.path.drained.store(carrier.drain.measured, Ordering::Relaxed);
+            if let (Some(rate), Some(node)) = (told, self.node.upgrade()) {
+                node.budget(self, rate);
             }
-            let now = Instant::now();
-            let silent = path.silent();
+        }
+        let now = Instant::now();
+        for (index, live) in lives.iter_mut().enumerate() {
+            let silent = live.path.silent();
             if silent > PATH_SILENCE.as_micros() as u64 {
-                return Err(format!("nothing heard for {:.1} s", silent as f64 / 1e6));
+                lost.push((index, Lost::Failed(format!("nothing heard for {:.1} s", silent as f64 / 1e6))));
+                continue;
             }
-            // Heard (the other side sends) and taking nothing of what waits:
-            // lost as well (its answers, our pings, piled up for ever).
-            if took || !blocked {
-                taken_at = now;
-            } else if now.duration_since(taken_at) > PATH_SILENCE {
-                return Err(format!("nothing taken for {:.1} s", now.duration_since(taken_at).as_secs_f64()));
+            // Heard (the other side sends) and taking nothing of what
+            // waits: lost as well (its answers, our pings, piled up for ever).
+            if live.took || !live.blocked {
+                live.taken_at = now;
+            } else if now.duration_since(live.taken_at) > PATH_SILENCE {
+                lost.push((index, Lost::Failed(format!("nothing taken for {:.1} s",
+                                                       now.duration_since(live.taken_at).as_secs_f64()))));
+                continue;
             }
             // Nothing heard for PATH_SUSPECT, though the other side pings
             // each PING_EVERY: suspect, until something comes (a datagram
             // on a suspect path wakes this).
             let suspect = silent >= PATH_SUSPECT.as_micros() as u64;
-            if suspect != suspect_since.is_some() {
+            if suspect != live.suspect_since.is_some() {
                 if suspect {
-                    log!("{}: the {} path ({}) is suspect: nothing heard for {:.1} s", self.label(), path.kind, path.id,
-                         silent as f64 / 1e6);
-                    suspect_since = Some(now);
-                } else if let Some(since) = suspect_since.take() {
-                    log!("{}: the {} path ({}) heard again, suspect for {:.1} s", self.label(), path.kind, path.id,
-                         now.duration_since(since).as_secs_f64());
+                    log!("{}: the {} path ({}) is suspect: nothing heard for {:.1} s", self.label(), live.path.kind,
+                         live.path.id, silent as f64 / 1e6);
+                    live.suspect_since = Some(now);
+                } else if let Some(since) = live.suspect_since.take() {
+                    log!("{}: the {} path ({}) heard again, suspect for {:.1} s", self.label(), live.path.kind,
+                         live.path.id, now.duration_since(since).as_secs_f64());
+                    live.steady_since = now;
                 }
-                self.tell_path(path, if suspect { PathState::Suspect } else { PathState::Active });
-            }
-            let ack_due = {
-                let reliable = self.reliable.lock().unwrap();
-                reliable.heard >= reliable.acknowledged.saturating_add(ACK_AFTER)
-            };
-            if now >= next_ping || ack_due {
-                next_ping = now + PING_EVERY;
-                let heard = {
-                    let mut reliable = self.reliable.lock().unwrap();
-                    reliable.acknowledged = reliable.heard;
-                    reliable.heard
+                let state = match (suspect, index) {
+                    (true, _) => PathState::Suspect,
+                    (false, 0) => PathState::Active,
+                    (false, _) => PathState::Standby,
                 };
-                self.queue(frame::PING, 0, &heard.to_be_bytes());
-                continue;
-            }
-            if (path.udp.is_some() || path.quic.is_some()) && now >= next_udp_ping {
-                let early = path.started.elapsed() < UDP_PROOF;
-                let busy = path.realtime_going() && self.outbox.lock().unwrap().reliable_bytes > 0;
-                next_udp_ping = now + if busy && path.udp_works() { PROBE_BUSY }
-                    else if path.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
-                let mut ping = vec![PING];
-                ping.extend_from_slice(&path.us().to_be_bytes());
-                self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
-            }
-            let datagrams = path.udp.is_some() || path.quic.is_some();
-            let mut deadline = if datagrams { next_ping.min(next_udp_ping) } else { next_ping };
-            if suspect_since.is_none() {
-                // When it is suspect, if nothing comes before: no timer of its own.
-                deadline = deadline.min(now + PATH_SUSPECT.saturating_sub(Duration::from_micros(silent)));
-            }
-            if let Some(until) = self.retiring_until(now) {
-                deadline = deadline.min(until);  // the path a handover left, at the latest
-            }
-            let mut wait = deadline.saturating_duration_since(now);
-            if let Some(paced) = paced.filter(|_| self.outbox.lock().unwrap().reliable_bytes > 0) {
-                wait = wait.min(paced);  // the reliable frames' next turn
-            }
-            let mut fds = [
-                libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 }, revents: 0 },
-                libc::pollfd { fd: self.wake.fd(), events: libc::POLLIN, revents: 0 },
-            ];
-            sys::poll(&mut fds, Some(if more { Duration::ZERO } else { wait.min(PING_EVERY) })).map_err(|e| e.to_string())?;
-            if fds[1].revents != 0 {
-                self.wake.clear();
-            }
-            if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
-                continue;
-            }
-            if self.take_in(path, conn, stream, decoder, &mut plain)? {
-                return Err("the other side closed".into());
+                self.tell_path(&live.path, state);
             }
         }
+        if !lost.is_empty() {
+            return lost;
+        }
+        let ack_due = {
+            let reliable = self.reliable.lock().unwrap();
+            reliable.heard >= reliable.acknowledged.saturating_add(ACK_AFTER)
+        };
+        let mut pinged = false;
+        if now >= lives[0].next_ping || ack_due {
+            lives[0].next_ping = now + PING_EVERY;
+            let heard = {
+                let mut reliable = self.reliable.lock().unwrap();
+                reliable.acknowledged = reliable.heard;
+                reliable.heard
+            };
+            self.queue(frame::PING, 0, &heard.to_be_bytes());
+            pinged = true;
+        }
+        // The reserves': each PING_EVERY on the stream and over the
+        // datagrams at once, in step with the carrier's (one wake for
+        // all), and nothing else; none on one being let go of.
+        let step = lives[0].next_ping;
+        for (index, live) in lives.iter_mut().enumerate().skip(1) {
+            if live.leaving.is_some() || now < live.next_ping {
+                continue;
+            }
+            live.next_ping = if step >= now + PING_EVERY / 2 { step } else { now + PING_EVERY };
+            let mut ping = Vec::new();
+            frame::encode(frame::PING, 0, &self.reliable.lock().unwrap().heard.to_be_bytes(), &mut ping);
+            if let Err(e) = live.conn.writer().write_all(&ping) {
+                lost.push((index, Lost::Failed(e.to_string())));
+                continue;
+            }
+            if live.path.udp.is_some() || live.path.quic.is_some() {
+                let mut ping = vec![PING];
+                ping.extend_from_slice(&live.path.us().to_be_bytes());
+                self.send_datagram_now(&live.path, DATAGRAM_PATH, &ping, &mut Vec::new());
+            }
+            pinged = true;
+        }
+        if pinged || !lost.is_empty() {
+            return lost;  // out at once: the next round
+        }
+        let carrier = &mut lives[0];
+        let datagrams = carrier.path.udp.is_some() || carrier.path.quic.is_some();
+        if datagrams && now >= carrier.next_udp_ping {
+            let path = &carrier.path;
+            let early = path.started.elapsed() < UDP_PROOF;
+            let busy = path.realtime_going() && self.outbox.lock().unwrap().reliable_bytes > 0;
+            carrier.next_udp_ping = now + if busy && path.udp_works() { PROBE_BUSY }
+                else if path.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
+            let mut ping = vec![PING];
+            ping.extend_from_slice(&path.us().to_be_bytes());
+            self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
+        }
+        let mut deadline = if datagrams { carrier.next_ping.min(carrier.next_udp_ping) } else { carrier.next_ping };
+        for (index, live) in lives.iter().enumerate() {
+            if index > 0 && live.leaving.is_none() {
+                deadline = deadline.min(live.next_ping);
+            }
+            if live.suspect_since.is_none() {
+                // When it is suspect, if nothing comes before: no timer of its own.
+                deadline = deadline.min(now + PATH_SUSPECT.saturating_sub(Duration::from_micros(live.path.silent())));
+            }
+        }
+        if let Some(until) = until {
+            deadline = deadline.min(until);  // the caller's: a reserve ready, one let go of at the latest
+        }
+        if let Some(until) = self.retiring_until(now) {
+            deadline = deadline.min(until);  // the path a handover left, at the latest
+        }
+        let mut wait = deadline.saturating_duration_since(now);
+        if let Some(paced) = paced.filter(|_| self.outbox.lock().unwrap().reliable_bytes > 0) {
+            wait = wait.min(paced);  // the reliable frames' next turn
+        }
+        let mut fds: Vec<libc::pollfd> = std::iter::once(libc::pollfd { fd: self.wake.fd(), events: libc::POLLIN, revents: 0 })
+            .chain(lives.iter().map(|live| libc::pollfd {
+                fd: live.stream.as_raw_fd(),
+                events: libc::POLLIN | if live.blocked { libc::POLLOUT } else { 0 },
+                revents: 0,
+            }))
+            .collect();
+        if let Err(e) = sys::poll(&mut fds, Some(if more { Duration::ZERO } else { wait.min(PING_EVERY) })) {
+            lost.push((0, Lost::Failed(e.to_string())));
+            return lost;
+        }
+        if fds[0].revents != 0 {
+            self.wake.clear();
+        }
+        for (index, live) in lives.iter_mut().enumerate() {
+            if fds[index + 1].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+                continue;
+            }
+            match self.take_in(live, plain) {
+                Ok(In::Open) => {}
+                Ok(In::Ended) => lost.push((index, Lost::Failed("the other side closed".into()))),
+                Ok(In::Notified) => lost.push((index, Lost::Notified)),
+                Err(e) => lost.push((index, Lost::Failed(e))),
+            }
+        }
+        lost
     }
 
-    /// What came on the stream, until it would block: every whole frame
-    /// taken, even when the stream ended or failed right after (a "bye"
-    /// there ends the session, not only the path: lost, the session
+    /// What came on a path's stream, until it would block: every whole
+    /// frame taken, even when the stream ended or failed right after (a
+    /// "bye" there ends the session, not only the path: lost, the session
     /// waited RESUME_WAIT for another, and the PC reached for the
-    /// tablet). Ok(true): it ended (its end, or TLS's close_notify).
-    fn take_in(self: &Arc<Self>, path: &Arc<Path>, conn: &mut rustls::Connection, stream: &mut Box<dyn Stream>,
-               decoder: &mut Decoder, plain: &mut [u8]) -> Result<bool, String> {
+    /// tablet). How the stream is: open still, at its end, or told it ends
+    /// (TLS's close_notify: the other side let go of it on purpose).
+    fn take_in(self: &Arc<Self>, live: &mut Live, plain: &mut [u8]) -> Result<In, String> {
         let read = 'read: loop {
-            match conn.read_tls(stream) {
-                Ok(0) => break Ok(true),
+            match live.conn.read_tls(&mut live.stream) {
+                Ok(0) => break Ok(In::Ended),
                 Ok(_) => {
-                    if let Err(e) = conn.process_new_packets() {
+                    if let Err(e) = live.conn.process_new_packets() {
                         break Err(e.to_string());
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break Ok(In::Open),
                 Err(e) => break Err(e.to_string()),
             }
             // Out at once: rustls holds only so much read and not taken.
             loop {
-                match conn.reader().read(plain) {
-                    Ok(0) => break 'read Ok(true),
-                    Ok(n) => decoder.push(&plain[..n]),
+                match live.conn.reader().read(plain) {
+                    Ok(0) => break 'read Ok(In::Notified),
+                    Ok(n) => live.decoder.push(&plain[..n]),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => break 'read Err(e.to_string()),
                 }
             }
         };
-        while let Some((kind, channel, body)) = decoder.next().map_err(|e| e.to_string())? {
-            path.heard();
-            self.heard_on(path);
+        while let Some((kind, channel, body)) = live.decoder.next().map_err(|e| e.to_string())? {
+            live.path.heard();
+            self.heard_on(&live.path);
             self.frame(kind, channel, body)?;
         }
         read
@@ -2004,8 +2522,9 @@ impl Session {
             path.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
             path.proven_us.store(now.max(1), Ordering::Relaxed);
             // A QUIC path is paced by its own controller (cc.rs); pace.rs
-            // paces a TCP one.
-            if path.quic.is_none() {
+            // paces a TCP one, the carrier (a reserve's round trips are
+            // not the carrier's).
+            if path.quic.is_none() && (!self.multipath || self.carries(path)) {
                 self.pace.lock().unwrap().sample(now.saturating_sub(sent), path.realtime_going(), Instant::now());
             }
         }
@@ -2063,14 +2582,23 @@ mod tests {
         /// names (None: a new one).
         fn start(tablet: &Identity, pc: &str, flow: bool, resumes: Option<String>,
                  stream: impl FnOnce() -> Box<dyn Stream> + Send + 'static) -> std::thread::JoinHandle<Fake> {
+            let said = if flow { json!({"flow": 1}) } else { json!({}) };
+            Fake::start_saying(tablet, pc, said, resumes.map(|id| (id, true)), stream)
+        }
+
+        /// As start(), its hello saying said's fields too, a path for the
+        /// session resumes names (and whether the tablet has no path for
+        /// it: the PC must take this one).
+        fn start_saying(tablet: &Identity, pc: &str, said: Value, resumes: Option<(String, bool)>,
+                        stream: impl FnOnce() -> Box<dyn Stream> + Send + 'static) -> std::thread::JoinHandle<Fake> {
             let server = tablet.server_config(trusting(pc)).unwrap();
             let mut hello = json!({"t": "hello", "name": "tablet", "features": {"sink": 1}});
-            if flow {
-                hello["flow"] = json!(1);
+            for (field, value) in said.as_object().into_iter().flatten() {
+                hello[field] = value.clone();
             }
             std::thread::spawn(move || {
                 let conn = rustls::ServerConnection::new(server).unwrap();
-                let ours = move |_: &str| resumes.clone().map(|id| (id, true));
+                let ours = move |_: &str| resumes.clone();
                 let established = establish(conn.into(), stream(), false, hello, "usb", &ours).unwrap();
                 Fake { conn: established.conn, stream: established.stream, decoder: established.decoder,
                        udp: established.udp, udp_peer: established.udp_peer, sealer: established.sealer, next: 1 }
@@ -2159,6 +2687,15 @@ mod tests {
             let (ours, theirs) = UnixStream::pair().unwrap();
             let faking = Fake::start(&self.tablet, &self.pc_fingerprint, flow, resumes, move || Box::new(theirs));
             let session = self.pc.connect_stream(Box::new(ours), "usb").unwrap();
+            (session, faking.join().unwrap())
+        }
+
+        /// A session (or a path for the one resumes names) on a stream of
+        /// kind, the tablet's hello saying said's fields too: no UDP.
+        fn by_stream(&self, said: Value, resumes: Option<(String, bool)>, kind: &str) -> (Arc<Session>, Fake) {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let faking = Fake::start_saying(&self.tablet, &self.pc_fingerprint, said, resumes, move || Box::new(theirs));
+            let session = self.pc.connect_stream(Box::new(ours), kind).unwrap();
             (session, faking.join().unwrap())
         }
 
@@ -2471,6 +3008,65 @@ mod tests {
             let expected = if bye { "closed by the other side" } else { "detached" };
             assert_eq!(said, expected, "bye: {bye}");
             assert_eq!(session.is_closed(), bye);
+            devices.pc.close();
+        }
+    }
+
+    /// fake pinging its path each 300 ms on a thread, until the sender is
+    /// dropped or its stream fails: then the fake back, and whether it
+    /// failed.
+    fn pinging(mut fake: Fake) -> (mpsc::Sender<()>, std::thread::JoinHandle<(Fake, bool)>) {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let pinging = std::thread::spawn(move || {
+            while stopped.recv_timeout(Duration::from_millis(300)) == Err(mpsc::RecvTimeoutError::Timeout) {
+                if fake.try_send(frame::PING, 0, &0u64.to_be_bytes()).is_err() {
+                    return (fake, true);
+                }
+            }
+            (fake, false)
+        });
+        (stop, pinging)
+    }
+
+    #[test]
+    fn a_peer_from_before_has_one_path_at_a_time_as_before() {
+        // A tablet whose hello says nothing of "paths": a better path takes
+        // over, the one before ends once the tablet is heard on the new
+        // one, the session has one path at a time; that one cut, the
+        // session is detached, with nothing to go on with. The same tablet
+        // saying "paths": 1 keeps the one before as a reserve (pinged), and
+        // the session goes on over it.
+        let _one = one_at_a_time();
+        for paths in [false, true] {
+            let devices = devices();
+            let told = told_ends(&devices.pc);
+            let said = if paths { json!({"paths": 1}) } else { json!({}) };
+            let (session, bt) = devices.by_stream(said.clone(), None, "bt");
+            let bt = pinging(bt);
+            let (again, usb) = devices.by_stream(said, Some((session.id.clone(), false)), "usb");
+            assert!(Arc::ptr_eq(&again, &session), "the same session, another path");
+            let (stop_usb, usb) = pinging(usb);
+            until("on usb", Duration::from_secs(5), || session.path().as_deref() == Some("usb"));
+            let kinds = || session.paths().iter().map(|path| (path.kind.clone(), path.state.name())).collect::<Vec<_>>();
+            if paths {
+                assert_eq!(kinds(), [("usb".to_owned(), "active"), ("bt".to_owned(), "standby")]);
+            } else {
+                assert_eq!(kinds(), [("usb".to_owned(), "active")]);
+                let (_, failed) = bt.1.join().unwrap();
+                assert!(failed, "the bt path not ended");
+            }
+            drop(stop_usb);
+            let (usb, _) = usb.join().unwrap();
+            usb.stream.shutdown();
+            if paths {
+                until("on bt", Duration::from_secs(1), || session.path().as_deref() == Some("bt"));
+                assert_eq!(told.recv_timeout(Duration::from_secs(1)).ok(), None, "detached");
+                assert_eq!(kinds(), [("bt".to_owned(), "active")]);
+                drop(bt.0);
+            } else {
+                assert_eq!(told.recv_timeout(Duration::from_secs(2)).as_deref(), Ok("detached"));
+                assert!(session.paths().is_empty());
+            }
             devices.pc.close();
         }
     }

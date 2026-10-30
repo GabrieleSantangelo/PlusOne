@@ -1092,3 +1092,163 @@ fn a_session_accepted_is_not_cut_by_a_slow_start() {
     pc.close();
     tablet.close();
 }
+
+/// A stream path of kind from pc to tablet (a socket pair, as a cable or a
+/// Bluetooth socket handed over): the session on it (the tablet's kept by
+/// then: a path after it goes on with it), and the PC's end (shut down,
+/// the path ends on both sides at once, as a cable pulled).
+fn stream_path(pc: &Node, tablet: &Node, kind: &str) -> (Arc<plusone_link::Session>, std::os::unix::net::UnixStream) {
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let cut = ours.try_clone().unwrap();
+    let (accepter, taken) = (tablet.clone(), kind.to_owned());
+    std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), &taken).map(|_| ()));
+    let session = pc.connect_stream(Box::new(ours), kind).unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|theirs| theirs.id == session.id));
+    (session, cut)
+}
+
+/// The kinds of session's paths, the carrier first, and its state.
+fn kinds(session: &plusone_link::Session) -> Vec<(String, &'static str)> {
+    session.paths().iter().map(|path| (path.kind.clone(), path.state.name())).collect()
+}
+
+#[test]
+fn a_carrier_lost_hands_over_to_its_reserve_with_nothing_lost() {
+    // Two stream paths: bt, then usb, better, the carrier once heard
+    // throughout 2 s, bt kept as a reserve on both sides. Numbered control
+    // messages there and back (echoed) while the usb path ends on both
+    // sides: the session goes on over bt at once, never detached, the
+    // channel the same; none lost, none twice, in order. (A better path
+    // retired the one before it, and its end left the session with none:
+    // detached on both sides, waiting for the PC to dial.)
+    let (pc, tablet, _address) = pair();
+    let (pc_told, tablet_told) = (told(&pc), told(&tablet));
+    let (session, _bt) = stream_path(&pc, &tablet, "bt");
+    let (by_usb, usb) = stream_path(&pc, &tablet, "usb");
+    assert!(Arc::ptr_eq(&by_usb, &session), "the same session, another path");
+    let reserved = [("usb".to_owned(), "active"), ("bt".to_owned(), "standby")];
+    until("on usb, bt a reserve, on the PC", || kinds(&session) == reserved);
+    until("on usb, bt a reserve, on the tablet", || tablet.sessions().first().is_some_and(|s| kinds(s) == reserved));
+    let control = session.open("echo", "numbered", Class::Control).unwrap();
+    const COUNT: u32 = 3000;
+    let sent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sender = {
+        let (control, sent) = (control.try_clone().unwrap(), sent.clone());
+        std::thread::spawn(move || {
+            for i in 0..COUNT {
+                control.send(&i.to_be_bytes()).unwrap();
+                sent.store(i + 1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        })
+    };
+    let echoed = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        while got.len() < COUNT as usize {
+            match control.recv(&mut buf, WAIT) {
+                Ok(Some(4)) => got.push(u32::from_be_bytes(buf[..4].try_into().unwrap())),
+                other => panic!("after {} back: {other:?}", got.len()),
+            }
+        }
+        got
+    });
+    until("some sent on usb", || sent.load(std::sync::atomic::Ordering::SeqCst) >= 500);
+    let cut = Instant::now();
+    usb.shutdown(std::net::Shutdown::Both).unwrap();
+    until("on bt", || session.path().as_deref() == Some("bt"));
+    let moved = cut.elapsed();
+    let at_cut = sent.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(at_cut < COUNT, "all sent before the cut: send more");
+    sender.join().unwrap();
+    let got = echoed.join().unwrap();
+    if let Some(i) = (0..COUNT as usize).find(|&i| got[i] != i as u32) {
+        panic!("message {i} came back as {} ({at_cut} sent at the cut)", got[i]);
+    }
+    assert!(moved < Duration::from_millis(500), "on bt {moved:?} after the cut");
+    assert_eq!(kinds(&session), [("bt".to_owned(), "active")]);
+    let (usb, bt) = (Some("usb".to_owned()), Some("bt".to_owned()));
+    for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
+        let said: Vec<_> = told.try_iter().map(|(event, path, _)| (event, path)).collect();
+        assert_eq!(said, [("up", bt.clone()), ("moved", usb.clone()), ("moved", bt.clone())], "{side}");
+    }
+    assert!(!session.is_closed());
+}
+
+/// A stream between a and b through a relay that counts the bytes each
+/// way: (a's end, b's end, the counts).
+fn counted() -> (std::os::unix::net::UnixStream, std::os::unix::net::UnixStream, Arc<[std::sync::atomic::AtomicU64; 2]>) {
+    use std::io::{Read, Write};
+    let (a, relay_a) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (b, relay_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let counts: Arc<[std::sync::atomic::AtomicU64; 2]> = Arc::default();
+    for (way, (mut from, mut to)) in [(relay_a.try_clone().unwrap(), relay_b.try_clone().unwrap()), (relay_b, relay_a)]
+        .into_iter().enumerate() {
+        let counts = counts.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16384];
+            while let Ok(n) = from.read(&mut buf) {
+                if n == 0 || to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                counts[way].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = to.shutdown(std::net::Shutdown::Both);
+        });
+    }
+    (a, b, counts)
+}
+
+#[test]
+fn a_reserve_carries_its_pings_and_nothing_else() {
+    // A bt reserve beside a usb carrier carrying a transfer both ways (8 MiB
+    // echoed): on the reserve, each way, a ping a second (37 bytes with
+    // TLS's), nothing more.
+    let (pc, tablet, _address) = pair();
+    let (pcs, tablets, counts) = counted();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "bt").map(|_| ())
+    });
+    let session = pc.connect_stream(Box::new(pcs), "bt").unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|theirs| theirs.id == session.id));
+    let (by_usb, _usb) = stream_path(&pc, &tablet, "usb");
+    assert!(Arc::ptr_eq(&by_usb, &session), "the same session, another path");
+    let reserved = [("usb".to_owned(), "active"), ("bt".to_owned(), "standby")];
+    let started = Instant::now();
+    while kinds(&session) != reserved || tablet.sessions().first().is_none_or(|s| kinds(s) != reserved) {
+        assert!(started.elapsed() < Duration::from_secs(8), "on usb, bt a reserve: not in time: {:?}, the tablet's {:?}",
+                session.paths(), tablet.sessions().first().map(|s| s.paths()));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let before = [0, 1].map(|way| counts[way].load(std::sync::atomic::Ordering::Relaxed));
+    let started = Instant::now();
+    let bulk = session.open("echo", "bulk", Class::Control).unwrap();
+    let reader = {
+        let bulk = bulk.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 17];
+            let mut got = 0;
+            while got < 128 * (64 << 10) {
+                match bulk.recv(&mut buf, WAIT) {
+                    Ok(Some(n)) if n > 0 => got += n,
+                    _ => break,
+                }
+            }
+            got
+        })
+    };
+    let chunk = vec![7u8; 64 << 10];
+    for _ in 0..128 {
+        bulk.send(&chunk).unwrap();
+    }
+    assert_eq!(reader.join().unwrap(), 128 * (64 << 10));
+    std::thread::sleep(Duration::from_secs(3).saturating_sub(started.elapsed()));
+    let seconds = started.elapsed().as_secs_f64();
+    for way in [0, 1] {
+        let bytes = counts[way].load(std::sync::atomic::Ordering::Relaxed) - before[way];
+        assert!(bytes > 0 && bytes as f64 <= 37.0 * (seconds + 2.0), "{bytes} bytes on the reserve in {seconds:.1} s");
+    }
+    assert_eq!(kinds(&session), reserved);
+}
