@@ -1076,8 +1076,10 @@ impl Session {
             return;
         }
         log!("{}: the session is over ({reason})", self.label());
-        if let Some(path) = self.current() {
-            path.stream.shutdown();
+        // Let go of, not only shut: a handle on the session kept anywhere
+        // (a feature's thread, an app's) keeps none of its sockets.
+        if let Some(path) = self.path.lock().unwrap().take() {
+            end_path(&path);
         }
         if let Some(arriving) = self.arriving.lock().unwrap().take() {
             arriving.close();
@@ -1409,6 +1411,9 @@ impl Session {
             let kind = established.kind.clone();
             let reason = self.run_path(established, path, resumed);
             resumed = true;
+            if self.is_closed() {
+                self.path.lock().unwrap().take();  // taken after end() let go of the one before
+            }
             if self.is_closed() || self.closing.load(Ordering::SeqCst) {
                 return;  // close() ends it
             }

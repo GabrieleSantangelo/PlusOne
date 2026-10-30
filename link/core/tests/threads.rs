@@ -67,6 +67,13 @@ fn descriptors() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
 }
 
+/// The process's descriptors that are sockets.
+fn sockets() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().flatten()
+        .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to.to_string_lossy().starts_with("socket:")))
+        .count()
+}
+
 /// A TCP proxy to address (its own address), and what cuts it: both of its
 /// connections shut down, as when the network is lost.
 fn proxy(address: SocketAddr) -> (SocketAddr, impl FnOnce()) {
@@ -124,6 +131,33 @@ fn a_session_over_leaves_no_thread_or_socket_behind() {
     let after = back_to(before);
     assert!(after.0 <= before.0 && after.1 <= before.1,
             "the link's threads and the descriptors: {before:?} before the session, {after:?} after it");
+    pc.close();
+    tablet.close();
+}
+
+#[test]
+fn a_session_held_past_its_end_keeps_none_of_its_sockets() {
+    // A handle on a session kept past its end (a feature's thread, an
+    // app's) kept its path with it: its TCP connection and its UDP
+    // socket (a QUIC path's connection, buffers and all).
+    let _one = one_at_a_time();
+    let (pc, tablet, address) = pair();
+    std::thread::sleep(Duration::from_millis(100));  // the listener's thread up
+    let before = sockets();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let started = Instant::now();
+    while session.rtt().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(5), "UDP never proven");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    session.close();
+    let started = Instant::now();
+    while sockets() > before {
+        assert!(started.elapsed() < Duration::from_secs(5), "{} sockets with the session over and held, {before} before it",
+                sockets());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(session);
     pc.close();
     tablet.close();
 }
