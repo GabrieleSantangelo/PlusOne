@@ -109,6 +109,10 @@ const AT_RATE: f64 = 1.5;
 const HELD_MOST: usize = 4 << 20;
 /// Counts said once a second at most (Seconds).
 const SECOND: Duration = Duration::from_secs(1);
+/// What the streams' readers hand the orderer, at most, before they wait
+/// for it (read()): QUIC's flow control holds the rest, as it did when each
+/// reader handed its messages on itself (a second of a 10 Mbit/s video).
+const READS: usize = 1024;
 
 /// A QUIC connection's groups so far (each connection has its own).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -980,17 +984,19 @@ impl Order {
 /// The other side's groups: each stream read by a task of its own as it
 /// comes, their messages handed to on in the streams' order (Order: one
 /// task calls it; on the runtime, it must not block), until the connection
-/// is over. A stream reset ends its reader at once (its credit back to the
-/// other side). A control stream's frames to control, if we take one (both
+/// is over. READS of them at most on their way to the orderer: past that,
+/// the readers wait (the other side's flow control), never more memory. A
+/// stream reset ends its reader at once (its credit back to the other
+/// side). A control stream's frames to control, if we take one (both
 /// hellos said so), else it is stopped.
 pub(crate) async fn read<F, C>(conn: Connection, on: Arc<F>, control: Option<Arc<C>>)
 where F: Fn(Bytes) + Send + Sync + 'static, C: Fn(u8, u16, Vec<u8>) + Send + Sync + 'static {
-    let (reads, read) = mpsc::unbounded_channel();
+    let (reads, read) = mpsc::channel(READS);
     tokio::spawn(order(read, on, conn.remote_address()));
     while let Ok(stream) = conn.accept_uni().await {
         let index = stream.id().index();
         let (stop, stopped) = oneshot::channel();
-        if reads.send(Read::Taken(index, stop)).is_err() {
+        if reads.send(Read::Taken(index, stop)).await.is_err() {
             return;
         }
         tokio::spawn(read_stream(stream, index, reads.clone(), stopped, control.clone()));
@@ -999,7 +1005,7 @@ where F: Fn(Bytes) + Send + Sync + 'static, C: Fn(u8, u16, Vec<u8>) + Send + Syn
 
 /// The streams' messages to on in order (Order), until no reader is left;
 /// its counts said once a second while groups come.
-async fn order<F: Fn(Bytes)>(mut reads: mpsc::UnboundedReceiver<Read>, on: Arc<F>, remote: SocketAddr) {
+async fn order<F: Fn(Bytes)>(mut reads: mpsc::Receiver<Read>, on: Arc<F>, remote: SocketAddr) {
     let mut order = Order::default();
     let mut seconds = Seconds::new(std::time::Instant::now(), order.stats);
     let mut wake: Option<std::time::Instant> = None;
@@ -1031,13 +1037,14 @@ async fn order<F: Fn(Bytes)>(mut reads: mpsc::UnboundedReceiver<Read>, on: Arc<F
 /// stopped once the orderer gives it up. A control stream's frames to
 /// control instead (never given up: its first bytes are read before that
 /// is looked at).
-async fn read_stream<C>(mut stream: RecvStream, index: u64, reads: mpsc::UnboundedSender<Read>,
+async fn read_stream<C>(mut stream: RecvStream, index: u64, reads: mpsc::Sender<Read>,
                         mut stop: oneshot::Receiver<()>, control: Option<Arc<C>>)
 where C: Fn(u8, u16, Vec<u8>) + Send + Sync + 'static {
     let mut head = [0u8; LENGTH];
     let first = stream.read_exact(&mut head).await;
     if first.is_ok() && head == CONTROL_MARK {
-        let _ = reads.send(Read::End(index, End::Control));
+        let _ = reads.send(Read::End(index, End::Control)).await;
+        drop(reads);
         if let Some(control) = control {
             read_control(&mut stream, &*control).await;
         }
@@ -1057,7 +1064,7 @@ where C: Fn(u8, u16, Vec<u8>) + Send + Sync + 'static {
         };
         match next {
             Ok(message) => {
-                if reads.send(Read::Message(index, message)).is_err() {
+                if reads.send(Read::Message(index, message)).await.is_err() {
                     return;
                 }
             }
@@ -1065,7 +1072,7 @@ where C: Fn(u8, u16, Vec<u8>) + Send + Sync + 'static {
                 if end == End::Cut {
                     let _ = stream.stop(VarInt::from_u32(0));
                 }
-                let _ = reads.send(Read::End(index, end));
+                let _ = reads.send(Read::End(index, end)).await;
                 return;
             }
         }
