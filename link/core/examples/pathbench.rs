@@ -22,7 +22,9 @@
 //! was first made); and the picture's: key (the encoder's keyframes so
 //! many times VBV_FRAMES), ramp (s: the bitrate's target rising from
 //! RAMP_FROM of the budget's share to all of it, a picture starting to
-//! move: changes up, each a keyframe).
+//! move: changes up, each a keyframe); and the link's: room (what the
+//! desktop takes the link to hold of realtime, so many times what it
+//! does: past 1, keyframes it took to fit cut all the same).
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
 //!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S
 //!             [--variant NAME[:KEY=VALUE...]]...]
@@ -318,7 +320,8 @@ impl Told {
 /// reckoned from the last ones made and backed off once the link cut one
 /// (false: at VBV_FRAMES, as l36 was first made). And the picture: the
 /// encoder's keyframes key times VBV_FRAMES; the bitrate's target ramping
-/// up over ramp seconds.
+/// up over ramp seconds. And the link: what the desktop takes it to hold
+/// of realtime, room times what it does.
 #[derive(Clone, Debug)]
 struct Variant {
     name: String,
@@ -331,12 +334,13 @@ struct Variant {
     fit: bool,
     key: f64,
     ramp: f64,
+    room: f64,
 }
 
 impl Variant {
     fn new(name: &str, l36: bool) -> Variant {
         Variant { name: name.into(), l36, hold: HOLD, start: l36, pay: 0.0, depth: ALLOWANCE_FRAMES, fits: FITS,
-                  fit: l36, key: 1.0, ramp: 0.0 }
+                  fit: l36, key: 1.0, ramp: 0.0, room: 1.0 }
     }
 
     /// NAME[:KEY=VALUE...], as --variant has it.
@@ -356,6 +360,7 @@ impl Variant {
                 "fit" => variant.fit = value != 0.0,
                 "key" => variant.key = value,
                 "ramp" => variant.ramp = value,
+                "room" => variant.room = value,
                 _ => panic!("--variant: no key {key}"),
             }
         }
@@ -441,7 +446,9 @@ impl Rate {
 /// keyframes so many times VBV_FRAMES (it makes them as it likes: live,
 /// two or three times); v.ramp: the bitrate's target rising from RAMP_FROM
 /// of the budget's share to all of it over so many seconds (a picture
-/// starting to move; the budget told as it is).
+/// starting to move; the budget told as it is); v.room: what the desktop
+/// takes the link to hold, so many times what it does (past 1, the link
+/// cuts what it took to fit: the back-off's case).
 /// examples/tablet asks for a keyframe as DisplaySession.kt does (a frame
 /// whole while an older one came in part; then at each frame that is not
 /// one, 250 ms apart), and answers each frame whole. What the tablet shows:
@@ -551,7 +558,7 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
         }
         // Into the encoder, or not.
         let queued = session.queued() as f64;
-        let holds = (budget * 125.0 * LATE).min(LINK_ROOM) * TOLD;
+        let holds = (budget * 125.0 * LATE).min(LINK_ROOM) * TOLD * v.room;
         let fits = |size: f64, queued: f64| budget <= 0.0 || queued + size <= holds || queued <= ALONE;
         if fix {
             flying = key_at.is_some_and(|k| now - k < KEY_FLYING_MOST && queued > after_key);
