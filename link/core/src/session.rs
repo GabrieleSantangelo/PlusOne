@@ -74,9 +74,19 @@ const MAX_PATHS: usize = 3;
 /// once carried nothing meanwhile).
 const HYSTERESIS: Duration = Duration::from_secs(2);
 /// A kind whose path failed, or went suspect while it carried, is not
-/// made the carrier again for this long, while another is left: a Wi-Fi
-/// coming and going does not take the session along each time.
+/// made the carrier again for this long, while another is left (again
+/// from each time it goes suspect as a reserve meanwhile): a Wi-Fi coming
+/// and going does not take the session along each time.
 const FLAP_HOLD: Duration = Duration::from_secs(60);
+/// A better reserve takes the carrier's place only just heard (this
+/// recently: its pings come each PING_EVERY, and the session's thread
+/// wakes for each), not up to a second after, maybe a second into its
+/// network's silence.
+const UPGRADE_HEARD: Duration = Duration::from_millis(300);
+/// The carrier suspect, a reserve heard this recently takes its place
+/// (each is pinged each PING_EVERY): one as silent as the carrier, nearly,
+/// is no better.
+const RESERVE_HEARD: Duration = Duration::from_millis(1200);
 /// A pong this recent over UDP: datagrams go both ways.
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
@@ -1857,10 +1867,14 @@ impl Session {
 
     /// The reserve that takes the carrier's place: the best heard lately
     /// (rank()), one held (FLAP_HOLD) only if no other is; the carrier
-    /// lost, any left rather than none (one suspect, one being let go of).
+    /// suspect, only one heard within RESERVE_HEARD (the other side stalled
+    /// a moment, every path is about as silent: none taken, its next ping
+    /// says); the carrier lost, any left rather than none (one suspect, one
+    /// being let go of).
     fn best_reserve(&self, paths: &Paths, carrier_lost: bool) -> Option<usize> {
         paths.lives.iter().enumerate().skip(if carrier_lost { 0 } else { 1 })
-            .filter(|(_, live)| carrier_lost || (live.leaving.is_none() && live.suspect_since.is_none()))
+            .filter(|(_, live)| carrier_lost || (live.leaving.is_none() && live.suspect_since.is_none()
+                                                 && live.path.silent() < RESERVE_HEARD.as_micros() as u64))
             .max_by_key(|(_, live)| (live.leaving.is_none(), live.suspect_since.is_none(), !paths.held(&live.path.kind),
                                      live.path.rank()))
             .map(|(index, _)| index)
@@ -2012,8 +2026,9 @@ impl Session {
             let ready = held.map_or(live.steady_since + HYSTERESIS, |held| held.max(live.steady_since + HYSTERESIS));
             if now < ready {
                 soon(ready, &mut next);
-            } else if best.is_none_or(|best| live.path.rank() > paths.lives[best].path.rank()) {
-                best = Some(index);
+            } else if live.path.silent() < UPGRADE_HEARD.as_micros() as u64
+                && best.is_none_or(|best| live.path.rank() > paths.lives[best].path.rank()) {
+                best = Some(index);  // else at its next ping (it wakes the round)
             }
         }
         if let Some(best) = best {
@@ -2134,7 +2149,7 @@ impl Session {
     /// on any of them or for the next thing due (until, at the latest);
     /// what came taken. The paths lost meanwhile, and why.
     fn round(self: &Arc<Self>, paths: &mut Paths, until: Option<Instant>, plain: &mut [u8]) -> Vec<(usize, Lost)> {
-        let lives = &mut paths.lives;
+        let Paths { lives, held, .. } = paths;
         let mut lost = Vec::new();
         let mut paced = None;
         if !lives[0].conn.wants_write() {
@@ -2239,6 +2254,10 @@ impl Session {
                     log!("{}: the {} path ({}) is suspect: nothing heard for {:.1} s", self.label(), live.path.kind,
                          live.path.id, silent as f64 / 1e6);
                     live.suspect_since = Some(now);
+                    // A reserve of a kind held, gone silent again: held on.
+                    if index > 0 && held.get(&live.path.kind).is_some_and(|at| now.duration_since(*at) < FLAP_HOLD) {
+                        held.insert(live.path.kind.clone(), now);
+                    }
                 } else if let Some(since) = live.suspect_since.take() {
                     log!("{}: the {} path ({}) heard again, suspect for {:.1} s", self.label(), live.path.kind,
                          live.path.id, now.duration_since(since).as_secs_f64());
