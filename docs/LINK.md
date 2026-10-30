@@ -364,6 +364,62 @@ the Wi-Fi 1.6 s later (realtime's and control's gap), and every one of the
 1500 control messages came back, in order; plugged in again, the session
 went back to the cable and the Wi-Fi path was let go.
 
+### Paths taken down under a load
+
+`tools/switchbench.sh SCENARIO` (stage 9's yardstick): the PC and the
+tablet in two containers on three Docker networks, lan (40 Mbit/s, 4 ms),
+p2p (100 Mbit/s, 1 ms) and bt (1 Mbit/s, 15 ms, carried by socat between
+a UNIX socket on each side: a stream path with no IP, as an RFCOMM socket
+handed over is, its room about RFCOMM's); `link/core/examples/switchbench`
+on each side. The PC's side sends a desktop's video (8 Mbit/s, or 0.85 of
+the path's budget: about 430 kbit/s on bt), its sound (5 ms packets, Opus
+under 8 Mbit/s of budget) and control messages, the tablet's the pen's
+input; the PC's side makes the paths as plus-one-link does (the first that
+answers, in order, at once when the session has none and each second
+after). Twenty times a path is taken down (every packet lost both ways:
+`drop`; the PC's interface down: `link`; dropped, and both ends' TCP
+connections destroyed: `kill`, a cable pulled), held down 10 s and brought
+back; each side records its events and every frame, packet and message,
+and `tools/switchbench-summary.py` gives each cycle's numbers and their
+median and worst: how soon the path was suspect, failed, left; the video's
+gap (no frame shown: whole and decodable, a keyframe or the frame after
+one), frames lost and broken, keyframes; the sound's longest gap (lost,
+or more than 150 ms late); input and control messages lost, the latest;
+the threads and descriptors of each side at the start and the end. The
+scenarios: `wifi` (the path the session is on taken down, the other Wi-Fi
+up: lan, then p2p, in turn), `bt` (lan taken down, only bt to fall back
+on; lan tried again from bt each 2 s), `flap` (lan down 2 s, up 2 s, ten
+times in a row, twice).
+
+At 8bae6a7 (2026-10-30; TCP, as plus-one-link by default), median (worst)
+of 20 cycles:
+
+| Scenario | Failed | On another path | Video gap | Frames lost | Sound's gap | Control's latest |
+|---|---|---|---|---|---|---|
+| wifi, drop | 5.0 s | 5.8 s (6.6) | 5.8 s (6.6) | 348 (394) | 5.8 s (6.6) | 5.8 s (6.6) |
+| wifi, link | 5.0 s | 5.0 s (5.1) | 5.1 s (5.1) | 303 (304) | 5.1 s (5.1) | 5.0 s (5.1) |
+| wifi, kill | 9 ms | 0.8 s (1.5) | 0.8 s (1.5) | 46 (91) | 0.8 s (1.5) | 0.8 s (1.5) |
+| bt, drop | 5.0 s | 6.6 s (6.7) | 6.9 s (7.0) | 396 (400) | 6.6 s (6.7) | 6.7 s (6.7) |
+| bt, kill | 9 ms | 1.6 s (1.6) | 1.7 s (1.8) | 96 (98) | 1.6 s (1.6) | 1.6 s (1.6) |
+| flap, drop | never | never | 2.1 s (3.1) | 123 (124) | 2.1 s (2.1) | 3.3 s (3.3) |
+
+Every cycle that left its path was detached on both sides (one path at a
+time: nothing to go on with until another is made, and none is made before
+the session has lost its own), after the 5 s of silence unless the stream
+ended (kill); an interface down is not seen. The cycles from lan waited
+1.5 s more, the dial of the lan that was down; from p2p, killed, the
+session was on lan 34 ms later, a gap of 71 ms. None of the control
+messages was lost, the pen's input lost was all of the gap's, a keyframe
+or two each cycle; threads and descriptors the same after 20 cycles as at
+the start, on both sides. Back on lan from bt, once lan is up: 78 ms
+(145), a frame lost and one broken, 20 ms of sound. Flapping, one cycle in
+ten took 1 s more to come back (its frames and sound lost meanwhile), and
+in one the pen's input that went over TCP while UDP was not proven again
+came 1-1.8 s late, handed on after newer input that came by UDP (286
+messages older than one before them). How the bench is made:
+`tools/switchbench.sh`'s head; each cycle's numbers: `cycles.jsonl` among
+its logs (`SWITCHBENCH_OUT`).
+
 ## Phases
 
 1. The core (`link/`): session, channels, keys, liveness over TCP and UDP;

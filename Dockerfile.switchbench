@@ -1,0 +1,6 @@
+# Paths taken down and back under a load (tools/switchbench.sh): two of
+# these on three Docker networks of their own, each shaping its way out
+# with tc, the Bluetooth-like stream between them carried by socat.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 socat \
+    && rm -rf /var/lib/apt/lists/*
