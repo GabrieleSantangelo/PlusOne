@@ -2,6 +2,11 @@
 
 ## Unreleased (1.0)
 
+- **The cable waits for the app asleep**: a tablet plugged in as Plus
+  One's accessory while its app did not answer (not allowed yet, or not
+  installed) had plus-one-link wake every second to look again, for as
+  long as it stayed plugged in. It now sleeps until the app answers or
+  the cable is pulled.
 - **One tablet slow to reach holds up no other**: plus-one-link reached
   one tablet at a time, all tablets together: one whose last address
   answered slowly made every other wait, up to about 19 s, and again at

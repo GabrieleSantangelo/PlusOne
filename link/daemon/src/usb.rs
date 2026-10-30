@@ -34,6 +34,10 @@ const STRINGS: [&str; 6] = ["Plus One", "Plus One", "The tablet as the PC's seco
 /// quarter of the calls for the same bytes (a call costs about as much as
 /// a 16 KiB transfer).
 const CHUNK: usize = 64 << 10;
+/// The app's READY waited for with no timeout (usbfs's 0): nothing wakes
+/// meanwhile, however long no app answers; the cable pulled ends the read
+/// (usbfs kills the transfer: an error).
+const READY_WAIT: u32 = 0;
 const USBDEVFS_CONTROL: libc::c_ulong = 0xC018_5500;
 const USBDEVFS_BULK: libc::c_ulong = 0xC018_5502;
 const USBDEVFS_CLAIMINTERFACE: libc::c_ulong = 0x8004_550F;
@@ -174,22 +178,7 @@ pub fn open_accessory(device: &Device) -> io::Result<std::os::unix::net::UnixStr
         let done = unsafe { libc::ioctl(fd.as_raw_fd(), USBDEVFS_BULK, &mut transfer) };
         if done < 0 { Err(io::Error::last_os_error()) } else { Ok(done as usize) }
     };
-    // The app first: it says so once it has the accessory open (the user
-    // may still be answering Android's question), and again until answered.
-    // Until then, or the cable gone, nothing is sent.
-    let mut buf = vec![0u8; CHUNK];
-    let number = loop {
-        match bulk(&fd, inward, buf.as_mut_ptr(), buf.len(), 1000) {
-            Ok(n) => {
-                if let Some(number) = plusone_link::stream::usb_number(plusone_link::stream::USB_READY, &buf[..n]) {
-                    break number;
-                }
-                // An attempt's leftovers from before: dropped.
-            }
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e),
-        }
-    };
+    let number = ready(|buf, timeout| bulk(&fd, inward, buf.as_mut_ptr(), buf.len(), timeout))?;
     let mut go = plusone_link::stream::USB_GO.to_vec();
     go.extend_from_slice(&number);
     bulk(&fd, outward, go.as_mut_ptr(), go.len(), 2000)?;
@@ -216,6 +205,26 @@ pub fn open_accessory(device: &Device) -> io::Result<std::os::unix::net::UnixStr
             Ok(())
         },
         CHUNK)
+}
+
+/// The app's READY on the accessory, read(buf, timeout in ms) reading it:
+/// its number. The app first: it says so once it has the accessory open
+/// (the user may still be answering Android's question), and again until
+/// answered. Until then, or the cable gone, nothing is sent.
+fn ready(mut read: impl FnMut(&mut [u8], u32) -> io::Result<usize>) -> io::Result<[u8; 8]> {
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        match read(&mut buf, READY_WAIT) {
+            Ok(n) => {
+                if let Some(number) = plusone_link::stream::usb_number(plusone_link::stream::USB_READY, &buf[..n]) {
+                    return Ok(number);
+                }
+                // An attempt's leftovers from before: dropped.
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The cable, watched: accessories bridged to sessions (connect: the
@@ -271,3 +280,33 @@ impl Watcher {
 
 /// How often the bus is looked at.
 pub const EVERY: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn waiting_for_the_app_wakes_for_nothing() {
+        // An accessory with no app answering: its READY waited for in reads
+        // of a second each, for as long as it stayed plugged in (a wakeup
+        // each second). Read as usbfs reads: one with a timeout ends with
+        // it, one with none only with something read or the cable pulled
+        // (here after 2 s).
+        let started = Instant::now();
+        let pulled = Duration::from_secs(2);
+        let mut reads = 0;
+        let result = ready(|_, timeout| {
+            reads += 1;
+            let left = pulled.saturating_sub(started.elapsed());
+            if timeout != 0 && Duration::from_millis(timeout.into()) < left {
+                std::thread::sleep(Duration::from_millis(timeout.into()));
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(left);
+            Err(io::Error::from_raw_os_error(libc::ENODEV))
+        });
+        assert_eq!(result.err().and_then(|e| e.raw_os_error()), Some(libc::ENODEV));
+        assert_eq!(reads, 1, "reads while no app answered, for 2 s");
+    }
+}
