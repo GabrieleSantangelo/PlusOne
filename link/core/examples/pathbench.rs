@@ -635,10 +635,12 @@ fn groups(before: Option<GroupStats>, after: Option<GroupStats>) -> String {
     let (stream, datagram) = (d(after.stream_bytes, b.stream_bytes), d(after.datagram_bytes, b.datagram_bytes));
     let share = stream as f64 / (stream + datagram).max(1) as f64;
     let lost_cut = d(after.lost_after_cut, b.lost_after_cut);
-    format!("groups={} late={} late_kb={:.1} superseded={} late_unsent={} dropped={} credit_waits={} window_full={} \
-             wait_ms={} control={} stream_kb={:.1} lost_kb={:.1} lost_cut_kb={:.1} cuts={} share={:.2} retx_cut_kb={:.1}",
+    format!("groups={} late={} late_kb={:.1} superseded={} late_unsent={} stopped={} resets={} dropped={} \
+             credit_waits={} window_full={} wait_ms={} control={} stream_kb={:.1} lost_kb={:.1} lost_cut_kb={:.1} cuts={} \
+             share={:.2} retx_cut_kb={:.1}",
             d(after.groups, b.groups), d(after.late, b.late), d(after.late_bytes, b.late_bytes) as f64 / 1e3,
-            d(after.superseded, b.superseded), d(after.late_unsent, b.late_unsent), d(after.dropped, b.dropped),
+            d(after.superseded, b.superseded), d(after.late_unsent, b.late_unsent), d(after.stopped, b.stopped),
+            d(after.resets, b.resets), d(after.dropped, b.dropped),
             d(after.credit_waits, b.credit_waits), d(after.window_full, b.window_full), d(after.wait_ms, b.wait_ms),
             d(after.control, b.control), stream as f64 / 1e3, d(after.lost_bytes, b.lost_bytes) as f64 / 1e3,
             lost_cut as f64 / 1e3, d(after.cuts, b.cuts), share, lost_cut as f64 * share / 1e3)
