@@ -46,10 +46,17 @@ connection and the rest.
 
 The session tries what it has candidates for at once, the better ones
 first by a few hundred ms (as Happy Eyeballs), uses the best that answers,
-and keeps at most one other ready (power: a Bluetooth link kept up for
-nothing costs both batteries). A better path showing up (the cable plugged
-in) takes over; the active one going (the Wi-Fi gone) hands over to the
-next. Each path's round trip is measured all along (its pings).
+and keeps the others it has ready (power: a Bluetooth link kept up for
+nothing costs both batteries). With both sides' hellos saying
+`"paths": 1`, a session keeps up to three paths, one of each kind: the
+carrier, and reserves pinged once a second, nothing else. A better path
+showing up (the cable plugged in) is a reserve first, the carrier once it
+was heard throughout 2 s, the one before a reserve (make before break);
+the carrier going (the Wi-Fi gone, or silent 1.5 s) hands over to the
+best reserve at once, no detaching; a kind that failed or went silent
+carrying does not carry again for 60 s while another is left. Each side
+picks its carrier alone and reads every path. Each path's round trip is
+measured all along (its pings).
 
 ## Discovery, with or without multicast
 
@@ -110,8 +117,10 @@ goes over the cable, Wi-Fi Direct or Bluetooth instead.
 - **The hello** says the features each side has, each with its version
   (`{"display": 2, "speakers": 1, ...}`): an older app means a feature
   missing, not "update everything".
-- **Liveness in one place**: a ping each second on the active path; three
-  missed and the path is gone; no path left and the device is gone, for
+- **Liveness in one place**: a ping each second on each path; 1.5 s with
+  nothing heard and the path is suspect (the carrier's place goes to a
+  reserve heard lately), 5 s and it is lost; no path left and the session
+  waits 15 s for another (60 s with a channel open), then is over, for
   every channel at once.
 
 ## Channels
@@ -249,6 +258,7 @@ on all of them).
 | TCP bulk pace (`pace.rs`) | 8 ms of queue, 32 KiB/s at least | measured on a hotspot; the floor lowered on an emulated 3 Mbit/s Wi-Fi |
 | Budget told (`cc.rs` `PUBLISH_CHANGE`, `PUBLISH_EVERY`) | past 10 % of the last told; going up at most every 100 ms, a cut at once; `{"event": "budget"}` to the apps, null on a path with no controller of its own | the design's (architecture §3.11); a condition variable, not a poll: nothing wakes while it holds |
 | Bluetooth's budget (`session.rs` `Drain`, `BT_PRIOR`, `DRAIN_SPAN`) | 0.9 Mbit/s until its stream is measured full; then what it drained over the last second of 200 ms windows one after the other, each full from start to end with more waiting all along (the socket's room filling is no rate), a window ended only with the socket full or nothing waiting; never more than that, told as above | chosen: RFCOMM carries 1-2 Mbit/s; under it the speakers go in Opus (they sent PCM's 1.7 Mbit/s with no budget); derived: a window alone is off by up to half (a bridge's socket holds 8 to 16 KB when full, 25 KB go in 200 ms at 1 Mbit/s); seen: windows ending in a round that had just emptied TLS's buffer locked onto that phase, nothing measured in 2 s of a full stream |
+| A cable's budget (`session.rs` `USB_PRIOR`, `PROBE_AFTER`; `usb.rs` `AOA_SHARE`) | a fifth of the speed its USB link was made at (sysfs; 96 Mbit/s at USB 2's high speed; 80 Mbit/s where it is not known: the app's side) until its stream is measured full, as Bluetooth's; measured under it (the other side reading slowly), 1.5 times higher each 2 s it is not measured again, up to it: a cable has no congestion, its drain is its controller; realtime on a stream with a budget waits up to `REALTIME_WAIT` (150 ms) of what it takes: what its socket took in a window it filled, or its budget if more (1.5 MB on a cable, 256 KiB at least elsewhere) | measured (2026-10-27): USB 2's high speed by accessory 17.5 MB/s one way, 18.7 each way at once (0.29 of 480 Mbit/s); chosen: a fifth, over the desktop's 20 Mbit/s; seen (live, 2026-10-30): with no budget the desktop followed its own reports, a third off at each frame lost, 3-11 Mbit/s on the cable; and the cable's rate taken from what its socket took while a keyframe filled its little room (what went on it, not what it carries) dropped each keyframe's tail: every keyframe the tablet asked for on the cable came after such drops on the PC |
 | Screen's bitrate on QUIC (`appdisplay.py`) | 0.85 of the controller's rate, as the budget is told (it read it once a second); down once it no longer fits in 95 % of the budget (less the others'), at once (`HOLD` 0; `PLUSONE_L36_HOLD_MS` holds it, on Intel's encoders only, where a change is a keyframe), up by 15 % at least and 2 s after its last change; a stream starts at 0.85 of the budget, not at the most | chosen; the start: from the most, the first second on a budget under it left out frames (half of them from 20 Mbit/s on 10), then a keyframe to go down; a frame lost asks for a keyframe, it no longer cuts the bitrate (a third each, 20 to 4 Mbit/s in 4 s on a hotspot taking 36); measured: each change of the bitrate is a keyframe (Intel's VA encoders, vah264lpenc and vaapih264enc, start a new sequence), at each cut and at each step up of 5 % before; the hold: live, 61 cuts of 30 % in 10 minutes on a good Wi-Fi, most taken back within the second, 51 bitrate changes, so a second at first; then on the grid's chain (adsl, lossy, spikes, 30 runs each, against the desktop before l36), with keyframes made once they fit: hold 0, frames shown 1.9 points fewer, keyframes 10 fewer in 30 s, the delay's p99 3 ms lower; 500 ms, 3.3 fewer, 13, 6 ms higher; 1 s, 4.8 fewer |
 | Frames within the budget (`appdisplay.py` `Allowance`) | a bucket filling at 95 % of the budget less the others', 5 frames deep; a frame is encoded only while it is not in debt | chosen: over the budget (until a change's keyframe goes, a hold, a budget under the least bitrate, keyframes asked faster than the room left pays for them) whole frames are left out, none late; never more than the budget |
 | Keyframes forced (`appdisplay.py` `force_keyframe`, `_bitrate`) | not while the last one, whatever made it, still waits to go out (more waits than went after it, 0.5 s at most): the app's ask is left (it asks again), a change of bitrate on Intel's encoders made with the first frame in after it; an ask within 1.5 round trips and the keyframe's own time (the last one's at the budget, if longer than four frames at the bitrate) of the last keyframe sent, or asked for, is left too; an ask within 250 ms (the app's own gap between asks), the keyframe's time out and two round trips of the last one going, the link having dropped realtime since it went (its count, as `devices()`' `dropped`, in the answer to `queued` the desktop asks as the keyframe goes), weighed even when the gap above leaves it unanswered, once: that keyframe lost, the next made at half the bitrate (on Intel's the change is that keyframe; up again 2 s on, as far as its keyframe fits) and alone, the frames after it left out until it is out | chosen; live: 67 of 73 asks within 3 s of a cut, a bitrate change's keyframe and the app's answered one into the same queue; live (2026-10-30, a video starting in a browser): 0 fps for 8 s, an ask every 270 ms, each answered with a keyframe the link cut, none whole; an ask alone is no proof (a frame lost on the air after a keyframe that came whole asks too); on the grid's chain where the link holds half what the desktop takes it to (pathbench `room=2`), keyframes twice the reckoning (10 runs of adsl, hotspot, lossy, spikes): frames shown 75.7 %, 1 s of 30 frozen, 13 keyframes backed off, where before l36 18.2 % (19 s) and l36 as it was 16.3 % (19 s); weighed only past the gap, 66.7 % |
@@ -435,6 +445,106 @@ control every 200 ms on "echo", the cable pulled: the session went on over
 the Wi-Fi 1.6 s later (realtime's and control's gap), and every one of the
 1500 control messages came back, in order; plugged in again, the session
 went back to the cable and the Wi-Fi path was let go.
+
+### Paths taken down under a load
+
+`tools/switchbench.sh SCENARIO` (stage 9's yardstick): the PC and the
+tablet in two containers on three Docker networks, lan (40 Mbit/s, 4 ms),
+p2p (100 Mbit/s, 1 ms) and bt (1 Mbit/s, 15 ms, carried by socat between
+a UNIX socket on each side: a stream path with no IP, as an RFCOMM socket
+handed over is, its room about RFCOMM's); `link/core/examples/switchbench`
+on each side. The PC's side sends a desktop's video (8 Mbit/s, or 0.85 of
+the path's budget: about 430 kbit/s on bt), its sound (5 ms packets, Opus
+under 8 Mbit/s of budget) and control messages, the tablet's the pen's
+input; the PC's side makes the paths as plus-one-link does (the first that
+answers, in order, at once when the session has none and each second
+after). Twenty times a path is taken down (every packet lost both ways:
+`drop`; the PC's interface down: `link`; dropped, and both ends' TCP
+connections destroyed: `kill`, a cable pulled), held down 10 s and brought
+back; each side records its events and every frame, packet and message,
+and `tools/switchbench-summary.py` gives each cycle's numbers and their
+median and worst: how soon the path was suspect, failed, left; the video's
+gap (no frame shown: whole and decodable, a keyframe or the frame after
+one), frames lost and broken, keyframes; the sound's longest gap (lost,
+or more than 150 ms late); input and control messages lost, the latest;
+the threads and descriptors of each side at the start and the end. The
+scenarios: `wifi` (the path the session is on taken down, the other Wi-Fi
+up: lan, then p2p, in turn), `bt` (lan taken down, only bt to fall back
+on; lan tried again from bt each 2 s), `flap` (lan down 2 s, up 2 s, ten
+times in a row, twice).
+
+At 8bae6a7 (2026-10-30; TCP, as plus-one-link by default), median (worst)
+of 20 cycles:
+
+| Scenario | Failed | On another path | Video gap | Frames lost | Sound's gap | Control's latest |
+|---|---|---|---|---|---|---|
+| wifi, drop | 5.0 s | 5.8 s (6.6) | 5.8 s (6.6) | 348 (394) | 5.8 s (6.6) | 5.8 s (6.6) |
+| wifi, link | 5.0 s | 5.0 s (5.1) | 5.1 s (5.1) | 303 (304) | 5.1 s (5.1) | 5.0 s (5.1) |
+| wifi, kill | 9 ms | 0.8 s (1.5) | 0.8 s (1.5) | 46 (91) | 0.8 s (1.5) | 0.8 s (1.5) |
+| bt, drop | 5.0 s | 6.6 s (6.7) | 6.9 s (7.0) | 396 (400) | 6.6 s (6.7) | 6.7 s (6.7) |
+| bt, kill | 9 ms | 1.6 s (1.6) | 1.7 s (1.8) | 96 (98) | 1.6 s (1.6) | 1.6 s (1.6) |
+| flap, drop | never | never | 2.1 s (3.1) | 123 (124) | 2.1 s (2.1) | 3.3 s (3.3) |
+
+Every cycle that left its path was detached on both sides (one path at a
+time: nothing to go on with until another is made, and none is made before
+the session has lost its own), after the 5 s of silence unless the stream
+ended (kill); an interface down is not seen. The cycles from lan waited
+1.5 s more, the dial of the lan that was down; from p2p, killed, the
+session was on lan 34 ms later, a gap of 71 ms. None of the control
+messages was lost, the pen's input lost was all of the gap's, a keyframe
+or two each cycle; threads and descriptors the same after 20 cycles as at
+the start, on both sides. Back on lan from bt, once lan is up: 78 ms
+(145), a frame lost and one broken, 20 ms of sound. Flapping, one cycle in
+ten took 1 s more to come back (its frames and sound lost meanwhile), and
+in one the pen's input that went over TCP while UDP was not proven again
+came 1-1.8 s late, handed on after newer input that came by UDP (286
+messages older than one before them). How the bench is made:
+`tools/switchbench.sh`'s head; each cycle's numbers: `cycles.jsonl` among
+its logs (`SWITCHBENCH_OUT`).
+
+With reserves (stage 9's P3, 2026-10-30, at 95bd0ed; bt's at f15d805, the
+same handover): the session keeps a path of each kind it is given, the
+best the carrier, the others pinged once a second; the bench's dialer
+keeps one of each kind of the scenario up while the session has one
+(`SWITCHBENCH_RESERVE=1`: plus-one-link does not dial reserves itself
+yet). Median (worst) of 20 cycles, 8bae6a7 → reserves:
+
+| Scenario | On another path | Video gap | Frames lost | Sound's gap | Control's latest | Detached |
+|---|---|---|---|---|---|---|
+| wifi, kill | 0.8 s (1.5) → 9 ms (10) | 0.8 s (1.5) → 20 ms (54) | 46 (91) → 0 (1) | 0.8 s (1.5) → 5 ms (15) | 0.8 s (1.5) → 5 ms (10) | every cycle → never |
+| wifi, drop | 5.8 s (6.6) → 1.5 s (1.5) | 5.8 s (6.6) → 1.6 s (1.8) | 348 (394) → 92 (93) | 5.8 s (6.6) → 1.5 s (1.6) | 5.8 s (6.6) → 1.5 s (1.5) | every cycle → never |
+| bt, kill | 1.6 s (1.6) → 9 ms (9) | 1.7 s (1.8) → 28 ms (91) | 96 (98) → 0 (1) | 1.6 s (1.6) → 5 ms (15) | 1.6 s (1.6) → 22 ms (30) | every cycle → never |
+| flap, drop | never → in 1 cycle of 20 | 2.1 s (3.1) → 17 ms (1.6 s) | 123 (124) → 0 (93) | 2.1 s (2.1) → 0 (1.6 s) | 3.3 s (3.3) → 5 ms (1.5 s) | never → never |
+
+A path killed (its streams ended on both sides), the session is on its
+reserve 9 ms later, the time the system takes to tell; the video's gap
+54 ms at the 95th percentile on Wi-Fi, 82 ms on Bluetooth, no
+"Reconnecting…", no control message lost or late past 30 ms. The frame
+lost in some cycles is the one on its way on the network killed: nothing
+carried a copy of it (duplication is P5's). A path gone silent (drop) is
+left once suspect, 1.5 s (the system's events and a faster suspect are
+P4's). Flap here is p2p, the carrier, flapping (`SWITCHBENCH_FLAP=p2p`):
+its first outage moves the session to lan, and `FLAP_HOLD` keeps it there
+through the 19 others (17 ms, a frame's time: nothing lost); with lan
+flapping as the reserve (the default), nothing at all (17 ms, 0 lost).
+From bt the session is back on lan once its hold is over, 50 s after lan
+came back (60 s after it failed). Threads and descriptors the same at the
+start, at most and at the end of every run, on both sides. Moving from bt
+back to lan, about 10 ms of the pen's input still on bt's stream (3
+messages) is handed on after newer input that came over lan's UDP: input
+on a stream has no counter (P5's sealed frames on streams).
+
+The cable (`tools/switchbench.sh cable`, 10 cycles, 2026-10-30): a usb
+stream path (400 Mbit/s, the session's end of it with a bridge's little
+room) pulled (its streams ended at both ends at once) and plugged back
+4 s later, lan up, reserves kept. Each time the session is on the cable
+again 2.47 s after it is back (2.49 at worst: HYSTERESIS and its next
+ping; with `FLAP_HOLD` on the cable it stayed a reserve 60 s after each
+pull, as live); pulled, on lan 9 ms after, the video's gap 38 ms (55 at
+worst), half a frame lost (the one on its way), the sound's 7.5 ms. On
+the cable once back: no frame lost, broken or late, no sound missing;
+the pen's input both ways (2 messages lost at the pull, those on the
+killed stream; one handed on after newer each time, as from bt).
 
 ## Phases
 

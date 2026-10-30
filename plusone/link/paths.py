@@ -74,14 +74,15 @@ class Paths:
 
     def _state(self, device, path):
         """A path's state, as plus-one-link tells it ("path" events,
-        devices' "paths"): kept (a failed one forgotten), logged as it gets
-        in trouble or out of it. Under _lock."""
+        devices' "paths"): kept (a failed one forgotten, and one let go of:
+        closed), logged as it gets in trouble or out of it (a reserve's,
+        "standby", as the one in use's, "active"). Under _lock."""
         if not isinstance(path, dict) or "id" not in path:
             return
         known = dict(self._states.get(device, {}))
         before = known.get(path["id"], {}).get("state")
         state = path.get("state")
-        if state == "failed":
+        if state in ("failed", "closed"):
             known.pop(path["id"], None)
         else:
             known[path["id"]] = path
@@ -91,8 +92,8 @@ class Paths:
             silent = path.get("silent_ms")
             log(f"link: the {name} path ({path['id']}) is {state}"
                 + (f", nothing heard for {silent / 1000:.1f} s" if isinstance(silent, (int, float)) else ""))
-        elif before == "suspect" and state == "active":
-            log(f"link: the {name} path ({path['id']}) is active again")
+        elif before == "suspect" and state in ("active", "standby"):
+            log(f"link: the {name} path ({path['id']}) is {state} again")
 
     def _changed(self):
         self.on_change()

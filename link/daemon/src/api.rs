@@ -5,6 +5,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 fn check(result: libc::c_int) -> io::Result<libc::c_int> {
     if result < 0 { Err(io::Error::last_os_error()) } else { Ok(result) }
@@ -127,14 +128,38 @@ pub fn hang_up(client: RawFd) {
 /// One message to an app, with a descriptor if there is one (ours closes
 /// once sent: the app has its own).
 pub fn send(client: RawFd, message: &serde_json::Value, fd: Option<OwnedFd>) -> io::Result<()> {
+    send_message(client, &message.to_string().into_bytes(), fd.as_ref(), 0)
+}
+
+/// As send(), waiting for room within that long at most: an app that
+/// takes nothing meanwhile fails it (TimedOut), and the descriptor is
+/// closed (it never had it).
+pub fn send_within(client: RawFd, message: &serde_json::Value, fd: Option<OwnedFd>, within: Duration) -> io::Result<()> {
     let bytes = message.to_string().into_bytes();
+    let until = Instant::now() + within;
+    loop {
+        match send_message(client, &bytes, fd.as_ref(), libc::MSG_DONTWAIT) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let left = until.saturating_duration_since(Instant::now());
+                let mut fds = [libc::pollfd { fd: client, events: libc::POLLOUT, revents: 0 }];
+                let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+                if left.is_zero() || (unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } == 0) {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "the app takes nothing"));
+                }
+            }
+            done => return done,
+        }
+    }
+}
+
+fn send_message(client: RawFd, bytes: &[u8], fd: Option<&OwnedFd>, flags: libc::c_int) -> io::Result<()> {
     let mut iov = libc::iovec { iov_base: bytes.as_ptr() as *mut libc::c_void, iov_len: bytes.len() };
     let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
     header.msg_iov = &mut iov;
     header.msg_iovlen = 1;
     let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
     let mut control = vec![0u8; space];
-    if let Some(fd) = &fd {
+    if let Some(fd) = fd {
         header.msg_control = control.as_mut_ptr() as *mut libc::c_void;
         header.msg_controllen = space as _;
         unsafe {
@@ -146,7 +171,7 @@ pub fn send(client: RawFd, message: &serde_json::Value, fd: Option<OwnedFd>) -> 
         }
     }
     loop {
-        let sent = unsafe { libc::sendmsg(client, &header, libc::MSG_NOSIGNAL) };
+        let sent = unsafe { libc::sendmsg(client, &header, libc::MSG_NOSIGNAL | flags) };
         if sent >= 0 {
             return Ok(());
         }

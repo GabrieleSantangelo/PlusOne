@@ -26,6 +26,111 @@
   stream starts at what the link takes, not at the most. (Holding the
   bitrate for a second at each cut, to ride out those taken back, left
   out more frames than the keyframes it saved.)
+- **A connection lost, the session goes on over another at once**: the
+  PC and the tablet kept one connection at a time. Plugging the cable in
+  closed the Wi-Fi's; pulling it, or the Wi-Fi going, left the session
+  with none until plus-one-link reached the tablet again: the tablet said
+  "Reconnecting…", the desktop and the sound stopped for 1-2 s when the
+  cable or Bluetooth was pulled, 5 s or more when the network went
+  silent. Now they keep up to three at once, one of each kind (the cable,
+  Wi-Fi Direct, the network, Bluetooth): the one in use, and the others
+  ready, each checked once a second and nothing more. The one in use lost
+  (or silent for 1.5 s), the session goes on over the best of the others
+  at once, with no "Reconnecting…", and nothing said meanwhile lost. A
+  better one coming (the cable) is used once it has worked for 2 s, the
+  one before kept ready. With an app or a plus-one-link from before, one
+  connection at a time, as before.
+- **A connection that comes and goes is not gone back to for a minute**:
+  a connection that failed, or went silent while in use, is still kept
+  ready once it works again, but the session goes back to it only a
+  minute later, or at once if nothing else is left: a Wi-Fi coming and
+  going no longer takes the desktop and the sound along with each of its
+  drops. Not the cable: pulled and plugged back in, it is used again 2 s
+  later each time (it stayed unused for a minute after each pull).
+- **The desktop at its best by cable**: on the cable the desktop's
+  bitrate followed only the tablet's reports, a third off at each frame
+  lost, and frames were lost at each keyframe: the link took the cable
+  for as slow as what went on it, and dropped what would have waited
+  longer than that allowed. The picture ran at 3-11 Mbit/s by cable, 20
+  on Wi-Fi. The cable now has a budget like Bluetooth's, from the speed
+  of its USB link (96 Mbit/s on USB 2) until what the tablet reads is
+  measured, down while the tablet reads slowly and back up once it does
+  again; the desktop and the speakers follow it, and the link lets
+  realtime wait as long as the cable takes to carry it: a keyframe is no
+  longer cut on a cable that carries tens of MB/s. Each cable session
+  says its speed in the log.
+- **The cable carries the next session once the last one let it go**:
+  plus-one-link took a session kept on the cable as a spare connection
+  for over after 5 s, and tried to open the cable again every second
+  while that session still held it, logging "Device or resource busy"
+  each time until the cable was pulled. It now opens the cable again
+  only once the session on it ended; and a cable that cannot be opened
+  is tried again after 1, 2, 4... up to 16 s, and said once.
+- **A session ended over there ends here at once**: when one side
+  ended the session (closed by hand, idle, plus-one-link stopping) and
+  its connection closed in the same moment, its goodbye could go unread:
+  the other side took it for a lost connection, said "Reconnecting…"
+  and waited up to 15 s (60 s with something in use) for it to come
+  back, while plus-one-link kept trying to reach the tablet. The goodbye
+  is now read before the connection's end, and the session ends as
+  asked. A connection that ends with no goodbye is still waited for, as
+  before.
+- **The cable asks a device once each time it is plugged in**: with
+  "use the cable" on, plus-one-link asked anything of Samsung's (a disk,
+  a hub) to become Plus One's accessory, and asked again every 2 s for
+  as long as it stayed plugged in, logging each refusal; so too a tablet
+  that would not switch. A disk, a hub, a keyboard, a webcam or a
+  printer is no longer asked at all, and any other device is asked once,
+  then again only once plugged in again or when "use the cable" is
+  turned on or off. A tablet charging only, with no file transfer and
+  no USB debugging, is still asked, as before.
+- **The cable waits for the app asleep**: a tablet plugged in as Plus
+  One's accessory while its app did not answer (not allowed yet, or not
+  installed) had plus-one-link wake every second to look again, for as
+  long as it stayed plugged in. It now sleeps until the app answers or
+  the cable is pulled.
+- **One tablet slow to reach holds up no other**: plus-one-link reached
+  one tablet at a time, all tablets together: one whose last address
+  answered slowly made every other wait, up to about 19 s, and again at
+  each try while it was away. Each tablet waits only on itself now.
+- **A device that sends and takes nothing is given up**: the link gave
+  up on a connection only once nothing came from the other side for
+  5 s. A device that kept sending but took nothing (stuck, or hostile)
+  kept the connection for good, and the answers to what it sent piled up
+  without end, megabytes of them. Now 5 s with nothing taken is a lost
+  connection too, and those answers never pile up past 256 KiB.
+- **A connection slow to start is not cut as it begins**: the side
+  that takes connections (the tablet's app, or plus-one-link with
+  --listen) gave each 8 s to become a session, and counted what it did
+  after it was one too: a session made late in those 8 s could lose its
+  connection at once, and both sides reconnected. The 8 s now cover the
+  handshake alone, on both sides as before.
+- **A tablet away is looked for once, however often the network
+  flapped**: each time the tablet's session lost its path, plus-one-link
+  started looking for the tablet again, each a second, on top of the
+  looking already going on; a network that came and went left several
+  at once for as long as the tablet was away. There is one now.
+- **No tablet shown connected by a session already over**: a session
+  the tablet ended right as it began (it said goodbye straight after
+  hello) could be kept by plus-one-link all the same, closed: the tablet
+  stayed "connected" in its devices, with no path and nothing to open on
+  it, until another session replaced it. Such a session is no longer
+  kept, and plus-one-link tells the apps it is gone.
+- **A channel the tablet closed goes with the session**: a channel
+  the tablet closed while the feature on the PC was not reading what it
+  had sent kept a thread waiting on that feature, and another holding
+  the whole session, its connection and its sockets with it, past the
+  session's end and for as long as the feature kept the channel unread.
+  Both now go when the session ends, and a session over keeps none of
+  its sockets, whatever still holds on to it.
+- **An app that stops reading holds nothing up**: plus-one-link handed
+  each channel the tablet opened to the app serving its feature waiting
+  as long as it took, so an app that was stuck and no longer read kept,
+  for each channel, a thread, the channel and the tablet's whole session
+  in plus-one-link, for as long as it lived. It has a second now; then
+  the channel is closed (the tablet sees it end) and plus-one-link hangs
+  up on the app, as on one that cannot be told the tablet's news.
+
 - **What carries the desktop**: the pill bottom left on the tablet says
   it too ("PC screen · QUIC · Wi-Fi", "PC screen · TCP · Wi-Fi Direct";
   a cable or Bluetooth has no transport to say), bright for 4 s when the

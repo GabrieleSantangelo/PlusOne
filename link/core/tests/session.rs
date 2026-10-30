@@ -975,6 +975,14 @@ fn slow_session() -> (Node, Node, Arc<plusone_link::Session>) {
 /// in pieces of about RFCOMM's frames (what goes back as fast as it
 /// comes): the session on it.
 fn bluetooth(pc: &Node, tablet: &Node, bytes: u64) -> Arc<plusone_link::Session> {
+    paced_stream(pc, tablet, "bt", bytes, 1024)
+}
+
+/// A stream path of kind from pc to tablet, bridged as a cable's or
+/// Bluetooth's is (stream::bridge: the session's end of it with little
+/// room), that takes bytes a second, chunk at a time, from the PC (what
+/// goes back as fast as it comes): the session on it.
+fn paced_stream(pc: &Node, tablet: &Node, kind: &str, bytes: u64, chunk: usize) -> Arc<plusone_link::Session> {
     let (cable, far) = std::os::unix::net::UnixStream::pair().unwrap();
     cable.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let (mut reading, mut writing) = (cable.try_clone().unwrap(), cable);
@@ -990,10 +998,10 @@ fn bluetooth(pc: &Node, tablet: &Node, bytes: u64) -> Arc<plusone_link::Session>
             std::thread::sleep(Duration::from_micros(data.len() as u64 * 1_000_000 / bytes));
             writing.write_all(data)
         },
-        1024).unwrap();
-    let accepter = tablet.clone();
-    std::thread::spawn(move || accepter.accept_stream(Box::new(far), "bt").map(|_| ()));
-    pc.connect_stream(Box::new(pcs_end), "bt").unwrap()
+        chunk).unwrap();
+    let (accepter, taken) = (tablet.clone(), kind.to_owned());
+    std::thread::spawn(move || accepter.accept_stream(Box::new(far), &taken).map(|_| ()));
+    pc.connect_stream(Box::new(pcs_end), kind).unwrap()
 }
 
 #[test]
@@ -1038,6 +1046,54 @@ fn a_bluetooth_paths_budget_is_what_its_stream_drains() {
         pc.close();
         tablet.close();
     }
+}
+
+#[test]
+fn a_cable_drops_no_realtime_it_drains() {
+    // A cable (20 MB/s, its bridge's room little, as usb.rs makes it) and a
+    // desktop at 3 Mbit/s whose keyframe, 78 KB, comes each 200 ms: a burst
+    // the cable drains in 4 ms. None dropped, all of it back (echoed), and
+    // the cable's budget its prior (80 Mbit/s, no feature asks more) for
+    // the apps to follow. (Its rate taken from what its socket took while
+    // the burst filled its room, 390 KB/s, a keyframe's tail waited longer
+    // than REALTIME_WAIT of it: dropped, each one, as the live cable did;
+    // and no budget, the desktop followed its own reports, a third off at
+    // each frame lost.)
+    let (pc, tablet, _address) = pair();
+    let session = paced_stream(&pc, &tablet, "usb", 20_000_000, 64 << 10);
+    assert_eq!(session.rate(), Some(80_000_000 / 8), "the cable's budget");
+    let realtime = session.open("echo", "video", Class::Realtime).unwrap();
+    const BURSTS: u32 = 15;
+    const PACKETS: u32 = 60;
+    let receiving = {
+        let realtime = realtime.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            let mut got = 0;
+            while let Ok(Some(n)) = realtime.recv(&mut buf, Some(Duration::from_millis(1500))) {
+                if n == 0 {
+                    break;
+                }
+                got += 1;
+                if got == BURSTS * PACKETS {
+                    break;
+                }
+            }
+            got
+        })
+    };
+    for burst in 0..BURSTS {
+        for packet in 0..PACKETS {
+            let mut message = vec![0u8; 1300];
+            message[..4].copy_from_slice(&(burst * PACKETS + packet).to_be_bytes());
+            realtime.send(&message).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let got = receiving.join().unwrap();
+    assert_eq!((got, session.dropped()), (BURSTS * PACKETS, 0), "back, and dropped");
+    let path = session.paths().pop().expect("no path");
+    assert_eq!((path.budget_bps, path.budget_from), (Some(80_000_000), "prior"), "{path:?}");
 }
 
 #[test]
@@ -1400,4 +1456,362 @@ fn a_channel_opens_ahead_of_a_transfer_on_a_slow_quic_path() {
     let longest = |took: &[Duration]| took.iter().max().copied().unwrap();
     assert!(longest(&on) < Duration::from_millis(450), "opens behind a transfer took {on:?} ({off:?} with streams off)");
     assert!(longest(&off) > longest(&on), "streams off as fast as on: {off:?}, {on:?}");
+}
+
+#[test]
+fn a_session_accepted_is_not_cut_by_a_slow_start() {
+    // The listening side shut an accepted connection that was no session
+    // HANDSHAKE_WHOLE (8 s) after it came, by a watch let go of only once
+    // add() was done: a session up already (its handshake late, add()
+    // closing the one before or telling Up meanwhile) had its path cut.
+    // establish() bounds the handshake itself (each read and write under
+    // the same 8 s): no watch now. Here telling Up takes 8.5 s.
+    let (pc_id, pc_fp) = identity();
+    let (tablet_id, tablet_fp) = identity();
+    let tablet = Node::new("tablet", &tablet_id, trusting(&pc_fp)).unwrap();
+    let (detached, left) = mpsc::channel();
+    tablet.on_event(move |event| match event {
+        Event::Up(_) => std::thread::sleep(Duration::from_millis(8500)),
+        Event::Detached(_) => drop(detached.send(())),
+        _ => {}
+    });
+    let address = tablet.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let pc = Node::new("pc", &pc_id, trusting(&tablet_fp)).unwrap();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    assert_eq!(left.recv_timeout(Duration::from_millis(9500)), Err(mpsc::RecvTimeoutError::Timeout),
+               "the tablet's path cut as its session was taken");
+    assert!(session.path().is_some(), "the PC's path cut");
+    pc.close();
+    tablet.close();
+}
+
+/// A stream path of kind from pc to tablet (a socket pair, as a cable or a
+/// Bluetooth socket handed over): the session on it (the tablet's kept by
+/// then: a path after it goes on with it), and the PC's end (shut down,
+/// the path ends on both sides at once, as a cable pulled).
+fn stream_path(pc: &Node, tablet: &Node, kind: &str) -> (Arc<plusone_link::Session>, std::os::unix::net::UnixStream) {
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let cut = ours.try_clone().unwrap();
+    let (accepter, taken) = (tablet.clone(), kind.to_owned());
+    std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), &taken).map(|_| ()));
+    let session = pc.connect_stream(Box::new(ours), kind).unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|theirs| theirs.id == session.id));
+    (session, cut)
+}
+
+/// The kinds of session's paths, the carrier first, and its state.
+fn kinds(session: &plusone_link::Session) -> Vec<(String, &'static str)> {
+    session.paths().iter().map(|path| (path.kind.clone(), path.state.name())).collect()
+}
+
+#[test]
+fn a_carrier_lost_hands_over_to_its_reserve_with_nothing_lost() {
+    // Two stream paths: bt, then usb, better, the carrier once heard
+    // throughout 2 s, bt kept as a reserve on both sides. Numbered control
+    // messages there and back (echoed) while the usb path ends on both
+    // sides: the session goes on over bt at once, never detached, the
+    // channel the same; none lost, none twice, in order. (A better path
+    // retired the one before it, and its end left the session with none:
+    // detached on both sides, waiting for the PC to dial.)
+    let (pc, tablet, _address) = pair();
+    let (pc_told, tablet_told) = (told(&pc), told(&tablet));
+    let (session, _bt) = stream_path(&pc, &tablet, "bt");
+    let (by_usb, usb) = stream_path(&pc, &tablet, "usb");
+    assert!(Arc::ptr_eq(&by_usb, &session), "the same session, another path");
+    let reserved = [("usb".to_owned(), "active"), ("bt".to_owned(), "standby")];
+    until("on usb, bt a reserve, on the PC", || kinds(&session) == reserved);
+    until("on usb, bt a reserve, on the tablet", || tablet.sessions().first().is_some_and(|s| kinds(s) == reserved));
+    let control = session.open("echo", "numbered", Class::Control).unwrap();
+    const COUNT: u32 = 3000;
+    let sent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sender = {
+        let (control, sent) = (control.try_clone().unwrap(), sent.clone());
+        std::thread::spawn(move || {
+            for i in 0..COUNT {
+                control.send(&i.to_be_bytes()).unwrap();
+                sent.store(i + 1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        })
+    };
+    let echoed = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        while got.len() < COUNT as usize {
+            match control.recv(&mut buf, WAIT) {
+                Ok(Some(4)) => got.push(u32::from_be_bytes(buf[..4].try_into().unwrap())),
+                other => panic!("after {} back: {other:?}", got.len()),
+            }
+        }
+        got
+    });
+    until("some sent on usb", || sent.load(std::sync::atomic::Ordering::SeqCst) >= 500);
+    let cut = Instant::now();
+    usb.shutdown(std::net::Shutdown::Both).unwrap();
+    until("on bt", || session.path().as_deref() == Some("bt"));
+    let moved = cut.elapsed();
+    let at_cut = sent.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(at_cut < COUNT, "all sent before the cut: send more");
+    sender.join().unwrap();
+    let got = echoed.join().unwrap();
+    if let Some(i) = (0..COUNT as usize).find(|&i| got[i] != i as u32) {
+        panic!("message {i} came back as {} ({at_cut} sent at the cut)", got[i]);
+    }
+    assert!(moved < Duration::from_millis(500), "on bt {moved:?} after the cut");
+    assert_eq!(kinds(&session), [("bt".to_owned(), "active")]);
+    let (usb, bt) = (Some("usb".to_owned()), Some("bt".to_owned()));
+    for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
+        let said: Vec<_> = told.try_iter().map(|(event, path, _)| (event, path)).collect();
+        assert_eq!(said, [("up", bt.clone()), ("moved", usb.clone()), ("moved", bt.clone())], "{side}");
+    }
+    assert!(!session.is_closed());
+}
+
+/// A stream between a and b through a relay that counts the bytes each
+/// way: (a's end, b's end, the counts).
+fn counted() -> (std::os::unix::net::UnixStream, std::os::unix::net::UnixStream, Arc<[std::sync::atomic::AtomicU64; 2]>) {
+    use std::io::{Read, Write};
+    let (a, relay_a) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (b, relay_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let counts: Arc<[std::sync::atomic::AtomicU64; 2]> = Arc::default();
+    for (way, (mut from, mut to)) in [(relay_a.try_clone().unwrap(), relay_b.try_clone().unwrap()), (relay_b, relay_a)]
+        .into_iter().enumerate() {
+        let counts = counts.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16384];
+            while let Ok(n) = from.read(&mut buf) {
+                if n == 0 || to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                counts[way].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = to.shutdown(std::net::Shutdown::Both);
+        });
+    }
+    (a, b, counts)
+}
+
+#[test]
+fn a_reserve_carries_its_pings_and_nothing_else() {
+    // A bt reserve beside a usb carrier carrying a transfer both ways (8 MiB
+    // echoed): on the reserve, each way, a ping a second (37 bytes with
+    // TLS's), nothing more.
+    let (pc, tablet, _address) = pair();
+    let (pcs, tablets, counts) = counted();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "bt").map(|_| ())
+    });
+    let session = pc.connect_stream(Box::new(pcs), "bt").unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|theirs| theirs.id == session.id));
+    let (by_usb, _usb) = stream_path(&pc, &tablet, "usb");
+    assert!(Arc::ptr_eq(&by_usb, &session), "the same session, another path");
+    let reserved = [("usb".to_owned(), "active"), ("bt".to_owned(), "standby")];
+    let started = Instant::now();
+    while kinds(&session) != reserved || tablet.sessions().first().is_none_or(|s| kinds(s) != reserved) {
+        assert!(started.elapsed() < Duration::from_secs(8), "on usb, bt a reserve: not in time: {:?}, the tablet's {:?}",
+                session.paths(), tablet.sessions().first().map(|s| s.paths()));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let before = [0, 1].map(|way| counts[way].load(std::sync::atomic::Ordering::Relaxed));
+    let started = Instant::now();
+    let bulk = session.open("echo", "bulk", Class::Control).unwrap();
+    let reader = {
+        let bulk = bulk.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 17];
+            let mut got = 0;
+            while got < 128 * (64 << 10) {
+                match bulk.recv(&mut buf, WAIT) {
+                    Ok(Some(n)) if n > 0 => got += n,
+                    _ => break,
+                }
+            }
+            got
+        })
+    };
+    let chunk = vec![7u8; 64 << 10];
+    for _ in 0..128 {
+        bulk.send(&chunk).unwrap();
+    }
+    assert_eq!(reader.join().unwrap(), 128 * (64 << 10));
+    std::thread::sleep(Duration::from_secs(3).saturating_sub(started.elapsed()));
+    let seconds = started.elapsed().as_secs_f64();
+    for way in [0, 1] {
+        let bytes = counts[way].load(std::sync::atomic::Ordering::Relaxed) - before[way];
+        assert!(bytes > 0 && bytes as f64 <= 37.0 * (seconds + 2.0), "{bytes} bytes on the reserve in {seconds:.1} s");
+    }
+    assert_eq!(kinds(&session), reserved);
+}
+
+/// A stream between a and b through a relay that holds what comes while
+/// paused (as a network gone silent a while, what was on its way delivered
+/// as it comes back): (a's end, b's end, the pause).
+fn pausable() -> (std::os::unix::net::UnixStream, std::os::unix::net::UnixStream, Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write};
+    let (a, relay_a) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (b, relay_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for (mut from, mut to) in [(relay_a.try_clone().unwrap(), relay_b.try_clone().unwrap()), (relay_b, relay_a)] {
+        let paused = paused.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16384];
+            let wait = || while paused.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            loop {
+                wait();
+                let n = match from.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => break,
+                };
+                wait();
+                if to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            let _ = to.shutdown(std::net::Shutdown::Both);
+        });
+    }
+    (a, b, paused)
+}
+
+#[test]
+fn a_path_gone_suspect_is_not_made_the_carrier_again_for_a_while() {
+    // p2p (Wi-Fi Direct) the carrier, bt a reserve; p2p silent 2.5 s:
+    // suspect on both sides, and bt the carrier at once. Heard again, p2p
+    // is a reserve, better, but not made the carrier again (it was, 2 s
+    // after, and went with the next silence: a Wi-Fi coming and going took
+    // the session along each time); unless it is the only one left: bt
+    // cut, p2p the carrier at once. Never detached.
+    let (pc, tablet, _address) = pair();
+    let (pc_told, tablet_told) = (told(&pc), told(&tablet));
+    let (session, bt) = stream_path(&pc, &tablet, "bt");
+    let (pcs, tablets, paused) = pausable();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "p2p").map(|_| ())
+    });
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "p2p").unwrap(), &session), "the same session, another path");
+    let theirs = tablet.sessions().pop().unwrap();
+    let on = |kind: &str| session.path().as_deref() == Some(kind) && theirs.path().as_deref() == Some(kind);
+    until("on p2p on both sides", || on("p2p") && session.paths().len() == 2 && theirs.paths().len() == 2);
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    let silent = Instant::now();
+    until("on bt on both sides", || on("bt"));
+    let moved = silent.elapsed();
+    assert!(moved >= Duration::from_millis(1400) && moved < Duration::from_millis(2300), "on bt {moved:?} after the silence");
+    std::thread::sleep(Duration::from_millis(2500).saturating_sub(silent.elapsed()));
+    paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    let reserved = [("bt".to_owned(), "active"), ("p2p".to_owned(), "standby")];
+    until("p2p heard again, a reserve", || kinds(&session) == reserved && kinds(&theirs) == reserved);
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!((kinds(&session), kinds(&theirs)), (reserved.to_vec(), reserved.to_vec()), "p2p the carrier again");
+    let cut = Instant::now();
+    bt.shutdown(std::net::Shutdown::Both).unwrap();
+    until("on p2p, the only one", || on("p2p"));
+    assert!(cut.elapsed() < Duration::from_millis(500), "on p2p {:?} after bt was cut", cut.elapsed());
+    for (side, told) in [("the PC", &pc_told), ("the tablet", &tablet_told)] {
+        let said: Vec<_> = told.try_iter().map(|(event, path, _)| (event, path.unwrap_or_default())).collect();
+        let expected = [("up", "bt"), ("moved", "p2p"), ("moved", "bt"), ("moved", "p2p")].map(|(e, p)| (e, p.to_owned()));
+        assert_eq!(said, expected, "{side}");
+    }
+}
+
+#[test]
+fn a_cable_is_the_carrier_again_each_time_it_is_plugged_back() {
+    // lan the carrier; the cable plugged: a usb path, the carrier once heard
+    // throughout 2 s, on both sides; pulled: lan at once. Plugged back (a
+    // new usb path each time), the carrier again 2 s on, three times; and
+    // gone silent while it carried (the tablet stalled), lan at once, and
+    // the cable the carrier again once heard throughout 2 s. (Each pull
+    // held the cable off the carrier's place for 60 s, as a Wi-Fi that
+    // flaps: it stayed a reserve while the user plugged it again and
+    // again.)
+    let (pc, tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    until("the tablet's session", || tablet.sessions().first().is_some_and(|theirs| theirs.id == session.id));
+    let theirs = tablet.sessions().pop().unwrap();
+    let on = |kind: &str| session.path().as_deref() == Some(kind) && theirs.path().as_deref() == Some(kind);
+    let alone = || session.paths().len() == 1 && theirs.paths().len() == 1;
+    for plug in 1..=3 {
+        let (by_cable, cable) = stream_path(&pc, &tablet, "usb");
+        assert!(Arc::ptr_eq(&by_cable, &session), "plug {plug}: the same session, another path");
+        let plugged = Instant::now();
+        until("on usb on both sides", || on("usb"));
+        assert!(plugged.elapsed() < Duration::from_millis(4500), "plug {plug}: on usb {:?} after", plugged.elapsed());
+        cable.shutdown(std::net::Shutdown::Both).unwrap();
+        let pulled = Instant::now();
+        until("on lan on both sides", || on("lan") && alone());
+        assert!(pulled.elapsed() < Duration::from_millis(500), "plug {plug}: on lan {:?} after", pulled.elapsed());
+    }
+    let (pcs, tablets, paused) = pausable();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "usb").map(|_| ())
+    });
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "usb").unwrap(), &session), "the same session, another path");
+    until("on usb on both sides", || on("usb"));
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    until("on lan on both sides", || on("lan"));
+    paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    let heard = Instant::now();
+    until("on usb again on both sides", || on("usb"));
+    assert!(heard.elapsed() < Duration::from_millis(4500), "on usb {:?} after it was heard again", heard.elapsed());
+    assert!(!session.is_closed());
+}
+
+#[test]
+fn a_session_closed_as_its_carrier_goes_says_bye_over_its_reserve() {
+    // usb the carrier, its stream full (the relay holding what comes, a
+    // transfer under way): the PC closes the session, and usb ends while
+    // its "bye" waits behind the transfer. bt takes the carrier's place
+    // all the same: what usb had not delivered goes again on it, then the
+    // bye, and the tablet's session is over at once. (Closing, the carrier
+    // lost was not replaced: what waited went on bt as it was, numbered
+    // past what the tablet had, which lost that path too; the bye never
+    // came, and the tablet waited for a path.)
+    let (pc, tablet, _address) = pair();
+    let (tell, told) = mpsc::channel();
+    tablet.on_event(move |event| {
+        let said = match event {
+            Event::Detached(_) => "detached".to_owned(),
+            Event::Gone(_, reason) => reason,
+            _ => return,
+        };
+        let _ = tell.send(said);
+    });
+    let (session, _bt) = stream_path(&pc, &tablet, "bt");
+    let (pcs, tablets, paused) = pausable();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "usb").map(|_| ())
+    });
+    let usb = pcs.try_clone().unwrap();
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "usb").unwrap(), &session), "the same session, another path");
+    let theirs = tablet.sessions().pop().unwrap();
+    until("on usb on both sides", || session.path().as_deref() == Some("usb") && theirs.path().as_deref() == Some("usb")
+          && session.paths().len() == 2 && theirs.paths().len() == 2);
+    let sink = session.open("echo", "bulk", Class::Control).unwrap();
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    let filling = std::thread::spawn(move || {
+        let chunk = vec![7u8; 64 << 10];
+        for _ in 0..24 {
+            if sink.send(&chunk).is_err() {
+                break;
+            }
+        }
+        sink
+    });
+    std::thread::sleep(Duration::from_millis(300));  // usb's stream full: the PC's queue waits
+    let closing = {
+        let session = session.clone();
+        std::thread::spawn(move || session.close())
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    usb.shutdown(std::net::Shutdown::Both).unwrap();
+    closing.join().unwrap();
+    assert_eq!(told.recv_timeout(Duration::from_secs(2)).as_deref(), Ok("closed by the other side"));
+    drop(filling.join().unwrap());
 }

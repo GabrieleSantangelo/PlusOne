@@ -128,7 +128,7 @@ class PcmSender:
 
     def follow(self, kbps, now=None):
         """The link's budget (kbit/s; None: a path with no controller of its
-        own, a cable's): Opus at once under OPUS_UNDER, PCM again once over
+        own, TCP's): Opus at once under OPUS_UNDER, PCM again once over
         PCM_OVER (or none) for PCM_AFTER."""
         now = time.monotonic() if now is None else now
         if kbps and kbps < OPUS_UNDER:

@@ -14,11 +14,14 @@
 //!                                QUIC one), transport ("quic", "tcp",
 //!                                "stream": a cable's, Bluetooth's; null
 //!                                with no path), rate_kbps (its
-//!                                controller's, or what Bluetooth's stream
-//!                                drains), dropped, paths (each:
-//!                                id, kind, transport, state "active",
-//!                                "suspect" or "failed", rtt_ms,
-//!                                silent_ms, budget_bps, budget_from)
+//!                                controller's, or what Bluetooth's or a
+//!                                cable's stream drains), dropped, paths (each, the
+//!                                one in use first: id, kind,
+//!                                transport, state "active" (in use),
+//!                                "standby" (a reserve), "suspect",
+//!                                "failed" or "closed" (its last),
+//!                                rtt_ms, silent_ms, budget_bps,
+//!                                budget_from)
 //!   {"op": "connect", "address": "IP:PORT"|"device": ID[, "timeout": S]
 //!    [, "kind": "p2p"|"ap"]}     a session with the tablet there (or with
 //!                                that one, wherever it is): its id; "p2p",
@@ -78,6 +81,9 @@ const REQUEST: usize = 64 << 10;
 const SERVICE: &str = "_plusone-link._tcp.local";
 /// A session with no channel this long: closed.
 const IDLE: Duration = Duration::from_secs(60);
+/// A channel the tablet opened, offered to the app that serves its
+/// feature: this long at most for the app to take it.
+const OFFER_STALL: Duration = Duration::from_secs(1);
 
 struct Daemon {
     node: Node,
@@ -88,12 +94,15 @@ struct Daemon {
     state: PathBuf,
     /// Held while state is read, changed and written again.
     changing: Mutex<()>,
-    finding: Mutex<()>,
+    /// Held while a tablet is reached (reach()): each tablet's its own.
+    finding: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     usb: usb::Watcher,
     /// The USB serial of the device last asked to be an accessory: its
     /// session, when it comes, remembers it.
     switched: Mutex<Option<String>>,
     watchers: Mutex<Vec<Arc<OwnedFd>>>,
+    /// The tablets reached for again now (come_back), each by one thread.
+    coming_back: Mutex<std::collections::HashSet<String>>,
     /// Who serves each feature now (a serial: the last one to ask).
     serving: Mutex<std::collections::HashMap<String, u64>>,
     serial: AtomicU64,
@@ -113,7 +122,8 @@ fn paired_name(entry: &Value) -> &str {
 impl Daemon {
     fn new(node: Node, config: PathBuf, ours: String, state: PathBuf) -> Daemon {
         Daemon { node, config, ours, state, changing: Mutex::default(), finding: Mutex::default(), usb: usb::Watcher::new(),
-                 switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(), serial: AtomicU64::new(0) }
+                 switched: Mutex::default(), watchers: Mutex::default(), coming_back: Mutex::default(),
+                 serving: Mutex::default(), serial: AtomicU64::new(0) }
     }
 
     fn devices(&self) -> Value {
@@ -206,17 +216,22 @@ impl Daemon {
         if !paired(&self.config).contains_key(device) {
             return Err("not a paired tablet".into());
         }
-        let _one_at_a_time = self.finding.lock().unwrap();
+        // One at a time for each tablet, not for all: one behind a host
+        // slow to answer (up to 8 s of handshake, 3 of mDNS) holds up none
+        // of the others.
+        let finding = self.finding.lock().unwrap().entry(device.to_owned()).or_default().clone();
+        let _one_at_a_time = finding.lock().unwrap();
         if let Some(session) = self.node.session(device).filter(|s| !s.is_closed() && s.path().is_some()) {
             return Ok(session);  // reached while this waited
         }
         let (id, ours) = (device.to_owned(), self.ours.clone());
-        let looking = std::thread::spawn(move || {
+        // A name of its own (unnamed, it took its caller's: come_back's).
+        let looking = std::thread::Builder::new().name("link-find".into()).spawn(move || {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let mine = |f: &plusone_link::mdns::Found| plusone_link::mdns::announces(f, &id, &ours, now);
             plusone_link::mdns::browse(SERVICE, Duration::from_secs(3), mine).map_err(|e| e.to_string())
                 .and_then(|all| all.into_iter().find(|f| mine(f)).map(|f| f.address).ok_or_else(|| "not found nearby".to_owned()))
-        });
+        }).ok();
         let mut why = Vec::new();
         let remembered: Option<std::net::SocketAddr> =
             self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok());
@@ -237,15 +252,15 @@ impl Daemon {
         if let Some(session) = remembered.and_then(|address| attempt(address, &mut why)) {
             return Ok(session);
         }
-        match looking.join() {
-            Ok(Ok(address)) if Some(address) != remembered => {
+        match looking.map(|looking| looking.join()) {
+            Some(Ok(Ok(address))) if Some(address) != remembered => {
                 if let Some(session) = attempt(address, &mut why) {
                     return Ok(session);
                 }
             }
-            Ok(Ok(_)) => {}  // where the first try was
-            Ok(Err(e)) => why.push(e),
-            Err(_) => why.push("mDNS failed".into()),
+            Some(Ok(Ok(_))) => {}  // where the first try was
+            Some(Ok(Err(e))) => why.push(e),
+            _ => why.push("mDNS failed".into()),
         }
         Err(if why.is_empty() { "not reached".into() } else { why.join("; ") })
     }
@@ -264,26 +279,7 @@ impl Daemon {
     fn watch_usb(self: &Arc<Self>) {
         let me = self.clone();
         let connect: Arc<dyn Fn(std::os::unix::net::UnixStream, &usb::Device) -> Result<String, String> + Send + Sync> =
-            Arc::new(move |stream, _device| {
-                let session = me.node.connect_stream(Box::new(stream), "usb")?;
-                log!("usb: a session with {} by cable", session.name);
-                if let Some(serial) = me.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
-                    me.remember_usb(&serial);
-                }
-                // While it runs on the cable (it may take a moment to move
-                // over): then the cable may carry the next.
-                let since = std::time::Instant::now();
-                let mut on_it = false;
-                while !session.is_closed() {
-                    if session.path().as_deref() == Some("usb") {
-                        on_it = true;
-                    } else if on_it || since.elapsed() > Duration::from_secs(5) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(300));
-                }
-                Ok(session.peer.clone())
-            });
+            Arc::new(move |stream, device| me.by_cable(stream, device));
         loop {
             std::thread::sleep(usb::EVERY);
             let state = self.remembered();
@@ -293,6 +289,29 @@ impl Daemon {
                           &|device| *self.switched.lock().unwrap() = Some(device.serial.clone()),
                           connect.clone());
         }
+    }
+
+    /// A session made on the accessory's stream (or a path for the one
+    /// there is): its device id. Taken to carry what the cable's speed
+    /// says until what it drains is measured (usb::Device::prior; the
+    /// session's own prior for a cable if not known), said once. The
+    /// session goes on over the cable (the carrier or a reserve) until its
+    /// stream on it ends: usb.rs waits for that before the cable carries
+    /// the next. (Given up 5 s on with the session not on the cable, a
+    /// reserve that stayed one was taken for over, and the accessory it
+    /// held for free.)
+    fn by_cable(&self, stream: std::os::unix::net::UnixStream, device: &usb::Device) -> Result<String, String> {
+        let (stream, speed): (Box<dyn plusone_link::stream::Stream>, String) = match (device.prior(), device.speed) {
+            (Some(prior), Some(speed)) => (Box::new(plusone_link::stream::Rated::new(stream, prior)),
+                                           format!("{speed} Mbit/s, taken to carry {} until measured", prior * 8 / 1_000_000)),
+            _ => (Box::new(stream), "its speed not known".into()),
+        };
+        let session = self.node.connect_stream(stream, "usb")?;
+        log!("usb: a session with {} by cable ({speed})", session.name);
+        if let Some(serial) = self.switched.lock().unwrap().take().filter(|s| !s.is_empty()) {
+            self.remember_usb(&serial);
+        }
+        Ok(session.peer.clone())
     }
 
     fn remember_usb(&self, serial: &str) {
@@ -376,16 +395,26 @@ impl Daemon {
             let channel = incoming.channel;
             let event = json!({"event": "incoming", "device": incoming.session.peer, "feature": channel.feature,
                                "channel": channel.name, "class": channel.class.name(), "id": channel.id});
-            // The app gone meanwhile: the channel closes with ours.
-            let _ = api::send(client.as_raw_fd(), &event, Some(channel.into_fd()));
+            // The app gone meanwhile: the channel closes with ours. One
+            // that takes nothing for OFFER_STALL (stuck, not reading) would
+            // hold this thread, the channel and its session for as long as
+            // it lives: it loses the channel and is hung up on, as a
+            // watcher that cannot be told (it sees its end).
+            if let Err(e) = api::send_within(client.as_raw_fd(), &event, Some(channel.into_fd()), OFFER_STALL) {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    log!("an app serving {} took nothing for {} s: hung up on", event["feature"].as_str().unwrap_or(""),
+                         OFFER_STALL.as_secs());
+                }
+                api::hang_up(client.as_raw_fd());
+            }
         });
         Ok((feature, serial))
     }
 
     fn event(self: &Arc<Self>, event: Event) {
         // Not on QUIC, whose controller tells it soon: the path's budget
-        // now (Bluetooth's: what its stream drains, its prior until
-        // measured), or none (TCP, a cable: the apps follow their own way).
+        // now (Bluetooth's, a cable's: what its stream drains, its prior
+        // until measured), or none (TCP: the apps follow their own way).
         let budget = |session: &plusone_link::Session| {
             (!session.by_quic()).then(|| json!({"event": "budget", "device": session.peer,
                                                "kbps": session.rate().map(|rate| rate * 8 / 1000)}))
@@ -433,18 +462,36 @@ impl Daemon {
 
     /// A session's path lost: another made at once, the network's (the
     /// cable's, if it is plugged in, comes by itself: usb.rs), until it
-    /// is on again or over.
+    /// is on again or over. One thread for each tablet, however many
+    /// times its session was detached meanwhile (each a thread of its
+    /// own, a session flapping left several reaching for it each second).
     fn come_back(self: &Arc<Self>, session: Arc<plusone_link::Session>) {
-        let me = self.clone();
-        let _ = std::thread::Builder::new().name("link-come-back".into()).spawn(move || {
-            while !session.is_closed() && session.path().is_none() {
-                match me.reach(&session.peer) {
-                    Ok(_) => return,
-                    Err(e) => log!("{}: not reached yet ({e})", session.name),
+        let (peer, name) = (session.peer.clone(), session.name.clone());
+        drop(session);
+        if !self.coming_back.lock().unwrap().insert(peer.clone()) {
+            return;
+        }
+        let (me, device) = (self.clone(), peer.clone());
+        let spawned = std::thread::Builder::new().name("link-come-back".into()).spawn(move || loop {
+            // Its session (a newer one's too) while it waits for a path.
+            let away = || me.node.session(&device).is_some_and(|s| !s.is_closed() && s.path().is_none());
+            if !away() {
+                let mut coming_back = me.coming_back.lock().unwrap();
+                // Detached again meanwhile: that come_back found this one going.
+                if !away() {
+                    coming_back.remove(&device);
+                    return;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                continue;
             }
+            if let Err(e) = me.reach(&device) {
+                log!("{name}: not reached yet ({e})");
+            }
+            std::thread::sleep(Duration::from_secs(1));
         });
+        if spawned.is_err() {
+            self.coming_back.lock().unwrap().remove(&peer);
+        }
     }
 
     /// One app's connection: its requests, until it goes.
@@ -472,7 +519,7 @@ impl Daemon {
                 "queued" => (self.queued(&request), None),
                 "usb" => match request.get("use").map_or(Some(true), Value::as_bool) {
                     Some(on) => {
-                        self.usb.asked.store(on, Ordering::Relaxed);
+                        self.usb.ask(on);
                         (Ok(json!({"ok": true})), None)
                     }
                     None => (Err("use: true or false".into()), None),
@@ -645,15 +692,21 @@ mod tests {
     /// The tablet's session with the daemon over a stream an app hands it,
     /// as Bluetooth's: its id.
     fn by_bluetooth(daemon: &Arc<Daemon>, tablet: &Node) -> String {
+        bluetooth(daemon, tablet).0
+    }
+
+    /// As by_bluetooth(), and the tablet's end of the stream, to cut it.
+    fn bluetooth(daemon: &Arc<Daemon>, tablet: &Node) -> (String, std::os::unix::net::UnixStream) {
         let (app, _served) = app(daemon);
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cut = theirs.try_clone().unwrap();
         let accepter = tablet.clone();
         std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "bt").map(|_| ()));
         api::send_fds(app.as_raw_fd(), br#"{"op": "stream", "kind": "bt"}"#, &[ours.as_raw_fd()]);
         drop(ours);
         let reply = heard(&app).expect("no reply");
         assert_eq!(reply["ok"], true, "{reply}");
-        reply["device"].as_str().unwrap().to_owned()
+        (reply["device"].as_str().unwrap().to_owned(), cut)
     }
 
     /// The events an app watching hears, until one of each kind in kinds
@@ -669,16 +722,22 @@ mod tests {
 
     /// An app's connection to it, served on a thread of its own.
     fn app(daemon: &Arc<Daemon>) -> (OwnedFd, std::thread::JoinHandle<()>) {
+        let (app, ours) = connection();
+        let daemon = daemon.clone();
+        (app, std::thread::spawn(move || daemon.client(ours)))
+    }
+
+    /// An app's connection: (the app's end, reads waiting 5 s at most;
+    /// the daemon's).
+    fn connection() -> (OwnedFd, OwnedFd) {
         let mut pair = [0; 2];
         assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) }, 0);
-        let (app, ours) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
         let wait = libc::timeval { tv_sec: 5, tv_usec: 0 };
         unsafe {
             libc::setsockopt(pair[0], libc::SOL_SOCKET, libc::SO_RCVTIMEO, &wait as *const libc::timeval as *const libc::c_void,
                              std::mem::size_of::<libc::timeval>() as libc::socklen_t);
         }
-        let daemon = daemon.clone();
-        (app, std::thread::spawn(move || daemon.client(ours)))
+        unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) }
     }
 
     /// The next message the app reads (None: nothing within 5 s, or its end).
@@ -697,6 +756,101 @@ mod tests {
     fn ended(app: &OwnedFd) -> bool {
         let mut byte = 0u8;
         unsafe { libc::recv(app.as_raw_fd(), &mut byte as *mut u8 as *mut libc::c_void, 1, 0) == 0 }
+    }
+
+    /// How many of this process's threads are named so.
+    fn threads(name: &str) -> usize {
+        std::fs::read_dir("/proc/self/task").unwrap().flatten()
+            .filter(|task| std::fs::read_to_string(task.path().join("comm")).is_ok_and(|comm| comm.trim_end() == name))
+            .count()
+    }
+
+    /// Until done, or panics past within.
+    fn until(what: &str, within: Duration, done: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(started.elapsed() < within, "{what}: not in {within:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn reaching_one_tablet_holds_up_no_other() {
+        // One lock for every tablet, held through connecting, TLS and mDNS:
+        // a tablet whose address answers and says nothing held up reaching
+        // any other, here for 5 s (a read's timeout in the handshake).
+        let daemon = daemon("finding");
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        std::fs::write(daemon.config.join("paired.json"), json!({(a.clone()): "A", (b.clone()): "B"}).to_string()).unwrap();
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();  // takes the connection, says nothing
+        daemon.reached(&a, silent.local_addr().unwrap());
+        let held = {
+            let (daemon, a) = (daemon.clone(), a.clone());
+            std::thread::spawn(move || daemon.reach(&a).is_err())
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        assert!(daemon.reach(&b).is_err());  // nowhere to be found
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(4500), "{took:?} behind another tablet's reaching");
+        assert!(held.join().unwrap());
+        drop(silent);
+    }
+
+    #[test]
+    fn a_tablet_away_is_reached_for_by_one_thread() {
+        // Each detach of a session started a thread reaching for the
+        // tablet each second: a session flapping left several at once.
+        let (daemon, tablet) = paired_daemon("away");
+        let (device, cut) = bluetooth(&daemon, &tablet);
+        cut.shutdown(std::net::Shutdown::Both).unwrap();
+        until("the path lost", Duration::from_secs(2), || daemon.node.session(&device).is_some_and(|s| s.path().is_none()));
+        until("reached for", Duration::from_secs(2), || threads("link-come-back") == 1);
+        let session = daemon.node.session(&device).unwrap();
+        for _ in 0..2 {
+            daemon.event(Event::Detached(session.clone()));  // detached again, as a flapping path is
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(threads("link-come-back"), 1, "threads reaching for one tablet");
+        daemon.node.close();
+        tablet.close();
+    }
+
+    #[test]
+    fn an_app_that_reads_nothing_holds_no_channel_offered_to_it() {
+        // An app serving a feature stops reading (its connection full):
+        // each channel the tablet opened for it held a thread of the
+        // link's core, the channel and its whole session, for as long as
+        // the app lived. Now the channel is closed after OFFER_STALL and
+        // the app hung up on.
+        let (daemon, tablet) = paired_daemon("deaf");
+        let (app, ours) = connection();
+        let filling = ours.try_clone().unwrap();
+        let served = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || daemon.client(ours))
+        };
+        assert_eq!(ask(&app, json!({"op": "serve", "feature": "deaf"}))["ok"], true);
+        while api::send_now(filling.as_raw_fd(), &json!({"event": "filler"})).is_ok() {}
+        by_bluetooth(&daemon, &tablet);
+        let session = tablet.sessions().pop().unwrap();
+        let channel = session.open("deaf", "c", Class::Control).unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(channel.recv(&mut buf, Some(Duration::from_secs(3))).unwrap(), Some(0),
+                   "the channel still open, offered to an app that takes nothing");
+        until("the offer's thread over", Duration::from_secs(1), || threads("link-incoming") == 0);
+        served.join().unwrap();
+        let mut unread = 0;
+        loop {
+            let got = unsafe { libc::recv(app.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+            if got <= 0 {
+                assert_eq!(got, 0, "the app not hung up on, after {unread} messages");
+                break;
+            }
+            unread += 1;
+        }
+        daemon.node.close();
+        tablet.close();
     }
 
     #[test]
@@ -859,6 +1013,36 @@ mod tests {
         assert_eq!(device["rate_kbps"], 900, "{device}");
         let path = &device["paths"][0];
         assert_eq!((&path["budget_bps"], &path["budget_from"]), (&json!(900_000), &json!("prior")), "{path}");
+        daemon.node.close();
+        tablet.close();
+    }
+
+    #[test]
+    fn a_cable_path_has_a_budget() {
+        // Its prior until what its stream drains is measured, told with up
+        // as Bluetooth's: a fifth of its USB speed (96 Mbit/s at USB 2's
+        // high speed), or the session's own for a cable (80 Mbit/s) with
+        // its speed not known. The desktop follows it, at its most. (null:
+        // the desktop followed its own reports, a third off at each frame
+        // lost, 3-11 Mbit/s on a cable that carries tens of MB/s.)
+        let (daemon, tablet) = paired_daemon("cable-budget");
+        let (watching, _watched) = app(&daemon);
+        assert_eq!(ask(&watching, json!({"op": "watch"}))["ok"], true);
+        for (speed, kbps) in [(Some(480.0), 96_000), (None, 80_000)] {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let accepter = tablet.clone();
+            std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "usb").map(|_| ()));
+            let id = daemon.by_cable(ours, &usb::accessory_at(speed)).unwrap();
+            let told = events_until(&watching, &["up", "budget"]);
+            assert_eq!((&told["up"]["path"], &told["budget"]["kbps"]), (&json!("usb"), &json!(kbps)), "{speed:?}: {told:?}");
+            let (app, _served) = app(&daemon);
+            let device = &ask(&app, json!({"op": "devices"}))["devices"][0];
+            assert_eq!(device["rate_kbps"], kbps, "{speed:?}: {device}");
+            let path = &device["paths"][0];
+            assert_eq!((&path["budget_bps"], &path["budget_from"]), (&json!(kbps * 1000), &json!("prior")), "{path}");
+            assert_eq!(ask(&app, json!({"op": "close", "device": id}))["ok"], true);
+            events_until(&watching, &["gone"]);
+        }
         daemon.node.close();
         tablet.close();
     }

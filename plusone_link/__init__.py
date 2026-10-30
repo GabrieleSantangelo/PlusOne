@@ -231,9 +231,10 @@ class Link:
 
     def devices(self):
         """The paired tablets: [{"id", "name", "connected", "features",
-        "rtt_ms", "dropped", "paths"}]; each path {"id", "kind", "transport",
-        "state" ("active", "suspect", "failed"), "rtt_ms", "silent_ms",
-        "budget_bps", "budget_from"}."""
+        "rtt_ms", "dropped", "paths"}]; each path, the one in use first,
+        {"id", "kind", "transport", "state" ("active": in use, "standby": a
+        reserve, "suspect"; "failed", "closed": its last), "rtt_ms",
+        "silent_ms", "budget_bps", "budget_from"}."""
         return self._request({"op": "devices"})[0]["devices"]
 
     def connect(self, address=None, device=None, timeout=5.0):
