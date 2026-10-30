@@ -2,6 +2,13 @@
 
 ## Unreleased (1.0)
 
+- **The desktop's frames each on a stream of their own** (test build,
+  `PLUSONE_LINK_VIDEO_STREAMS=0` turns it off): on QUIC a frame of the
+  desktop goes on a QUIC stream of its own, what is lost of it sent again
+  within the congestion control's rate, given up once late or once a
+  keyframe follows; and the link's own messages (a channel opened, its
+  credits) on a stream ahead of the video and of transfers. Each packet
+  went alone before, and a lost one broke its frame.
 - **Fewer stutters on a Wi-Fi that hiccups**: the link's congestion
   control cuts its rate by 30 % now and then on a Wi-Fi's jitter alone,
   and takes it back within the second. Each cut lowered the desktop's

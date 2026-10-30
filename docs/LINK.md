@@ -173,11 +173,13 @@ details:
 
 - **Python** (`plusone_link`, no dependencies):
   ```python
-  from plusone_link import Link, REALTIME
+  from plusone_link import Link, REALTIME, VIDEO
   link = Link()                                   # plus-one-link's socket
   tablet = link.devices()[0]
   video = link.open(tablet, "display", "video", REALTIME)
   video.send(packet); data = video.recv(timeout=0.1); video.fileno()
+  frames = link.open(tablet, "display", "frames", VIDEO)  # groups (q3)
+  frames.send_in_group(number, keyframe, last, piece)     # a frame's piece
   link.serve("speakers", on_channel)              # channels the app opens
   link.watch(on_event)                            # devices, paths
   ```
@@ -311,8 +313,11 @@ turns off what q3 added on QUIC: our hellos say neither "groups" nor
 "control", so a Video channel's groups go as datagrams and the session's
 own messages on its stream alone, both ways (each needs both hellos), and
 the transport takes no unidirectional streams; logged once ("video
-streams off"). The desktop's frames go in groups only once Plus One opens
-its channel as Video and writes each packet's group head.
+streams off"). The desktop's frames go in groups: Plus One opens its
+media channel as Video (`plusone_link.VIDEO`; Realtime from a
+plus-one-link that refuses it) and writes each packet's group head, the
+frame's number its group; with the switch off, or off QUIC, the link takes
+the heads off and the tablet gets what it got before.
 
 `PLUSONE_LINK_DSCP=0` (the process's; on by default) leaves QUIC's
 packets unmarked, as before `dscp.rs`: the endpoint on quinn's own socket,
