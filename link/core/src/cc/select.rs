@@ -1,12 +1,13 @@
 //! Which controller a QUIC path runs, for a live A/B of them:
 //! PLUSONE_LINK_CC, read once (at Node::new), and its tunables,
 //! PLUSONE_LINK_CC_PARAMS="key=value,...". gcc (the default: today's, as it
-//! was), gcc-l23 (with the l23 rules), copa, and quinn's own bbr and
+//! was), gcc-l23 (with the l23 rules), copa, c4, and quinn's own bbr and
 //! cubic as references. A name not known is gcc; a tunable not known, not
 //! a number or out of its safe range keeps its default; each said in the
 //! log, and the controller with all its tunables at start ("congestion
 //! control: NAME KEY=VALUE ..."). Nothing refused stops the link.
 
+use super::c4::C4Params;
 use super::copa::CopaParams;
 use super::GccParams;
 use std::sync::OnceLock;
@@ -15,12 +16,13 @@ use std::sync::OnceLock;
 pub(crate) enum Choice {
     Gcc(GccParams),
     Copa(CopaParams),
+    C4(C4Params),
     Bbr,
     Cubic,
 }
 
 /// The names PLUSONE_LINK_CC takes.
-pub(crate) const NAMES: [&str; 5] = ["gcc", "gcc-l23", "copa", "bbr", "cubic"];
+pub(crate) const NAMES: [&str; 6] = ["gcc", "gcc-l23", "copa", "c4", "bbr", "cubic"];
 
 impl Choice {
     /// The controller named (none: gcc) with its tunables as text
@@ -32,6 +34,7 @@ impl Choice {
             "gcc" => Choice::Gcc(GccParams::default()),
             "gcc-l23" => Choice::Gcc(GccParams { l23: true, ..GccParams::default() }),
             "copa" => Choice::Copa(CopaParams::default()),
+            "c4" => Choice::C4(C4Params::default()),
             "bbr" => Choice::Bbr,
             "cubic" => Choice::Cubic,
             other => {
@@ -60,6 +63,7 @@ impl Choice {
         match self {
             Choice::Gcc(params) => params.set(key, value),
             Choice::Copa(params) => params.set(key, value),
+            Choice::C4(params) => params.set(key, value),
             Choice::Bbr | Choice::Cubic => Err(format!("{} takes none", self.name())),
         }
     }
@@ -69,6 +73,7 @@ impl Choice {
             Choice::Gcc(params) if params.l23 => "gcc-l23",
             Choice::Gcc(_) => "gcc",
             Choice::Copa(_) => "copa",
+            Choice::C4(_) => "c4",
             Choice::Bbr => "bbr",
             Choice::Cubic => "cubic",
         }
@@ -79,6 +84,7 @@ impl Choice {
         let params = match self {
             Choice::Gcc(params) => params.describe(),
             Choice::Copa(params) => params.describe(),
+            Choice::C4(params) => params.describe(),
             Choice::Bbr | Choice::Cubic => "(quinn's own, no tunables)".into(),
         };
         format!("{} {params}", self.name())
@@ -188,6 +194,10 @@ mod tests {
         assert!(choice.describe().contains("delta=0.25"), "{}", choice.describe());
         let (_, notes) = Choice::parse(Some("copa"), Some("delta=0"));
         assert_eq!(notes.len(), 1, "{notes:?}");
+        let (choice, notes) = Choice::parse(Some("c4"), Some("delay_max=40,beta=0.9,wcap=1"));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let Choice::C4(p) = &choice else { panic!("{choice:?}") };
+        assert_eq!((p.delay_max, p.beta, p.wcap), (40.0, 0.25, 1.0));
     }
 
     #[test]

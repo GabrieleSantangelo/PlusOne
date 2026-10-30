@@ -9,6 +9,7 @@
 //! its model). Every packet, datagrams too, goes under its window and
 //! quinn's pacer, as under GCC's.
 
+use super::c4::C4;
 use super::copa::Copa;
 use super::{record, tracing, Budget, Choice, MIN_RATE, PUBLISH_CHANGE, PUBLISH_EVERY, TRACE_EVERY, ACKED_WINDOW};
 use quinn::congestion::{BbrConfig, Controller, ControllerFactory, ControllerMetrics, CubicConfig};
@@ -43,6 +44,7 @@ pub(super) fn build(choice: &Choice, now: Instant, mtu: u16, out: Arc<AtomicU64>
     let describe = choice.describe();
     match choice {
         Choice::Copa(params) => Box::new(Wrapped::new(Copa::new(now, mtu, params.clone()), now, mtu, out, budget, &describe)),
+        Choice::C4(params) => Box::new(Wrapped::new(C4::new(now, mtu, params.clone()), now, mtu, out, budget, &describe)),
         Choice::Bbr => Box::new(Wrapped::new(Reference::bbr(now, mtu), now, mtu, out, budget, &describe)),
         Choice::Cubic => Box::new(Wrapped::new(Reference::cubic(now, mtu), now, mtu, out, budget, &describe)),
         Choice::Gcc(_) => unreachable!("GCC is built on its own"),

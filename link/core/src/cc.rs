@@ -17,10 +17,11 @@
 //! realtime late to be dropped and for the encoders to follow.
 //!
 //! For a live A/B, another controller may run in its place
-//! (PLUSONE_LINK_CC, select.rs): this one with the l23 rules, Copa, or
-//! quinn's BBR and Cubic; each tells the budget, shares the rate,
+//! (PLUSONE_LINK_CC, select.rs): this one with the l23 rules, Copa, C4
+//! (c4.rs, after Huitema's), or quinn's BBR and Cubic; each tells the budget, shares the rate,
 //! records and traces as this one does (shared.rs).
 
+mod c4;
 mod copa;
 mod select;
 mod shared;
