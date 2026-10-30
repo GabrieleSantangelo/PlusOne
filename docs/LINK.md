@@ -254,6 +254,25 @@ queue, its cuts by why); `PLUSONE_LINK_CC_RECORD=FILE` writes every event
 it gets (each acknowledgement's times, losses), a real network's to replay
 in a test.
 
+For a live A/B another controller may govern a side's QUIC paths in its
+place (`cc/select.rs`): `PLUSONE_LINK_CC` is `gcc` (the default, the one
+above as it is), `gcc-l23` (with the l23 rules: a radio's silence and
+its trickle after read as one burst), `copa` (Copa, δ 0.1, the spike's),
+or quinn's own `bbr` and `cubic` as references; `PLUSONE_LINK_CC_PARAMS`
+(`key=value,...`) tunes it: GCC's `threshold_min`, `threshold_max`,
+`threshold_gain`, `k_up`, `k_down`, `overuse_ms`, `overuse_send_time`
+(over-use counted in send time, as WebRTC does), `beta`,
+`queue_limit_ms`, `loss_cut`, and gcc-l23's `silence_ms`, `held_ms`,
+`burst_most_ms`; Copa's `delta`. Both are read once, as the node starts,
+and the log says the controller with all its tunables ("congestion
+control: gcc-l23 threshold_min=6 ..."); a name not known is gcc, a key
+not known or a value out of its range keeps its default, each said in
+the log. Each of them governs every packet of the connection (datagrams
+too) under quinn's pacer, tells the budget from its own window or rate
+(the window a round trip; BBR's pacing rate if less), and writes the same
+trace (its decreases as cuts: by loss when one came in the second before,
+else by trend) and record.
+
 ## Measured
 
 ### The emulated grid, the reference
