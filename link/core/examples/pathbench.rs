@@ -22,9 +22,12 @@
 //! was first made); and the picture's: key (the encoder's keyframes so
 //! many times VBV_FRAMES), ramp (s: the bitrate's target rising from
 //! RAMP_FROM of the budget's share to all of it, a picture starting to
-//! move: changes up, each a keyframe); and the link's: room (what the
-//! desktop takes the link to hold of realtime, so many times what it
-//! does: past 1, keyframes it took to fit cut all the same).
+//! move: changes up, each a keyframe), low (kbit/s: under it the
+//! encoder's keyframes heavier, by the square root of low over the
+//! bitrate, as encoders overshoot), weigh (0: keyframes reckoned from all of the last
+//! three, at any bitrate and age); and the link's: room (what the desktop
+//! takes the link to hold of realtime, so many times what it does: past 1,
+//! keyframes it took to fit cut all the same).
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
 //!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S
 //!             [--variant NAME[:KEY=VALUE...]]...]
@@ -285,6 +288,9 @@ const ALLOWANCE_FRAMES: f64 = VBV_FRAMES + 1.0;
 /// with the packets' extra, by the payload).
 const KEY_SIZES: usize = 3;
 const KEY_BACKOFF: f64 = 0.5;
+/// appdisplay.py's KEY_AGE (two of media.py's periodic keyframes) and KEY_NEAR.
+const KEY_AGE: f64 = 20.0;
+const KEY_NEAR: f64 = 0.5;
 /// A ramp's start: the bitrate's target this much of the budget's share
 /// (live, 8.5 to 20 Mbit/s in 14 s as a video started in a browser, in
 /// four changes).
@@ -319,9 +325,11 @@ impl Told {
 /// the budget (also what the bitrate must stay under); fit, keyframes
 /// reckoned from the last ones made and backed off once the link cut one
 /// (false: at VBV_FRAMES, as l36 was first made). And the picture: the
-/// encoder's keyframes key times VBV_FRAMES; the bitrate's target ramping
-/// up over ramp seconds. And the link: what the desktop takes it to hold
-/// of realtime, room times what it does.
+/// encoder's keyframes key times VBV_FRAMES, and under low kbit/s the
+/// square root of low over the bitrate times that; the bitrate's target ramping up over ramp
+/// seconds; weigh, keyframes made long ago or under KEY_NEAR of the
+/// bitrate reckoned left out of its reckoning. And the link: what the
+/// desktop takes it to hold of realtime, room times what it does.
 #[derive(Clone, Debug)]
 struct Variant {
     name: String,
@@ -335,12 +343,14 @@ struct Variant {
     key: f64,
     ramp: f64,
     room: f64,
+    low: f64,
+    weigh: bool,
 }
 
 impl Variant {
     fn new(name: &str, l36: bool) -> Variant {
         Variant { name: name.into(), l36, hold: HOLD, start: l36, pay: 0.0, depth: ALLOWANCE_FRAMES, fits: FITS,
-                  fit: l36, key: 1.0, ramp: 0.0, room: 1.0 }
+                  fit: l36, key: 1.0, ramp: 0.0, room: 1.0, low: 0.0, weigh: true }
     }
 
     /// NAME[:KEY=VALUE...], as --variant has it.
@@ -361,6 +371,8 @@ impl Variant {
                 "key" => variant.key = value,
                 "ramp" => variant.ramp = value,
                 "room" => variant.room = value,
+                "low" => variant.low = value,
+                "weigh" => variant.weigh = value != 0.0,
                 _ => panic!("--variant: no key {key}"),
             }
         }
@@ -420,6 +432,35 @@ impl Rate {
     }
 }
 
+/// appdisplay.py's _key_worth: a keyframe at kbps as reckoned, in average
+/// frames at it, from the last made (worth, kbit/s, when): the most of
+/// those made within KEY_AGE at KEY_NEAR of kbps or more (weigh false: of
+/// all), floor at least.
+fn key_worth_at(worths: &VecDeque<(f64, f64, f64)>, kbps: f64, now: f64, weigh: bool, floor: f64) -> f64 {
+    worths.iter().filter(|&&(_, made, at)| !weigh || made >= kbps * KEY_NEAR && now - at <= KEY_AGE)
+        .fold(floor, |most, &(worth, _, _)| most.max(worth))
+}
+
+/// appdisplay.py's _key_kbps: the most bitrate up to kbps whose keyframe,
+/// as reckoned at it, takes no more than room (bytes * FPS / 125): each
+/// stretch between the keyframes' bitrates over KEY_NEAR, at its top.
+fn key_kbps(worths: &VecDeque<(f64, f64, f64)>, room: f64, kbps: f64, now: f64, weigh: bool, floor: f64) -> f64 {
+    let mut edges: Vec<f64> = worths.iter().map(|&(_, made, at)| (made / KEY_NEAR, at))
+        .filter(|&(edge, at)| weigh && now - at <= KEY_AGE && edge < kbps).map(|(edge, _)| edge).collect();
+    edges.sort_by(f64::total_cmp);
+    edges.dedup();
+    edges.push(kbps);
+    let (mut best, mut low) = (0.0f64, 0.0f64);
+    for high in edges {
+        let top = high.min(room / key_worth_at(worths, high, now, weigh, floor));
+        if top > low {
+            best = top;
+        }
+        low = high;
+    }
+    best.floor()
+}
+
 /// The desktop after a cut, on a picture that always moves (a frame offered
 /// each 1/60 s, its size the bitrate's average, a keyframe VBV_FRAMES of
 /// them), as appdisplay.py runs it: v.l36 false, before l36 (the bitrate
@@ -434,17 +475,21 @@ impl Rate {
 /// sent, nor those after it until a keyframe; v.start, the first bitrate
 /// the budget's share). v.fit, as appdisplay.py has it since: a keyframe
 /// reckoned at the most of the last KEY_SIZES made (in average frames at
-/// their bitrate, VBV_FRAMES' worth at least), made once it fits behind
+/// their bitrate, VBV_FRAMES' worth at least; v.weigh, only those made
+/// within KEY_AGE at KEY_NEAR of the bitrate or more), made once it fits behind
 /// what waits, and sent only if it still does as it goes (else not, nor
 /// those after it); a bitrate whose keyframe could not fit with nothing
 /// waiting down first (to the one whose does, the change its keyframe; a
 /// change up only so far); an ask within the tablet's gap, the keyframe's
 /// time out and two round trips of one going, the link having dropped
-/// realtime since: the next at KEY_BACKOFF of the bitrate, the frames after
+/// realtime since (weighed even when the gap leaves the ask unanswered,
+/// once): the next at KEY_BACKOFF of the bitrate, the frames after
 /// it left out until it is out (alone); no answer within the last
 /// keyframe's time out and a round trip and a half. v.key: the encoder's
 /// keyframes so many times VBV_FRAMES (it makes them as it likes: live,
-/// two or three times); v.ramp: the bitrate's target rising from RAMP_FROM
+/// two or three times; v.low: under it, the square root of low over the
+/// bitrate times that, as encoders overshoot: still lighter at a lower
+/// bitrate, as theirs are); v.ramp: the bitrate's target rising from RAMP_FROM
 /// of the budget's share to all of it over so many seconds (a picture
 /// starting to move; the budget told as it is); v.room: what the desktop
 /// takes the link to hold, so many times what it does (past 1, the link
@@ -500,11 +545,11 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
     let (mut level, mut level_at) = (f64::NAN, 0.0f64);
     let (mut asks_seen, mut answered, mut held, mut changes) = (0u64, 0u64, 0u64, 0u64);
     let (mut skipped, mut unsent, mut keyframes) = ([0u64; 4], [0u64; 2], 0u64);
-    // v.fit: the last keyframes made (average frames' worth), the last sent
-    // (bytes on the wire), the link's drops as it went, since when the next
-    // goes alone, the keyframes backed off.
+    // v.fit: the last keyframes made (average frames' worth, kbit/s, when),
+    // the last sent (bytes on the wire), the link's drops as it went, since
+    // when the next goes alone, the keyframes backed off.
     let key_worth = VBV_FRAMES * (1.0 + PACKET_EXTRA / payload as f64);
-    let (mut worths, mut key_size, mut key_dropped) = (VecDeque::<f64>::new(), 0.0f64, None::<u64>);
+    let (mut worths, mut key_size, mut key_dropped) = (VecDeque::<(f64, f64, f64)>::new(), 0.0f64, None::<u64>);
     let (mut alone_from, mut cuts) = (None::<f64>, 0u64);
     let mut sent: Vec<(u32, bool, f64, u64)> = Vec::new();  // number, keyframe, when, ns
     let (mut number, mut frame, mut bytes) = (0u32, 0u64, 0f64);
@@ -514,7 +559,6 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
         frame += 1;
         let now = at(Instant::now());
         let budget = told.update(rate_kbps(), now);
-        let worth = worths.iter().copied().fold(key_worth, f64::max);
         let key_time = if key_size > 0.0 {
             key_size / (if budget > 0.0 { budget } else { encoder } * 125.0)
         } else {
@@ -543,17 +587,21 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
             asks_seen += 1;
             if fix && flying {
                 held += 1;
-            } else if now - last_keyframe >= gap {
+                continue;
+            }
+            // The last keyframe cut by the link, asked for again soon after:
+            // weighed even within the gap (the ask comes 250 ms after the
+            // one the keyframe answered), backed off once.
+            let cut = fix && v.fit && key_dropped.is_some_and(|d| session.dropped() > d)
+                && key_at.is_some_and(|k| now <= k + MIN_KEYFRAME_GAP + key_time + 2.0 * rtt.unwrap_or(0.0));
+            if cut {
+                (cuts, key_dropped, alone_from) = (cuts + 1, None, Some(now));
+                let kbps = rate.lower((encoder * KEY_BACKOFF).floor().min(rate.kbps), now);
+                pending = (kbps != encoder).then_some(kbps);
+            }
+            if now - last_keyframe >= gap {
                 (last_keyframe, answered) = (now, answered + 1);
                 if fix { wanted = true } else { key_next = true }
-                // The last keyframe cut by the link, asked for again soon after.
-                let cut = fix && v.fit && key_dropped.is_some_and(|d| session.dropped() > d)
-                    && key_at.is_some_and(|k| now <= k + MIN_KEYFRAME_GAP + key_time + 2.0 * rtt.unwrap_or(0.0));
-                if cut {
-                    (cuts, key_dropped, alone_from) = (cuts + 1, None, Some(now));
-                    let kbps = rate.lower((encoder * KEY_BACKOFF).floor().min(rate.kbps), now);
-                    pending = (kbps != encoder).then_some(kbps);
-                }
             }
         }
         // Into the encoder, or not.
@@ -591,15 +639,18 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
             let key_due = wanted || (broken && now - key_made >= MIN_KEYFRAME_GAP);
             if v.fit && budget > 0.0 && (key_due || pending.is_some()) {
                 // Its keyframe never past what the link holds: down first.
-                let most = ((holds - ALONE) * FPS / (125.0 * worth)).floor().max(MIN_KBPS);
-                if pending.unwrap_or(encoder) > most {
+                let kbps = pending.unwrap_or(encoder);
+                let room = (holds - ALONE) * FPS / 125.0;
+                let most = key_kbps(&worths, room, kbps, now, v.weigh, key_worth).max(MIN_KBPS);
+                if kbps > most {
                     let kbps = rate.lower(most.min(rate.kbps), now);
                     pending = (kbps != encoder).then_some(kbps);
                 }
             }
             if key_due || pending.is_some() {
                 let kbps = pending.unwrap_or(encoder);
-                let size = kbps * 125.0 / FPS * if v.fit { worth } else { key_worth };
+                let worth = if v.fit { key_worth_at(&worths, kbps, now, v.weigh, key_worth) } else { key_worth };
+                let size = kbps * 125.0 / FPS * worth;
                 let room = if v.fit {
                     budget <= 0.0 || queued + size <= holds || kbps <= MIN_KBPS && queued <= ALONE
                 } else {
@@ -626,7 +677,9 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
         // Encoded at once (measured: each frame out before the next goes in).
         let keyframe = key_next || since_key + 1 >= GOP;
         (key_next, since_key) = (false, if keyframe { 0 } else { since_key + 1 });
-        let size = (encoder * 125.0 / FPS * if keyframe { VBV_FRAMES * v.key } else { 1.0 }).max(1.0) as usize;
+        let heavier = if v.low > 0.0 { (v.low / encoder).max(1.0).sqrt() } else { 1.0 };
+        let frames = if keyframe { VBV_FRAMES * v.key * heavier } else { 1.0 };
+        let size = (encoder * 125.0 / FPS * frames).max(1.0) as usize;
         let count = size.div_ceil(payload);
         let wire = size as f64 + count as f64 * PACKET_EXTRA;
         if fix {
@@ -638,7 +691,7 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
                 if worths.len() == KEY_SIZES {
                     worths.pop_front();
                 }
-                worths.push_back(wire * FPS / (encoder * 125.0));
+                worths.push_back((wire * FPS / (encoder * 125.0), encoder, now));
             }
             let queued = session.queued() as f64;
             let room = if keyframe && v.fit {
