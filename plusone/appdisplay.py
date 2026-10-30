@@ -11,6 +11,7 @@ import argparse
 import collections
 import json
 import math
+import os
 import select
 import struct
 import threading
@@ -480,8 +481,10 @@ class RateControl:
     30 % six times a minute on a good Wi-Fi, most of them taken back within
     the second, and each one's keyframe made the frames after it late, lost,
     asked for again. Meanwhile whole frames are left out to stay within the
-    budget (Allowance): fewer frames for that second, none late. Up only by
-    UP at least, UP_AFTER after its last change."""
+    budget (Allowance): fewer frames for that time, none late; with PAY,
+    down sooner once those are worth PAY frames (a keyframe is VBV_FRAMES).
+    Up only by UP at least, UP_AFTER after its last change. HOLD, PAY and
+    FITS as L36 has them."""
 
     SHARE = 0.85    # of a path's budget (its congestion controller's), the video's
     STEADY = 0.05   # up to the most: by this much at least
@@ -490,7 +493,8 @@ class RateControl:
                     # goes 1.5 times what goes through at most: 1.25 held at 9.5 Mbit/s
                     # for 90 s on a hotspot taking 50)...
     UP_AFTER = 2.0  # ...this long (s) after the last change at least
-    HOLD = 1.0      # s: the budget under what the bitrate needs this long before it goes down
+    HOLD = 1.0      # s: the budget under what the bitrate needs this long before it goes down (L36)...
+    PAY = 0         # ...or once the frames left out for it are worth this many (0: never)
     GROWN_MS = 25   # over the least: a queue
     CLEAN = 3       # reports in a row without loss nor queue before going up
     HISTORY = 10    # reports the least is taken over
@@ -501,7 +505,9 @@ class RateControl:
     PROBE_EVERY = 10  # ...after this many clean reports
     CEILING_FOR = 60  # reports (seconds) a ceiling holds
 
-    def __init__(self, most):
+    def __init__(self, most, fps=60, tuning=None):
+        tuning = tuning or L36()
+        self.hold, self.pay, self.fits, self.fps = tuning.hold, tuning.pay if tuning.on else 0, tuning.share, fps
         self.most = most
         self.kbps = most
         self.clean = 0
@@ -512,6 +518,8 @@ class RateControl:
         self.why = None  # what the last change returned was for, for the log
         self.last = None  # the last budget (kbit/s) and the others' share
         self.under = None  # since when the bitrate no longer fits in the budget (time.monotonic())
+        self.over = 0.0  # bytes it went over the budget by since (what the allowance leaves out)
+        self.over_at = None  # (time.monotonic()) counted up to
 
     def report(self, shown, lost, capture_to_decoded, first_to_decoded, skipped=0, budget=None, others=0, now=None):
         """A report, and the frames not encoded since the last; the new
@@ -569,14 +577,18 @@ class RateControl:
         changed, else None."""
         now = time.monotonic() if now is None else now
         self.clean, self.ceiling = 0, None
+        if self.under is not None and self.last is not None:  # over the last budget until now
+            self.over += max(0.0, self.kbps - self.allowed(*self.last)) * 125 * (now - self.over_at)
         self.last = (budget, others)
         target = max(MIN_KBPS, min(self.most, int(budget * self.SHARE - others)))
         if self.kbps <= self.allowed(budget, others):
             self.under = None
         elif self.under is None:
-            self.under = now
+            self.under, self.over = now, 0.0
+        self.over_at = now
         if target < self.kbps:
-            if self.under is None or now - self.under < self.HOLD:
+            paid = self.pay and self.over >= self.pay * self.kbps * 125 / self.fps
+            if self.under is None or now - self.under < self.hold and not paid:
                 return None
         elif (target < self.kbps * self.UP and (target < self.most or target < self.kbps * (1 + self.STEADY))
               or now - self.changed_at < self.UP_AFTER):
@@ -601,11 +613,10 @@ class RateControl:
         """The path has no controller of its own now (TCP, a cable)."""
         self.last = self.under = None
 
-    @classmethod
-    def allowed(cls, budget, others=0):
+    def allowed(self, budget, others=0):
         """What the video may send within a budget (kbit/s): FITS of it,
         less the others'."""
-        return max(0.0, (budget - others) * cls.FITS)
+        return max(0.0, (budget - others) * self.fits)
 
     def _set(self, kbps):
         kbps = max(MIN_KBPS, min(self.most, kbps))
@@ -627,8 +638,8 @@ class Allowance:
 
     DEPTH = media.VBV_FRAMES + 1
 
-    def __init__(self, fps):
-        self.fps = fps
+    def __init__(self, fps, depth=DEPTH):
+        self.fps, self.depth = fps, depth
         self.kbps = None  # what fills it; None: no budget
         self.level = 0.0
         self.at = None
@@ -662,11 +673,84 @@ class Allowance:
                 self.level -= size
 
     def _depth(self, kbps):
-        return kbps * 125 * self.DEPTH / self.fps
+        return kbps * 125 * self.depth / self.fps
 
     def _fill(self, now):
         self.level = min(self._depth(self.kbps), self.level + self.kbps * 125 * max(0.0, now - self.at))
         self.at = now
+
+
+class L36:
+    """How the desktop takes the link's cuts (l36), from the environment as
+    each stream starts: a live A/B without rebuilding, said in the log.
+    PLUSONE_L36=0: as before l36, the bitrate down at once whenever it no
+    longer fits in the budget (a keyframe on Intel's encoders), every frame
+    encoded sent, keyframes made as asked. Else (the default) a cut is first
+    absorbed by whole frames left out within the budget (Allowance), the
+    bitrate down only once it has held, keyframes made once they fit, whole
+    frames to the link. Its knobs, the frames left out (each kept within
+    its range, said if not):
+    PLUSONE_L36_HOLD_MS: how long the budget must stay under the bitrate
+    before it goes down (RateControl.HOLD);
+    PLUSONE_L36_PAY: down sooner once the frames left out for it are worth
+    this many frames at the bitrate (0: never; a change costs a keyframe,
+    media.VBV_FRAMES of them);
+    PLUSONE_L36_DEPTH: the allowance's depth, in frames (past 5, a burst
+    nearly as long as the link holds realtime for: LATE);
+    PLUSONE_L36_FITS: what the video may send of the budget less the
+    others', in percent (never past all of it), and what the bitrate must
+    stay under."""
+
+    # attribute: (environment, default, least, most)
+    KNOBS = {"hold_ms": ("PLUSONE_L36_HOLD_MS", round(RateControl.HOLD * 1000), 0, 3000),
+             "pay": ("PLUSONE_L36_PAY", RateControl.PAY, 0, 30),
+             "depth": ("PLUSONE_L36_DEPTH", Allowance.DEPTH, 1, 5),
+             "fits": ("PLUSONE_L36_FITS", round(RateControl.FITS * 100), 80, 100)}
+
+    def __init__(self, on=True, **knobs):
+        self.on = on
+        self.wrong = []  # what the environment asked that was not taken, for the log
+        for name, (_env, default, least, most) in self.KNOBS.items():
+            setattr(self, name, max(least, min(most, knobs.get(name, default))))
+
+    @classmethod
+    def from_env(cls, environ=None):
+        environ = os.environ if environ is None else environ
+        on = environ.get("PLUSONE_L36", "1").strip() != "0"
+        knobs, wrong = {}, []
+        for name, (env, default, least, most) in cls.KNOBS.items():
+            value = environ.get(env)
+            if value is None:
+                continue
+            try:
+                number = int(value)
+            except ValueError:
+                wrong.append(f"{env}={value} (not a whole number)")
+                continue
+            if not least <= number <= most:
+                wrong.append(f"{env}={value} (kept within {least}-{most})")
+            knobs[name] = number
+        tuning = cls(on, **knobs)
+        tuning.wrong = wrong
+        return tuning
+
+    @property
+    def hold(self):
+        """s; before l36, none."""
+        return self.hold_ms / 1000 if self.on else 0.0
+
+    @property
+    def share(self):
+        """Of the budget less the others', what the video may send."""
+        return self.fits / 100 if self.on else RateControl.FITS
+
+    def describe(self):
+        if not self.on:
+            said = "l36 off (PLUSONE_L36=0): the bitrate down at once, every frame sent"
+        else:
+            said = (f"l36 on, hold {self.hold_ms} ms, pay {self.pay or 'off'}{' frames' if self.pay else ''}, "
+                    f"allowance {self.depth} frames at {self.fits} % of the budget")
+        return said + "".join(f"; {wrong}" for wrong in self.wrong)
 
 
 class LinkPackets:
@@ -811,12 +895,14 @@ class AppStreamer:
         self._feedback = threading.Thread(target=self._listen, daemon=True)
         to = f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams) else "the link"
         log(f"app display: {width}x{height}@{fps} {encoder} {bitrate} kbit/s -> {to}")
+        log(f"app display: {self.l36.describe()}")
 
     def _rates(self, channel, fps, bitrate):
         """What decides which frames go and at what bitrate (not GStreamer's:
         the tests make a streamer of it alone)."""
         self.channel, self.fps = channel, fps
-        self.rate = RateControl(bitrate)
+        self.l36 = L36.from_env()  # PLUSONE_L36=0: as before l36, for a live A/B
+        self.rate = RateControl(bitrate, fps, self.l36)
         self.kbps = bitrate  # the encoder's
         # The stats' thread, the link's budget events, the streaming thread
         # (a bitrate change made with the next frame in).
@@ -828,9 +914,9 @@ class AppStreamer:
         # The path's budget (kbit/s), if its controller is its own (QUIC's):
         # what waits counts against it, and in bytes as they are.
         self._budget_kbps = channel.budget_kbps() if hasattr(channel, "budget_kbps") else None
-        self.allowance = Allowance(fps)
+        self.allowance = Allowance(fps, self.l36.depth)
         if self._budget_kbps:
-            self.allowance.follow(RateControl.allowed(self._budget_kbps))
+            self._follow(self._budget_kbps, 0)
         self._frame = 0
         self._last_keyframe = 0.0  # one asked for, or sent
         self._keyframes = 0  # sent since the last stats
@@ -870,14 +956,22 @@ class AppStreamer:
             return
         others = self._others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
         with self._rate_lock:
-            self.allowance.follow(RateControl.allowed(kbps, others))
+            self._follow(kbps, others)
             changed = self.rate.budget(kbps, others)
             if changed is not None:
                 self._bitrate(changed, self.rate.why)
 
+    def _follow(self, budget, others):
+        """The allowance filling at what the budget leaves the video; before
+        l36, no allowance (every frame went)."""
+        self.allowance.follow(self.rate.allowed(budget, others) if self.l36.on else None)
+
     def _tick(self):
-        """From the listening thread, a few times a second: the bitrate
-        down once the budget has been under it for HOLD."""
+        """From the listening thread, a few times a second, and with each
+        frame in while over the budget: the bitrate down once the budget
+        has been under it for HOLD (or the frames left out pay for it)."""
+        if not self.l36.on:
+            return
         with self._rate_lock:
             changed = self.rate.tick()
             if changed is not None:
@@ -890,7 +984,7 @@ class AppStreamer:
         in made the frames behind it late, and the app asked again."""
         with self._rate_lock:
             self._pending = (kbps, why)
-            if not self._restarts:
+            if not self._restarts or not self.l36.on:
                 self._make_bitrate()
 
     def _make_bitrate(self):
@@ -951,9 +1045,17 @@ class AppStreamer:
         under what the link holds realtime for (quic.rs LATE, 100 ms of the
         same rate): past it the link drops a frame's packets, and the
         frames after are broken.
-        "budget": over the budget's allowance (Allowance)."""
+        "budget": over the budget's allowance (Allowance).
+        Before l36: QUEUE_MS of the budget, 64 KB at least, alone."""
         budget = self._budget_kbps
         queued = self._queued = self.channel.queued()
+        if not self.l36.on:
+            self._key_flying = False
+            most = (min(self.rate.kbps, budget) * QUEUE_MS // 8 if budget
+                    else self.rate.kbps * QUEUE_MS // 8 * TRUESIZE)
+            return "queue" if queued > max(64 << 10, most) else None
+        if self.rate.under is not None:
+            self._tick()  # the hold to the frame, not to the listener's next wake (up to IDLE_WAIT)
         self._key_flying = self._flying(queued, now)
         if budget:
             # And room left for an average frame under what the link holds
@@ -984,7 +1086,9 @@ class AppStreamer:
         (_flying) and the whole of it fits in the link: VBV_FRAMES frames at
         its bitrate. "keyframe" if the frame is left out meanwhile: the app
         waits for one, and a frame that is not one is of no use to it (the
-        queue empties sooner); else None."""
+        queue empties sooner); else None. Before l36, made as asked."""
+        if not self.l36.on:
+            return None
         due = self._key_wanted or (self._broken and now - self._key_made >= MIN_KEYFRAME_GAP)
         change = self._pending is not None
         if not (due or change):
@@ -1029,16 +1133,18 @@ class AppStreamer:
         until a keyframe (decoded against one the app never had, they would
         show garbage: it sees no frame missing that never came at all); the
         keyframe is made as soon as it fits (_keyframe_in). The app keeps
-        the last picture meanwhile, and its frame numbers run on."""
+        the last picture meanwhile, and its frame numbers run on. Before
+        l36, every frame sent."""
         now = time.monotonic()
         payload = getattr(self.channel, "payload", PAYLOAD)
         count = -(-len(data) // payload)
         size = len(data) + count * PACKET_EXTRA
-        if self._broken and not keyframe:
+        on = self.l36.on
+        if on and self._broken and not keyframe:
             self.dropped["broken"] += 1
             return
         budget = self._budget_kbps
-        if budget:
+        if on and budget:
             # What waited as it went in, if that leaves room to spare (the
             # frame comes out before the next goes in); else asked again.
             clear = self._queued + size + ALONE <= self._holds(budget)
@@ -1058,7 +1164,8 @@ class AppStreamer:
         self.allowance.take(size, now)
         if keyframe:  # whatever made it (asked, a bitrate change, the periodic one): it answers the app
             self._key_at, self._after_key = now, 0
-            self._last_keyframe = max(self._last_keyframe, now)
+            if on:
+                self._last_keyframe = max(self._last_keyframe, now)
             self._broken = self._key_wanted = False
         else:
             self._after_key += size
@@ -1106,7 +1213,7 @@ class AppStreamer:
                 dropped, self.dropped = self.dropped, collections.Counter()
                 with self._rate_lock:
                     if budget:
-                        self.allowance.follow(RateControl.allowed(budget, others))  # the others' share moves
+                        self._follow(budget, others)  # the others' share moves
                     kbps = self.rate.report(shown, lost, ms[0] / 10, ms[3] / 10, skipped, budget, others)
                     if kbps is not None:
                         self._bitrate(kbps, self.rate.why)
@@ -1171,7 +1278,10 @@ class AppStreamer:
         if now - self._last_keyframe < gap:
             return
         self._last_keyframe = now
-        self._key_wanted = True  # with the first frame in that it fits with
+        if self.l36.on:
+            self._key_wanted = True  # with the first frame in that it fits with
+        else:
+            self.keyframes.request()
 
 
 def _left_out(stats):

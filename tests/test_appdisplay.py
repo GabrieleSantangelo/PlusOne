@@ -1,6 +1,7 @@
 """The app display's packets: their layout, sealed both ways, replays refused."""
 import collections
 import json
+import os
 import socket
 import struct
 import threading
@@ -11,6 +12,14 @@ import pytest
 
 from plusone import appdisplay  # noqa: E402
 from plusone.link.datagrams import FROM_APP, FROM_PC, Datagrams  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def l36_as_it_ships(monkeypatch):
+    """The desktop as it ships, whatever the shell running the tests set
+    (PLUSONE_L36, its knobs)."""
+    for name in [name for name in os.environ if name.startswith("PLUSONE_L36")]:
+        monkeypatch.delenv(name)
 
 crypto = pytest.importorskip("cryptography.hazmat.primitives.ciphers.aead")
 AESGCM = crypto.AESGCM
@@ -619,6 +628,83 @@ def test_under_a_cut_whole_frames_are_left_out_within_the_budget(monkeypatch):
                                 "whole_to_decoded": [10, 12, 14], "capture_to_sent": 5, "skipped": 13,
                                 "left_out": {"budget": 12, "queue": 1}, "kbps": 8500}).endswith(
         "; 13 not encoded (12 over the budget, 1 the link's queue); 8500 kbit/s")
+
+
+def test_l36_s_switch_and_knobs_are_read_from_the_environment():
+    shipped = appdisplay.L36.from_env({})
+    assert shipped.on and shipped.wrong == [] and shipped.describe().startswith("l36 on, hold ")
+    off = appdisplay.L36.from_env({"PLUSONE_L36": "0", "PLUSONE_L36_HOLD_MS": "300", "PLUSONE_L36_FITS": "90"})
+    assert not off.on and off.hold == 0 and off.share == appdisplay.RateControl.FITS  # the knobs, unused
+    assert off.describe() == "l36 off (PLUSONE_L36=0): the bitrate down at once, every frame sent"
+    tuned = appdisplay.L36.from_env({"PLUSONE_L36": "1", "PLUSONE_L36_HOLD_MS": "300", "PLUSONE_L36_PAY": "6",
+                                     "PLUSONE_L36_DEPTH": "9", "PLUSONE_L36_FITS": "most"})
+    assert (tuned.hold, tuned.pay, tuned.depth, tuned.share) == (0.3, 6, 5, 0.95)
+    assert tuned.describe() == ("l36 on, hold 300 ms, pay 6 frames, allowance 5 frames at 95 % of the budget; "
+                                "PLUSONE_L36_DEPTH=9 (kept within 1-5); PLUSONE_L36_FITS=most (not a whole number)")
+    rate = appdisplay.RateControl(20000, 60, appdisplay.L36(fits=90))
+    assert rate.allowed(10000, 1000) == 8100
+
+
+def test_with_l36_off_the_desktop_runs_as_before_it(monkeypatch):
+    # PLUSONE_L36=0, a live A/B without rebuilding: the bitrate follows the
+    # budget at once (on Intel's, its keyframe at once too), no allowance,
+    # every frame encoded sent, keyframes made as the app asks.
+    monkeypatch.setenv("PLUSONE_L36", "0")
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    assert streamer.allowance.kbps is None  # no allowance
+    streamer._budget(7000)
+    assert streamer.enc.props["bitrate"] == streamer.kbps == 5950 and streamer.allowance.kbps is None
+    assert said[-1].startswith("app display: 8500 -> 5950 kbit/s, as the network takes (the budget 7000")
+    streamer._out(bytes(40000), True, 0)
+    link.waiting = 200 << 10  # the keyframe still waits, past what the link holds of 7 Mbit/s
+    clock.now += 0.3
+    streamer.force_keyframe()
+    assert made == [clock.now] and streamer._asks_held == 0  # another, at once
+    streamer._out(bytes(15000), False, 0)
+    packets = -(-40000 // appdisplay.PAYLOAD) - (-15000 // appdisplay.PAYLOAD)
+    assert streamer.dropped == {} and len(link.sent) == packets  # sent whole all the same
+    # The same, l36 on: held, the change and the frame both.
+    monkeypatch.setenv("PLUSONE_L36", "1")
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    streamer._budget(7000)
+    assert "bitrate" not in streamer.enc.props and streamer.allowance.kbps == 7000 * 0.95
+    streamer._out(bytes(40000), True, 0)
+    link.waiting = 200 << 10
+    clock.now += 0.3
+    assert not frame_in(streamer, clock) and made == []  # left out: the last keyframe still waits
+    streamer._out(bytes(15000), False, 0)
+    assert streamer.dropped == {"late": 1}
+
+
+def test_the_hold_is_a_knob_counted_to_the_frame(monkeypatch):
+    monkeypatch.setenv("PLUSONE_L36_HOLD_MS", "300")
+    clock = Clock()
+    monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(appdisplay, "log", lambda *args: None)
+    streamer = streamer_on(FakeLink(budget=10000), bitrate=8500)
+    streamer._budget(7000)  # 8500 no longer fits in 6650
+    offer_frames(streamer, clock, 0.28)
+    assert streamer.kbps == 8500  # held...
+    offer_frames(streamer, clock, 0.05)
+    assert streamer.kbps == 5950  # ...300 ms: down with that frame, not at the listener's next wake (250 ms)
+
+
+def test_a_deep_cut_goes_down_once_the_frames_left_out_pay_for_its_keyframe():
+    # PLUSONE_L36_PAY: the hold costs the frames left out, the change a
+    # keyframe; past PAY frames' worth, the change is the cheaper.
+    rate = appdisplay.RateControl(20000, 60, appdisplay.L36(hold_ms=1000, pay=4))
+    rate.kbps = 8500
+    assert rate.budget(5000, now=10) is None  # halved: 8500 over 4750 by 3750 kbit/s, 7.8 KB a frame
+    assert rate.tick(now=10.12) is None  # 56 KB over: under 4 frames of 8500 (71 KB)
+    assert rate.tick(now=10.16) == 4250  # 75 KB: down, 160 ms on
+    rate.kbps = 8500
+    assert rate.budget(8800, now=20) is None  # a shallow cut: 140 kbit/s over, a frame's worth in 2 s
+    assert rate.tick(now=20.9) is None
+    assert rate.tick(now=21) == 7480  # the hold's 1 s all the same
+    no_pay = appdisplay.RateControl(20000, 60, appdisplay.L36(hold_ms=1000))
+    no_pay.kbps = 8500
+    no_pay.budget(5000, now=10)
+    assert no_pay.tick(now=10.9) is None
 
 
 def test_frames_not_encoded_for_the_queue_here_lower_the_bitrate():

@@ -251,6 +251,22 @@ on all of them).
 | A frame left out before it is encoded (`appdisplay.py` `QUEUE_MS`) | past 60 ms of the budget waiting (on QUIC, in quinn too), and past what leaves an average frame room under what the link holds (below) | chosen: under the link's 100 ms (`LATE`), past which it drops a frame's packets and the frames after are broken; quinn's were not counted before, and on a hotspot every cut broke frames; the 64 KB at least let in frames the link cut on budgets under 5 Mbit/s |
 | Whole frames to the link (`appdisplay.py` `_out`, `_keyframe_in`) | the link holds realtime up to 100 ms of its rate (no more than quinn's 512 KB), taken as 90 % of that of the budget told; an encoded frame that would not fit whole is not sent, nor those after it until a keyframe; a keyframe (asked for, the stream broken, a bitrate change on Intel's) is made only with a frame in when four frames at its bitrate fit, the frames left out meanwhile if the tablet waits for one | chosen: the link drops late packet by packet, a keyframe's tail, and every frame after it broken; a frame the tablet never had any of, it does not see missing (DisplaySession.kt counts frames that came in part), so those after it are never sent |
 
+`PLUSONE_L36=0` runs the desktop as before the hold, the allowance, the
+keyframes held back and the whole frames of the table above
+(`appdisplay.py` `L36`): the bitrate down at once whenever it no longer
+fits, no allowance, every frame encoded sent, keyframes made as asked; a
+live A/B without rebuilding, read as each stream starts. Its knobs, each
+kept within a safe range: `PLUSONE_L36_HOLD_MS` (0-3000), how long the
+budget must stay under the bitrate before it goes down; `PLUSONE_L36_PAY`
+(0-30, 0 off), down sooner once the frames left out for it are worth that
+many frames at the bitrate; `PLUSONE_L36_DEPTH` (1-5), the allowance's
+depth in frames (5 is about all the link holds realtime for at the
+budget); `PLUSONE_L36_FITS` (80-100), the percent of the budget less the
+others' the video may send, and the bitrate must stay under (100: right
+up to the budget told, never past it). Each stream says which in the log
+("app display: l36 on, hold 1000 ms, pay off, allowance 5 frames at 95 %
+of the budget").
+
 `PLUSONE_LINK_CC_TRACE=1` puts what the controller does in the log four
 times a second (rate, what is acknowledged, trend and threshold, state,
 queue, its cuts by why); `PLUSONE_LINK_CC_RECORD=FILE` writes every event
