@@ -55,9 +55,9 @@ pub(crate) struct NodeInner {
     quic_port: std::sync::atomic::AtomicU16,
     /// Our TCP paths to a device that takes QUIC move to it (upgrade_to_quic).
     quic_upgrade: AtomicBool,
-    /// We read Video's groups on QUIC streams (said in our hello; off: as a
-    /// device from before them, for tests).
-    groups: AtomicBool,
+    /// Video's groups and the session's messages on QUIC streams of their
+    /// own (said in our hello; off: as a device from before them).
+    streams: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -75,14 +75,17 @@ impl NodeInner {
     fn hello(&self) -> Value {
         // flow: control channels flow-controlled (session.rs, WINDOW);
         // quic: the UDP port we take QUIC on, if we do (quic.rs);
-        // groups: a Video channel's groups read on QUIC streams (groups.rs).
+        // groups: a Video channel's groups on QUIC streams, control: copies
+        // of the session's messages on one of their own (groups.rs), each
+        // way if both hellos say so.
         let mut hello = json!({"t": "hello", "name": self.name, "features": self.features(), "flow": 1});
         let port = self.quic_port.load(Ordering::SeqCst);
         if port != 0 {
             hello["quic"] = json!(port);
         }
-        if self.groups.load(Ordering::SeqCst) {
+        if self.streams.load(Ordering::SeqCst) {
             hello["groups"] = json!(1);
+            hello["control"] = json!(1);
         }
         hello
     }
@@ -257,7 +260,7 @@ impl Node {
             quic: Mutex::default(),
             quic_port: std::sync::atomic::AtomicU16::new(0),
             quic_upgrade: AtomicBool::new(false),
-            groups: AtomicBool::new(true),
+            streams: AtomicBool::new(true),
             closed: AtomicBool::new(false),
         })))
     }
@@ -349,11 +352,11 @@ impl Node {
         Ok(bound)
     }
 
-    /// Whether our hellos say we read Video's groups on QUIC streams (on
-    /// unless turned off: off, the other side sends them as Realtime, as to
-    /// a device from before them).
-    pub fn read_groups(&self, on: bool) {
-        self.0.groups.store(on, Ordering::SeqCst);
+    /// Whether our hellos say we take Video's groups and the session's
+    /// messages on QUIC streams of their own (on unless turned off). Off,
+    /// neither goes so either way, as with a device from before them.
+    pub fn video_streams(&self, on: bool) {
+        self.0.streams.store(on, Ordering::SeqCst);
     }
 
     /// Our TCP paths to a device whose hello says it takes QUIC are followed

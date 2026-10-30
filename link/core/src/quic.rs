@@ -7,8 +7,10 @@
 //! datagrams share one rate, the datagrams first in each packet (quinn's
 //! order), and realtime that would wait longer than LATE for the window is
 //! dropped, not queued. A Video channel's groups (a video's frames) go on
-//! unidirectional streams, one each, ahead of the session's stream and
-//! behind the datagrams (groups.rs). The identities are the TCP path's (the same rustls
+//! unidirectional streams, one each, behind the datagrams, and copies of
+//! the session's own messages on one more ahead of all (groups.rs); the
+//! session's stream goes ahead of the groups while it carries no bulk,
+//! behind them with it (bridge). The identities are the TCP path's (the same rustls
 //! configs, pinned both ways). For now the session's own TLS still runs
 //! inside the stream (sealed twice); a later step leaves it to QUIC's.
 
@@ -58,6 +60,12 @@ const AHEAD_LEAST: f64 = 32.0 * 1024.0;
 /// (handed a quarter over the rate, it kept up to SEND_WINDOW unsent: a
 /// second on a 15 Mbit/s path, and a channel's open waited behind it).
 const WINDOW_EVERY: Duration = Duration::from_millis(10);
+/// The session's stream carries bulk once more than this went on it in a
+/// BULK_SPAN: it goes behind the groups then, ahead of them again QUIET
+/// after the last (what quinn holds of the bulk gone by then, near enough).
+const BULK_LEAST: usize = 8 << 10;
+const BULK_SPAN: Duration = Duration::from_millis(100);
+const QUIET: Duration = Duration::from_secs(1);
 /// A connection ID: this many random bytes, then this many of their MAC
 /// (MacCids).
 const CID_NONCE: usize = 8;
@@ -91,11 +99,12 @@ fn transport(cc: Arc<GccConfig>) -> TransportConfig {
     t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     // One bidirectional stream, the dialer's: the session's (architecture
     // §3.14, SEC-19); unidirectional ones, Video's groups (groups.rs),
-    // MAX_STREAMS at once, what comes on them sealed as the datagrams are.
-    // Their data is bounded by the receive windows (the connection's, 16
-    // MiB; quinn has one window for every stream, the session's 8 MiB).
+    // MAX_STREAMS at once, what comes on them sealed as the datagrams are,
+    // and the control stream. Their data is bounded by the receive windows
+    // (the connection's, 16 MiB; quinn has one window for every stream, the
+    // session's 8 MiB).
     t.max_concurrent_bidi_streams(1u32.into());
-    t.max_concurrent_uni_streams(groups::MAX_STREAMS.into());
+    t.max_concurrent_uni_streams(groups::UNI_STREAMS.into());
     // The peer acknowledges every second packet within 2 ms: cc.rs reads
     // the delay's growth off the acknowledgements' times.
     let mut ack = quinn::AckFrequencyConfig::default();
@@ -119,10 +128,11 @@ pub struct Quic {
     /// bytes aside, and 32 a datagram waiting; empty, it read 32 bytes still
     /// to send, and the desktop's wait for none never ended.
     idle: usize,
-    /// Video's groups on streams (groups.rs), if the other side reads them
-    /// (its hello: set_groups).
+    /// Video's groups on streams, and the session's messages on one of
+    /// their own (groups.rs), if both hellos said so (set_streams).
     groups: Arc<Groups>,
-    peer_groups: bool,
+    groups_on: bool,
+    control_on: bool,
 }
 
 /// quinn's send window, all streams': the session stream's share, the
@@ -157,13 +167,27 @@ impl Quic {
         self.idle.saturating_sub(self.conn.datagram_send_buffer_space()) + self.groups.queued()
     }
 
-    /// The other side reads groups on streams (its hello says so).
-    pub(crate) fn set_groups(&mut self, on: bool) {
-        self.peer_groups = on;
+    /// Video's groups on streams, and the session's messages on one of
+    /// their own (both hellos say so).
+    pub(crate) fn set_streams(&mut self, groups: bool, control: bool) {
+        self.groups_on = groups;
+        self.control_on = control;
     }
 
     pub(crate) fn groups(&self) -> bool {
-        self.peer_groups
+        self.groups_on
+    }
+
+    pub(crate) fn control(&self) -> bool {
+        self.control_on
+    }
+
+    /// A copy of frames the session numbered (its own messages) on the
+    /// control stream (groups.rs), ahead of all.
+    pub(crate) fn send_control(&self, frames: &[u8]) {
+        self.groups.send_control(frames, |frames| {
+            runtime().spawn(groups::write_control(self.conn.clone(), frames, self.groups.shared.clone()));
+        });
     }
 
     /// A sealed message of channel's group (key: a key group; last: the
@@ -200,15 +224,18 @@ impl Quic {
     pub(crate) fn close(&self) {
         self.cc.budget.close();
         let stats = self.group_stats();
-        if stats.groups > 0 {
+        if stats.groups > 0 || stats.control > 0 {
             log!("{}: QUIC path over: {stats}", self.conn.remote_address());
         }
         self.conn.close(0u32.into(), b"path over");
     }
 
     /// Each datagram that comes, and each message of the other side's
-    /// groups (groups.rs), to on (on the runtime: it must not block).
-    pub(crate) fn read_datagrams(&self, on: impl Fn(Bytes) + Send + Sync + 'static) {
+    /// groups (groups.rs), to on; each frame on its control stream (kind,
+    /// channel, body), to control, if we take one (on the runtime: neither
+    /// must block).
+    pub(crate) fn read_datagrams(&self, on: impl Fn(Bytes) + Send + Sync + 'static,
+                                 control: impl Fn(u8, u16, Vec<u8>) + Send + Sync + 'static) {
         let on = Arc::new(on);
         let conn = self.conn.clone();
         let datagrams = on.clone();
@@ -217,7 +244,8 @@ impl Quic {
                 datagrams(datagram);
             }
         });
-        runtime().spawn(groups::read(self.conn.clone(), on));
+        let control = self.control_on.then(|| Arc::new(control));
+        runtime().spawn(groups::read(self.conn.clone(), on, control));
     }
 }
 
@@ -323,7 +351,7 @@ pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, addr
         let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone(), groups.shared.clone())
             .map_err(|e| e.to_string())?;
         let idle = conn.datagram_send_buffer_space();
-        Ok((stream, Quic { conn, cc, realtime, idle, groups, peer_groups: false }))
+        Ok((stream, Quic { conn, cc, realtime, idle, groups, groups_on: false, control_on: false }))
     })
 }
 
@@ -361,7 +389,7 @@ pub(crate) fn listen(endpoint: Endpoint, server: Arc<rustls::ServerConfig>, gate
                     let stream = bridge(&conn, send, recv, cc.rate.clone(), realtime.clone(), groups.shared.clone())
                         .map_err(|e| e.to_string())?;
                     let idle = conn.datagram_send_buffer_space();
-                    Ok::<_, String>((stream, Quic { conn, cc, realtime, idle, groups, peer_groups: false }))
+                    Ok::<_, String>((stream, Quic { conn, cc, realtime, idle, groups, groups_on: false, control_on: false }))
                 };
                 match tokio::time::timeout(whole, accepted).await {
                     Ok(Ok((stream, quic))) => {
@@ -416,10 +444,28 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
         let (mut tokens, mut refilled) = (AHEAD_LEAST, tokio::time::Instant::now());
         let (mut realtime_rate, mut realtime_seen) = (0.0f64, realtime.load(Ordering::Relaxed));
         let mut windowed = refilled;
+        // The stream ahead of the groups while it carries no bulk: control
+        // messages wait behind no frame (CONTROL...). The bytes in this
+        // span, when bulk went last.
+        let _ = send.set_priority(groups::SESSION_AHEAD);
+        let (mut ahead, mut span, mut spanned, mut bulk) = (true, refilled, 0usize, None);
         loop {
             match from_session.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let now = tokio::time::Instant::now();
+                    if now.duration_since(span) >= BULK_SPAN {
+                        (span, spanned) = (now, 0);
+                    }
+                    spanned += n;
+                    if spanned > BULK_LEAST {
+                        bulk = Some(now);
+                    }
+                    let quiet = bulk.is_none_or(|at| now.duration_since(at) >= QUIET);
+                    if quiet != ahead {
+                        ahead = quiet;
+                        let _ = send.set_priority(if ahead { groups::SESSION_AHEAD } else { groups::SESSION_BEHIND });
+                    }
                     loop {
                         let now = tokio::time::Instant::now();
                         if now.duration_since(windowed) >= WINDOW_EVERY {
@@ -569,21 +615,29 @@ mod tests {
         (stream, quic, theirs, far)
     }
 
-    /// What comes on far, datagrams and groups' messages, as it comes.
-    fn read(far: &Quic) -> std::sync::mpsc::Receiver<Bytes> {
+    /// What comes on far, datagrams and groups' messages, as it comes; and
+    /// its control stream's frames (kind, body).
+    fn read_both(far: &Quic) -> (std::sync::mpsc::Receiver<Bytes>, std::sync::mpsc::Receiver<(u8, Vec<u8>)>) {
         let (came, got) = std::sync::mpsc::channel();
-        let came = Mutex::new(came);
+        let (framed, frames) = std::sync::mpsc::channel();
+        let (came, framed) = (Mutex::new(came), Mutex::new(framed));
         far.read_datagrams(move |message| {
             let _ = came.lock().unwrap().send(message);
+        }, move |kind, _, body| {
+            let _ = framed.lock().unwrap().send((kind, body));
         });
-        got
+        (got, frames)
+    }
+
+    fn read(far: &Quic) -> std::sync::mpsc::Receiver<Bytes> {
+        read_both(far).0
     }
 
     #[test]
     fn a_group_goes_on_a_stream_of_its_own_in_order() {
         let (_stream, mut quic, _theirs, far) = dialed();
         let got = read(&far);
-        quic.set_groups(true);
+        quic.set_streams(true, false);
         for i in 0..200u32 {
             let message = [&i.to_be_bytes()[..], &[7u8; 1000]].concat();
             assert!(quic.send_in_group(5, 1, false, i == 199, &message));
@@ -604,23 +658,23 @@ mod tests {
         }
     }
 
-    /// The other side takes no group streams for a while (all MAX_STREAMS
+    /// The other side takes no group streams for a while (all UNI_STREAMS
     /// of them open): the newest group waits as long as it takes, an older
     /// one is given up LATE after it began, at once if a key group came
     /// after it; then the newest goes.
     fn groups_held_up(key: bool) -> (Vec<Bytes>, groups::Stats) {
         let (_stream, mut quic, _theirs, far) = dialed();
-        quic.set_groups(true);
-        for group in 0..groups::MAX_STREAMS {
+        quic.set_streams(true, false);
+        for group in 0..groups::UNI_STREAMS {
             assert!(quic.send_in_group(5, group, false, true, &group.to_be_bytes()));
         }
         // All of them on their streams (a loaded machine is slow to).
         let started = Instant::now();
-        while quic.group_stats().groups < groups::MAX_STREAMS as u64 || quic.queued() > 0 {
+        while quic.group_stats().groups < groups::UNI_STREAMS as u64 || quic.queued() > 0 {
             assert!(started.elapsed() < Duration::from_secs(5), "{}", quic.group_stats());
             std::thread::sleep(Duration::from_millis(10));
         }
-        let held = groups::MAX_STREAMS;
+        let held = groups::UNI_STREAMS;
         assert!(quic.send_in_group(5, held, false, true, b"held up"));
         std::thread::sleep(LATE + Duration::from_millis(100));
         let stats = quic.group_stats();
@@ -639,7 +693,7 @@ mod tests {
     #[test]
     fn a_late_group_holds_up_no_newer_one_and_the_newest_is_never_late() {
         let (came, stats) = groups_held_up(false);
-        assert_eq!(came.len() as u32, groups::MAX_STREAMS + 1, "{came:?}");
+        assert_eq!(came.len() as u32, groups::UNI_STREAMS + 1, "{came:?}");
         assert_eq!(&came.last().unwrap()[..], b"newest");
         assert!(!came.iter().any(|m| &m[..] == b"held up"));
         assert_eq!((stats.late, stats.superseded, stats.dropped), (1, 0, 1), "{stats}");
@@ -654,19 +708,26 @@ mod tests {
     }
 
     #[test]
-    fn a_group_never_waits_for_room_in_quinns_send_window() {
-        // The window full (the bulk's: here none at all): each message
-        // written all the same, the window opened for it and set back (the
-        // bulk's share stays its own). They waited a round trip at least for
-        // the bulk's bytes to be acknowledged, past LATE under load.
-        let (_stream, mut quic, _theirs, far) = dialed();
-        let got = read(&far);
-        quic.set_groups(true);
+    fn a_group_and_a_control_frame_never_wait_for_room_in_quinns_send_window() {
+        // The window full (the bulk's: here none at all): each written all
+        // the same, the window opened for it and set back (the bulk's share
+        // stays its own). They waited a round trip at least for the bulk's
+        // bytes to be acknowledged, past LATE under load.
+        let (_stream, mut quic, _theirs, mut far) = dialed();
+        far.set_streams(true, true);
+        let (got, frames) = read_both(&far);
+        quic.set_streams(true, true);
         quic.groups.shared.set_window(&quic.conn, 0);
         for i in 0..20u32 {
             let message = [&i.to_be_bytes()[..], &[7u8; 1000]].concat();
             assert!(quic.send_in_group(5, i / 10, false, i % 10 == 9, &message));
         }
+        let mut control = Vec::new();
+        for i in 0..3u8 {
+            crate::frame::encode(crate::frame::SESSION, 0, &[i; 9], &mut control);
+        }
+        quic.send_control(&control[..16]);  // frames cut anywhere still come whole
+        quic.send_control(&control[16..]);
         // (Each group's in order; the other side reads each stream apart.)
         let mut came: Vec<u32> = (0..20).map(|_| {
             let message = got.recv_timeout(Duration::from_millis(500)).expect("a group's message held up");
@@ -678,9 +739,24 @@ mod tests {
         }
         came.sort_unstable();
         assert_eq!(came, (0..20).collect::<Vec<u32>>());
+        for i in 0..3u8 {
+            let (kind, body) = frames.recv_timeout(Duration::from_millis(500)).expect("a control frame held up");
+            assert_eq!((kind, body), (crate::frame::SESSION, vec![i; 9]));
+        }
         let stats = quic.group_stats();
         assert!(stats.window_full >= 1 && stats.wait_ms == 0, "{stats}");
         assert_eq!(*quic.groups.shared.window.lock().unwrap(), 0, "the window not set back");
+    }
+
+    #[test]
+    fn a_control_stream_to_a_side_that_takes_none_is_stopped() {
+        let (_stream, mut quic, _theirs, far) = dialed();
+        let (_got, frames) = read_both(&far);  // far's hello said nothing of it
+        quic.set_streams(false, true);
+        let mut control = Vec::new();
+        crate::frame::encode(crate::frame::SESSION, 0, b"12345678{}", &mut control);
+        quic.send_control(&control);
+        assert!(frames.recv_timeout(Duration::from_millis(500)).is_err());
     }
 
     #[test]

@@ -1021,7 +1021,7 @@ fn the_sixty_fifth_channel_is_refused() {
 /// counts on the PC's side.
 fn video_by_quic(groups: bool) -> (Vec<(u32, u16)>, plusone_link::groups::Stats) {
     let (pc, tablet, _address) = pair();
-    tablet.read_groups(groups);
+    tablet.video_streams(groups);
     let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
     let session = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
     until("datagrams proven", || session.rtt().is_some());
@@ -1088,4 +1088,101 @@ fn video_on_a_tcp_path_goes_as_realtime() {
     video.send(&[1, 0, 0]).unwrap();
     assert_eq!(video.recv(&mut buf, Some(Duration::from_millis(300))).unwrap(), None);
     assert!(session.dropped() >= 1);
+}
+
+/// A UDP relay to address: towards it at rate bytes a second, queue's
+/// worth of packets waiting at most (the rest dropped, as a router's), back
+/// as they come. Its address; it runs as long as the process.
+fn shaped(address: SocketAddr, rate: f64, queue: Duration) -> SocketAddr {
+    let near = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let far = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    far.connect(address).unwrap();
+    let via = near.local_addr().unwrap();
+    let from: Arc<std::sync::Mutex<Option<SocketAddr>>> = Arc::default();
+    let (back, answering, sender) = (near.try_clone().unwrap(), far.try_clone().unwrap(), from.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok(n) = answering.recv(&mut buf) {
+            if let Some(to) = *sender.lock().unwrap() {
+                let _ = back.send_to(&buf[..n], to);
+            }
+        }
+    });
+    let (due, leaving) = mpsc::channel::<(Vec<u8>, Instant)>();
+    std::thread::spawn(move || {
+        for (packet, at) in leaving {
+            std::thread::sleep(at.saturating_duration_since(Instant::now()));
+            let _ = far.send(&packet);
+        }
+    });
+    std::thread::spawn(move || {
+        let (mut buf, mut free) = ([0u8; 2048], Instant::now());
+        while let Ok((n, sender)) = near.recv_from(&mut buf) {
+            *from.lock().unwrap() = Some(sender);
+            let now = Instant::now();
+            let start = free.max(now);
+            if start - now > queue {
+                continue;
+            }
+            free = start + Duration::from_secs_f64(n as f64 / rate);
+            let _ = due.send((buf[..n].to_vec(), free));
+        }
+    });
+    via
+}
+
+/// Channels opened one after the other while a transfer fills a QUIC path
+/// at 100 KB/s, the PC's video streams on or off: how long each open took.
+fn opens_behind_a_transfer_by_quic(streams: bool) -> Vec<Duration> {
+    let (pc, tablet, _address) = pair();
+    pc.video_streams(streams);
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let session = pc.connect_quic(shaped(quic, 100_000.0, Duration::from_millis(200)), Duration::from_secs(3), "lan")
+        .unwrap();
+    until("datagrams proven", || session.rtt().is_some());
+    let bulk = session.open("echo", "bulk", Class::Control).unwrap();
+    let draining = {
+        let bulk = bulk.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 17];
+            while let Ok(Some(n)) = bulk.recv(&mut buf, Some(Duration::from_secs(3))) {
+                if n == 0 {
+                    break;
+                }
+            }
+        })
+    };
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sending = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let chunk = vec![7u8; 32 << 10];
+            while !done.load(std::sync::atomic::Ordering::SeqCst) && bulk.send(&chunk).is_ok() {}
+            bulk
+        })
+    };
+    std::thread::sleep(Duration::from_millis(1500));  // the transfer's queues full
+    let took = (0..3).map(|i| {
+        let begun = Instant::now();
+        let channel = session.open("echo", &format!("open{i}"), Class::Control).unwrap();
+        let took = begun.elapsed();
+        drop(channel);
+        took
+    }).collect();
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(sending.join().unwrap());
+    let _ = draining.join();
+    took
+}
+
+#[test]
+fn a_channel_opens_ahead_of_a_transfer_on_a_slow_quic_path() {
+    // The open and its answer go on each side's control stream, ahead of
+    // what the transfer has in quinn, in the bridge and in the stream's TLS
+    // (behind it, each took most of a second at this rate).
+    let on = opens_behind_a_transfer_by_quic(true);
+    let off = opens_behind_a_transfer_by_quic(false);
+    let longest = |took: &[Duration]| took.iter().max().copied().unwrap();
+    assert!(longest(&on) < Duration::from_millis(450), "opens behind a transfer took {on:?} ({off:?} with streams off)");
+    assert!(longest(&off) > longest(&on), "streams off as fast as on: {off:?}, {on:?}");
 }

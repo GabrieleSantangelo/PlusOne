@@ -16,11 +16,14 @@
 //! hands its messages on as datagrams (read()). (After moq-dev/moq's and
 //! moxygen's groups, checked against quinn-proto 0.11.19.)
 //!
+//! Beside them, a stream of the session's own messages, copies of those it
+//! numbers (open, accept, credit...: session.rs early), ahead of all
+//! (CONTROL); its first bytes are CONTROL_MARK, which no group's can be.
 //! quinn's send window is one for all streams: the bulk, handed a little over
-//! its share, keeps it full, and a group's message waited for room a round
-//! trip at least (the window frees what is acknowledged), often past LATE.
-//! The window is opened for each as it is written (write_now), never
-//! waited for.
+//! its share, keeps it full, and a group's message or a control frame waited
+//! for room a round trip at least (the window frees what is acknowledged),
+//! often past LATE. The window is opened for them as they are written
+//! (write_now), never waited for.
 
 use crate::quic::LATE;
 use bytes::Bytes;
@@ -36,10 +39,23 @@ use tokio::time::Instant;
 
 /// Group streams the other side may have open towards us at once: at 60
 /// frames a second, LATE and a long path's round trip (200 ms) hold about
-/// 18; some more than three times that.
+/// 18; some more than three times that. One more: the control stream.
 pub(crate) const MAX_STREAMS: u32 = 64;
-/// quinn's send window while a group's message is written into it
-/// (write_now): no limit but the other side's.
+pub(crate) const UNI_STREAMS: u32 = MAX_STREAMS + 1;
+/// The control stream's first bytes: as a length, more than any sealed
+/// message's (MAX_SEALED).
+const CONTROL_MARK: [u8; LENGTH] = [0xff, 0xff];
+/// The streams' priorities in quinn (the higher first; the datagrams go
+/// ahead of all): the control stream; the session's while it carries no
+/// bulk (quic.rs bridge); a key group; the other groups, the older the
+/// higher (what is sent again of a frame before the next frame); the
+/// session's with the bulk.
+pub(crate) const CONTROL: i32 = i32::MAX;
+pub(crate) const SESSION_AHEAD: i32 = i32::MAX - 1;
+const KEY_GROUP: i32 = i32::MAX - 2;
+pub(crate) const SESSION_BEHIND: i32 = 0;
+/// quinn's send window while a group's message or a control frame is
+/// written into it (write_now): no limit but the other side's.
 const OPEN: u64 = u64::MAX >> 2;
 /// Messages handed over and not on their streams yet, at most (a fifth of
 /// a second of a 100 Mbit/s video; more are dropped).
@@ -71,11 +87,13 @@ pub struct Stats {
     /// Groups whose stream waited for the other side's credit
     /// (MAX_STREAMS open already).
     pub credit_waits: u64,
-    /// Messages that found quinn's send window full (the bulk's): it was
-    /// opened for them. And how long they waited to be taken, all told (the
-    /// other side's flow control).
+    /// Messages and control frames that found quinn's send window full (the
+    /// bulk's): it was opened for them. And how long they waited to be
+    /// taken, all told (the other side's flow control).
     pub window_full: u64,
     pub wait_ms: u64,
+    /// The session's messages that went ahead on the control stream.
+    pub control: u64,
     /// Bytes written on group streams, and sent as datagrams (realtime and
     /// input not in groups, the path's pings).
     pub stream_bytes: u64,
@@ -93,10 +111,10 @@ impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kb = |bytes: u64| bytes as f64 / 1000.0;
         write!(f, "groups={} late={} late_kb={:.1} superseded={} superseded_kb={:.1} late_unsent={} dropped={} \
-                   credit_waits={} window_full={} wait_ms={} stream_kb={:.1} datagram_kb={:.1} \
+                   credit_waits={} window_full={} wait_ms={} control={} stream_kb={:.1} datagram_kb={:.1} \
                    lost_kb={:.1} lost_cut_kb={:.1} cuts={}",
                self.groups, self.late, kb(self.late_bytes), self.superseded, kb(self.superseded_bytes),
-               self.late_unsent, self.dropped, self.credit_waits, self.window_full, self.wait_ms,
+               self.late_unsent, self.dropped, self.credit_waits, self.window_full, self.wait_ms, self.control,
                kb(self.stream_bytes), kb(self.datagram_bytes), kb(self.lost_bytes), kb(self.lost_after_cut), self.cuts)
     }
 }
@@ -111,11 +129,13 @@ pub(crate) struct Piece {
     framed: Bytes,
 }
 
-/// A connection's groups: the writer (started with the first), what it
-/// shares with the session's stream (quic.rs bridge).
+/// A connection's groups: the writer (started with the first), the
+/// control stream's (the same), what they share with the session's stream
+/// (quic.rs bridge).
 #[derive(Default)]
 pub(crate) struct Groups {
     writer: OnceLock<mpsc::Sender<Piece>>,
+    control: OnceLock<mpsc::UnboundedSender<Bytes>>,
     pub(crate) shared: Arc<Shared>,
 }
 
@@ -159,6 +179,7 @@ pub(crate) struct Shared {
     credit_waits: AtomicU64,
     window_full: AtomicU64,
     wait_us: AtomicU64,
+    control: AtomicU64,
     stream_bytes: AtomicU64,
 }
 
@@ -169,7 +190,8 @@ impl Default for Shared {
                  queued: AtomicU64::new(0), groups: AtomicU64::new(0), late: AtomicU64::new(0),
                  late_bytes: AtomicU64::new(0), superseded: AtomicU64::new(0), superseded_bytes: AtomicU64::new(0),
                  late_unsent: AtomicU64::new(0), dropped: AtomicU64::new(0), credit_waits: AtomicU64::new(0),
-                 window_full: AtomicU64::new(0), wait_us: AtomicU64::new(0), stream_bytes: AtomicU64::new(0) }
+                 window_full: AtomicU64::new(0), wait_us: AtomicU64::new(0), control: AtomicU64::new(0),
+                 stream_bytes: AtomicU64::new(0) }
     }
 }
 
@@ -219,7 +241,7 @@ impl Shared {
                 superseded: load(&self.superseded), superseded_bytes: load(&self.superseded_bytes),
                 late_unsent: load(&self.late_unsent), dropped: load(&self.dropped),
                 credit_waits: load(&self.credit_waits), window_full: load(&self.window_full),
-                wait_ms: load(&self.wait_us) / 1000,
+                wait_ms: load(&self.wait_us) / 1000, control: load(&self.control),
                 stream_bytes: load(&self.stream_bytes), ..Stats::default() }
     }
 
@@ -402,11 +424,12 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
             };
             let stream = match open {
                 Ok(Ok(stream)) => {
-                    // A key group ahead of all; the others the older the
+                    // A key group ahead of the others, those the older the
                     // higher (frames in order, what is sent again of one
-                    // before the next), all ahead of the session's stream (0).
+                    // before the next), all ahead of the session's stream
+                    // with the bulk (CONTROL...).
                     opened = opened.wrapping_add(1);
-                    let priority = if piece.key { i32::MAX } else { i32::MAX - 1 - (opened & 0x3fff_ffff) as i32 };
+                    let priority = if piece.key { KEY_GROUP } else { KEY_GROUP - 1 - (opened & 0x3fff_ffff) as i32 };
                     let _ = stream.set_priority(priority);
                     shared.groups.fetch_add(1, Ordering::Relaxed);
                     Some(stream)
@@ -477,16 +500,74 @@ async fn write_all(conn: &Connection, stream: &mut SendStream, mut data: &[u8], 
     Ok(())
 }
 
+impl Groups {
+    /// A copy of frames the session numbered (its own messages: session.rs
+    /// early) on the control stream, ahead of all; started with the first.
+    pub(crate) fn send_control(&self, frames: &[u8], start: impl FnOnce(mpsc::UnboundedReceiver<Bytes>)) {
+        let writer = self.control.get_or_init(|| {
+            let (writer, frames) = mpsc::unbounded_channel();
+            start(frames);
+            writer
+        });
+        // Gone with the connection: the session's stream carries them.
+        if writer.send(Bytes::copy_from_slice(frames)).is_ok() {
+            self.shared.control.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The control stream's writer (on the connection's runtime), until the
+/// connection's Groups is gone or the connection is over: the frames, in
+/// order, after CONTROL_MARK; quinn's send window opened for them
+/// (write_now), never reset (the session's stream carries each too).
+pub(crate) async fn write_control(conn: Connection, mut frames: mpsc::UnboundedReceiver<Bytes>, shared: Arc<Shared>) {
+    let Ok(mut stream) = conn.open_uni().await else { return };
+    let _ = stream.set_priority(CONTROL);
+    let mut mark = Some(CONTROL_MARK);
+    while let Some(frame) = frames.recv().await {
+        let framed = match mark.take() {
+            Some(mark) => Bytes::from([&mark[..], &frame[..]].concat()),
+            None => frame,
+        };
+        let mut data = &framed[..];
+        while !data.is_empty() {
+            let written = match write_now(&conn, &mut stream, data, &shared).await {
+                Some(written) => written,
+                None => {
+                    let since = Instant::now();
+                    let written = stream.write(data).await;
+                    shared.wait_us.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    written
+                }
+            };
+            match written {
+                Ok(n) => data = &data[n..],
+                Err(_) => return,
+            }
+        }
+    }
+}
+
 /// The other side's groups: each stream's messages, in order, to on as they
 /// come (on the runtime: on must not block), until the connection is over.
 /// A stream reset ends its reader at once (its credit back to the other
-/// side).
-pub(crate) async fn read<F: Fn(Bytes) + Send + Sync + 'static>(conn: Connection, on: Arc<F>) {
+/// side). A control stream's frames to control, if we take one (both
+/// hellos said so), else it is stopped.
+pub(crate) async fn read<F, C>(conn: Connection, on: Arc<F>, control: Option<Arc<C>>)
+where F: Fn(Bytes) + Send + Sync + 'static, C: Fn(u8, u16, Vec<u8>) + Send + Sync + 'static {
     while let Ok(mut stream) = conn.accept_uni().await {
-        let on = on.clone();
+        let (on, control) = (on.clone(), control.clone());
         tokio::spawn(async move {
             let mut head = [0u8; LENGTH];
+            let mut first = true;
             while stream.read_exact(&mut head).await.is_ok() {
+                if std::mem::take(&mut first) && head == CONTROL_MARK {
+                    if let Some(control) = control {
+                        read_control(&mut stream, &*control).await;
+                    }
+                    let _ = stream.stop(VarInt::from_u32(0));
+                    return;
+                }
                 let length = u16::from_be_bytes(head) as usize;
                 if length > MAX_SEALED {
                     let _ = stream.stop(VarInt::from_u32(0));
@@ -499,5 +580,22 @@ pub(crate) async fn read<F: Fn(Bytes) + Send + Sync + 'static>(conn: Connection,
                 on(Bytes::from(sealed));
             }
         });
+    }
+}
+
+/// A control stream's frames (after its mark), each to control as it comes,
+/// until it ends or one is not a frame.
+async fn read_control<C: Fn(u8, u16, Vec<u8>)>(stream: &mut quinn::RecvStream, control: &C) {
+    let mut decoder = crate::frame::Decoder::default();
+    let mut buf = vec![0u8; 16 << 10];
+    while let Ok(Some(n)) = stream.read(&mut buf).await {
+        decoder.push(&buf[..n]);
+        loop {
+            match decoder.next() {
+                Ok(Some((kind, channel, body))) => control(kind, channel, body),
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
     }
 }
