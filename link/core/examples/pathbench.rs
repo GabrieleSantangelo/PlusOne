@@ -15,7 +15,7 @@
 //! (once each), those instead (chain_NAME), in an order turned at random
 //! (test=order): KEY l36 (0: before it), hold (ms), start (1: the first
 //! bitrate the budget's share), pay (frames), depth (frames), fits, as
-//! appdisplay.py's PLUSONE_L36* (Variant).
+//! appdisplay.py's PLUSONE_L36* (Variant), each as it ships unless given.
 //!   pathbench --cert PEM --key PEM --trust FINGERPRINT --tablet ADDRESS
 //!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S
 //!             [--variant NAME[:KEY=VALUE...]]...]
@@ -247,7 +247,7 @@ const FITS: f64 = 0.95;
 const UP: f64 = 1.15;
 const STEADY: f64 = 0.05;
 const UP_AFTER: f64 = 2.0;
-const HOLD: f64 = 1.0;
+const HOLD: f64 = 0.0;
 const QUEUE_MS: f64 = 60.0;
 const MIN_KEYFRAME_GAP: f64 = 0.25;
 const KEY_FLYING_MOST: f64 = 0.5;
@@ -298,7 +298,7 @@ struct Variant {
 
 impl Variant {
     fn new(name: &str, l36: bool) -> Variant {
-        Variant { name: name.into(), l36, hold: HOLD, start: false, pay: 0.0, depth: ALLOWANCE_FRAMES, fits: FITS }
+        Variant { name: name.into(), l36, hold: HOLD, start: l36, pay: 0.0, depth: ALLOWANCE_FRAMES, fits: FITS }
     }
 
     /// NAME[:KEY=VALUE...], as --variant has it.

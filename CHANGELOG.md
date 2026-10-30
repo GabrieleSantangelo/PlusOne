@@ -7,18 +7,18 @@
   and takes it back within the second. Each cut lowered the desktop's
   bitrate at once, a keyframe on Intel's encoder just when the network
   took less: frames late, lost, keyframes asked for, more bitrate
-  changes. A cut now leaves out whole frames for as long as it lasts, so
-  that what goes stays within it; the bitrate goes down only if the cut
-  holds for a second (on Intel's encoders, where each change is a
-  keyframe; elsewhere at once), and a stream starts at what the link
-  takes, not at the most. And no keyframe goes after another still on its
-  way: the tablet's asks for one meanwhile are left (it asks again if it
-  still needs one), a change of bitrate waits for it to go out. A frame
-  goes to the tablet whole or not at all: the link dropped what would
-  come too late packet by packet, a keyframe's end, and the picture broke
-  until another; now a keyframe is made only once all of it fits, and a
-  frame that would not is not sent (nor those after it, until a keyframe),
-  the tablet keeping the last picture.
+  changes. No keyframe goes now after another still on its way: the
+  tablet's asks for one meanwhile are left (it asks again if it still
+  needs one), a change of bitrate waits for it to go out. A frame goes to
+  the tablet whole or not at all: the link dropped what would come too
+  late packet by packet, a keyframe's end, and the picture broke until
+  another; now a keyframe is made only once all of it fits, and a frame
+  that would not is not sent (nor those after it, until a keyframe), the
+  tablet keeping the last picture. Until a cut's keyframe goes, whole
+  frames are left out so that what goes stays within the cut. And a
+  stream starts at what the link takes, not at the most. (Holding the
+  bitrate for a second at each cut, to ride out those taken back, left
+  out more frames than the keyframes it saved.)
 - **What carries the desktop**: the pill bottom left on the tablet says
   it too ("PC screen · QUIC · Wi-Fi", "PC screen · TCP · Wi-Fi Direct";
   a cable or Bluetooth has no transport to say), bright for 4 s when the

@@ -381,6 +381,15 @@ def test_big_sizes_are_hidpi_with_the_bitrate_to_match():
     assert appdisplay.bitrate_for(20000, (1280, 800)) == 20000  # never less than asked
 
 
+# A cut held a second before the bitrate goes down (PLUSONE_L36_HOLD_MS=1000,
+# l36 as first made; it ships with none): the hold's own tests.
+HELD = appdisplay.L36(hold_ms=1000)
+
+
+def held(monkeypatch):
+    monkeypatch.setenv("PLUSONE_L36_HOLD_MS", "1000")
+
+
 def test_the_bitrate_follows_the_network():
     rate = appdisplay.RateControl(20000)
     for _ in range(5):  # clean: stays at the most
@@ -400,7 +409,7 @@ def test_the_bitrate_follows_the_network():
 
 
 def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
-    rate = appdisplay.RateControl(20000)
+    rate = appdisplay.RateControl(20000, tuning=HELD)
     assert rate.report(60, 0, 30, 20, budget=10000, now=0) is None  # over it: a second first (frames left out)
     assert rate.report(60, 0, 30, 20, budget=10000, now=1) == 8500  # a share of it
     assert rate.report(55, 3, 30, 20, budget=10000, now=2) is None  # a frame lost: no cut
@@ -411,7 +420,7 @@ def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
 
 
 def test_each_change_is_a_keyframe_so_the_bitrate_changes_seldom():
-    rate = appdisplay.RateControl(20000)
+    rate = appdisplay.RateControl(20000, tuning=HELD)
     rate.budget(10000, now=-1)
     assert rate.budget(10000, now=0) == 8500
     assert rate.budget(9000, now=0.1) is None  # a cut it still fits in: no keyframe for it
@@ -511,6 +520,7 @@ def test_the_links_budget_is_followed_as_it_changes():
 
 
 def test_the_streamer_follows_the_budget_between_the_reports(monkeypatch):
+    held(monkeypatch)
     clock = Clock()
     monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
     link = FakeLink(budget=None)
@@ -536,6 +546,7 @@ def test_the_streamer_follows_the_budget_between_the_reports(monkeypatch):
 def test_every_change_of_the_bitrate_is_said_with_its_cause(monkeypatch):
     # The live tests count them: those from the budget's events wrote
     # nothing (13 said of 51 in 10 minutes), and each is a keyframe.
+    held(monkeypatch)
     said = []
     monkeypatch.setattr(appdisplay, "log", lambda *args: said.append(" ".join(map(str, args))))
     clock = Clock()
@@ -580,7 +591,7 @@ def test_on_quic_a_frame_is_left_out_before_the_link_would_drop_it():
 def test_a_single_cut_is_absorbed_without_a_change_of_bitrate():
     # GCC cut by 30 % six times a minute on a good Wi-Fi, most taken back
     # within the second; each bitrate change was a keyframe at the worst time.
-    rate = appdisplay.RateControl(20000)
+    rate = appdisplay.RateControl(20000, tuning=HELD)
     rate.kbps = 8500  # fits in 10000
     assert rate.budget(7000, now=10) is None  # cut: it no longer fits...
     assert rate.tick(now=10.5) is None
@@ -611,6 +622,7 @@ def offer_frames(streamer, clock, seconds, fps=60, keyframe_every=None):
 
 
 def test_under_a_cut_whole_frames_are_left_out_within_the_budget(monkeypatch):
+    held(monkeypatch)
     clock = Clock()
     monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
     link = FakeLink(budget=10000)
@@ -690,9 +702,26 @@ def test_the_hold_is_a_knob_counted_to_the_frame(monkeypatch):
     assert streamer.kbps == 5950  # ...300 ms: down with that frame, not at the listener's next wake (250 ms)
 
 
+def test_as_it_ships_a_cut_lowers_the_bitrate_at_once_its_keyframe_once_it_fits(monkeypatch):
+    # The grid's chain (adsl, lossy, spikes, 30 runs each): every 250 ms of
+    # hold left out more frames than the keyframes it saved cost; none, the
+    # frames shown as before l36 within 2 points, a fifth fewer keyframes.
+    streamer, link, clock, made, said = keyframe_streamer(monkeypatch)
+    assert streamer.rate.hold == 0
+    streamer._out(bytes(60000), True, 0)  # a keyframe...
+    link.waiting = 61000  # ...still on its way
+    streamer._budget(7000)  # 8500 no longer fits in 6650: down at once, its keyframe (Intel's) once that one is out
+    assert streamer.rate.kbps == 5950 and streamer.kbps == 8500 and said == []
+    assert frame_in(streamer, clock)  # meanwhile frames go as they are, within the allowance
+    link.waiting = 0
+    assert frame_in(streamer, clock) and streamer.kbps == 5950
+    assert said == ["app display: 8500 -> 5950 kbit/s, as the network takes (the budget 7000 kbit/s, the others' 0)"]
+
+
 def test_no_hold_where_a_change_of_bitrate_is_no_keyframe(monkeypatch):
     # NVENC, x264: the bitrate changed in place; held, a cut only left out
     # frames for a keyframe that never comes.
+    held(monkeypatch)
     clock = Clock()
     monkeypatch.setattr(appdisplay, "time", types.SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(appdisplay, "log", lambda *args: None)
@@ -704,7 +733,7 @@ def test_no_hold_where_a_change_of_bitrate_is_no_keyframe(monkeypatch):
     streamer = streamer_on(FakeLink(budget=10000), bitrate=20000)
     streamer._encoder_restarts(True)  # Intel's
     streamer._budget(7000)
-    assert streamer.kbps == 8500 and streamer.rate.hold == appdisplay.L36().hold
+    assert streamer.kbps == streamer.rate.kbps == 8500 and streamer.rate.hold == 1.0
 
 
 def test_a_stream_starts_at_the_budget_s_share(monkeypatch):

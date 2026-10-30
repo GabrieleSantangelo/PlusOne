@@ -477,14 +477,22 @@ class RateControl:
     network took less: the picture stuttered at each of the controller's
     cuts, and at each of its steps up. Following a budget, the bitrate
     goes down only once it no longer FITS in it (its share leaves 15 %: a
-    smaller cut costs nothing) and has not for HOLD: the controller cut by
-    30 % six times a minute on a good Wi-Fi, most of them taken back within
-    the second, and each one's keyframe made the frames after it late, lost,
-    asked for again. Meanwhile whole frames are left out to stay within the
-    budget (Allowance): fewer frames for that time, none late; with PAY,
-    down sooner once those are worth PAY frames (a keyframe is VBV_FRAMES).
-    Up only by UP at least, UP_AFTER after its last change. A stream starts
-    at the budget's share (start()). HOLD, PAY and FITS as L36 has them."""
+    smaller cut costs nothing), and has not for HOLD; whole frames are left
+    out meanwhile to stay within the budget (Allowance), none late; with
+    PAY, down sooner once those are worth PAY frames (a keyframe is
+    VBV_FRAMES). The controller cut by 30 % six times a minute on a good
+    Wi-Fi, most of them taken back within the second, and each one's
+    keyframe made the frames after it late, lost, asked for again: held a
+    second, as l36 was first made. But with keyframes made only once they
+    fit and none after one still on its way (AppStreamer), a keyframe costs
+    about its own bytes, and on the emulated grid's chain (adsl, lossy,
+    spikes; pathbench --variant) every 250 ms of hold left out more frames
+    than the keyframes it saved: none, frames shown within 2 points of the
+    desktop before l36 (1000 ms: 5 fewer, 500: 3), a fifth fewer keyframes
+    (500 ms: more than a quarter), the delay's 99th percentile 3 ms lower
+    (500 ms: 6 higher). Up only by UP at least, UP_AFTER after its last
+    change. A stream starts at the budget's share (start()). HOLD, PAY and
+    FITS as L36 has them."""
 
     SHARE = 0.85    # of a path's budget (its congestion controller's), the video's
     STEADY = 0.05   # up to the most: by this much at least
@@ -493,7 +501,7 @@ class RateControl:
                     # goes 1.5 times what goes through at most: 1.25 held at 9.5 Mbit/s
                     # for 90 s on a hotspot taking 50)...
     UP_AFTER = 2.0  # ...this long (s) after the last change at least
-    HOLD = 1.0      # s: the budget under what the bitrate needs this long before it goes down (L36)...
+    HOLD = 0.0      # s: the budget under what the bitrate needs this long before it goes down (L36)...
     PAY = 0         # ...or once the frames left out for it are worth this many (0: never)
     GROWN_MS = 25   # over the least: a queue
     CLEAN = 3       # reports in a row without loss nor queue before going up
@@ -598,7 +606,7 @@ class RateControl:
         if kbps is not None:
             self.changed_at = now
             self.why = (f"the budget {budget} kbit/s, the others' {others:.0f}"
-                        + (f"; under it for {now - under:.1f} s" if under is not None else ""))
+                        + (f"; under it for {now - under:.1f} s" if under is not None and now > under else ""))
         return kbps
 
     def start(self, budget, others=0):
@@ -693,14 +701,14 @@ class L36:
     each stream starts: a live A/B without rebuilding, said in the log.
     PLUSONE_L36=0: as before l36, the bitrate down at once whenever it no
     longer fits in the budget (a keyframe on Intel's encoders), every frame
-    encoded sent, keyframes made as asked. Else (the default) a cut is first
-    absorbed by whole frames left out within the budget (Allowance), the
-    bitrate down only once it has held, keyframes made once they fit, whole
-    frames to the link; and the stream starts at the budget's share. Its
-    knobs, the frames left out (each kept within its range, said if not):
+    encoded sent, keyframes made as asked. Else (the default) whole frames
+    are left out to stay within the budget (Allowance) until the bitrate
+    follows a cut, keyframes are made once they fit, whole frames go to the
+    link, and the stream starts at the budget's share. Its knobs, the
+    frames left out (each kept within its range, said if not):
     PLUSONE_L36_HOLD_MS: how long the budget must stay under the bitrate
-    before it goes down (RateControl.HOLD), on an encoder whose every
-    change of bitrate is a keyframe (Intel's: elsewhere, none);
+    before it goes down (RateControl.HOLD: none as it ships), on an encoder
+    whose every change of bitrate is a keyframe (Intel's: elsewhere, none);
     PLUSONE_L36_PAY: down sooner once the frames left out for it are worth
     this many frames at the bitrate (0: never; a change costs a keyframe,
     media.VBV_FRAMES of them);
