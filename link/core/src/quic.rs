@@ -102,9 +102,9 @@ fn transport(cc: Arc<GccConfig>) -> TransportConfig {
     // MAX_STREAMS at once, what comes on them sealed as the datagrams are,
     // and the control stream. Their data is bounded by the receive windows
     // (the connection's, 16 MiB; quinn has one window for every stream, the
-    // session's 8 MiB).
+    // session's 8 MiB). None while video streams are off (lib.rs).
     t.max_concurrent_bidi_streams(1u32.into());
-    t.max_concurrent_uni_streams(groups::UNI_STREAMS.into());
+    t.max_concurrent_uni_streams(if crate::video_streams() { groups::UNI_STREAMS } else { 0 }.into());
     // The peer acknowledges every second packet within 2 ms: cc.rs reads
     // the delay's growth off the acknowledgements' times.
     let mut ack = quinn::AckFrequencyConfig::default();

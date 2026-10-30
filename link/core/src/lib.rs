@@ -80,6 +80,21 @@ impl Class {
     }
 }
 
+/// Video's groups on QUIC streams and the session's messages on a stream of
+/// their own (groups.rs; q3, option B), said in each hello and used where
+/// both say so: on unless PLUSONE_LINK_VIDEO_STREAMS=0 (a live A/B against
+/// the way before them, with no build: either side off, both are).
+pub(crate) fn video_streams() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("PLUSONE_LINK_VIDEO_STREAMS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::log!("video streams off (PLUSONE_LINK_VIDEO_STREAMS=0): video as datagrams, as before them");
+        }
+        on
+    })
+}
+
 /// A line on stderr, with the time (the journal, under a service).
 #[cfg(not(target_os = "android"))]
 pub fn log(line: &str) {

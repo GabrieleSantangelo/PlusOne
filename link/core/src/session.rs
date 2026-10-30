@@ -514,7 +514,8 @@ pub(crate) struct Established {
     /// A QUIC path's connection (quic.rs).
     quic: Option<crate::quic::Quic>,
     /// Our hello said we take Video's groups and the session's messages on
-    /// QUIC streams of their own: used if theirs says so too.
+    /// QUIC streams of their own (lib.rs video_streams): used if theirs
+    /// says so too.
     streams: bool,
 }
 

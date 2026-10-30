@@ -56,7 +56,8 @@ pub(crate) struct NodeInner {
     /// Our TCP paths to a device that takes QUIC move to it (upgrade_to_quic).
     quic_upgrade: AtomicBool,
     /// Video's groups and the session's messages on QUIC streams of their
-    /// own (said in our hello; off: as a device from before them).
+    /// own (said in our hello: lib.rs video_streams; off: as a device from
+    /// before them).
     streams: AtomicBool,
     closed: AtomicBool,
 }
@@ -260,7 +261,7 @@ impl Node {
             quic: Mutex::default(),
             quic_port: std::sync::atomic::AtomicU16::new(0),
             quic_upgrade: AtomicBool::new(false),
-            streams: AtomicBool::new(true),
+            streams: AtomicBool::new(crate::video_streams()),
             closed: AtomicBool::new(false),
         })))
     }
@@ -353,8 +354,9 @@ impl Node {
     }
 
     /// Whether our hellos say we take Video's groups and the session's
-    /// messages on QUIC streams of their own (on unless turned off). Off,
-    /// neither goes so either way, as with a device from before them.
+    /// messages on QUIC streams of their own (lib.rs video_streams: on
+    /// unless PLUSONE_LINK_VIDEO_STREAMS=0). Off, neither goes so either
+    /// way, as with a device from before them.
     pub fn video_streams(&self, on: bool) {
         self.0.streams.store(on, Ordering::SeqCst);
     }
