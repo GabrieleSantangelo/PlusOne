@@ -23,7 +23,8 @@
 #         then p2p, in turn (plus-one-link reaches lan first, then p2p);
 #   bt    lan taken down, only the Bluetooth-like stream to fall back on; from
 #         bt, lan tried each 2 s, the session back on it before each cycle;
-#   flap  lan down 2 s and up 2 s, ten times in a row, then ten again; p2p up.
+#   flap  lan down 2 s and up 2 s, ten times in a row, then ten again; p2p up
+#         (SWITCHBENCH_FLAP=p2p: p2p flapping, lan up).
 # SWITCHBENCH_HOW: drop (every packet lost both ways: a network out of
 # reach, silence; the default), link (the PC's interface down: what a
 # Wi-Fi lost tells the system), kill (dropped, and each side's TCP
@@ -32,7 +33,11 @@
 # SWITCHBENCH_HOLD: how long a path stays down (s; 10, flap 2);
 # SWITCHBENCH_VIDEO: the video's kbit/s on a path with no budget (8000);
 # SWITCHBENCH_QUIC=1: the PC moves its TCP paths to QUIC (plus-one-link's
-# PLUSONE_LINK_QUIC=1); SWITCHBENCH_OUT: a directory the logs are kept in
+# PLUSONE_LINK_QUIC=1); SWITCHBENCH_RESERVE=1: the PC keeps a path of each
+# kind of the scenario up while the session has one (--reserve: reserves,
+# the best the carrier, as the link's sessions do since stage 9's P3;
+# plus-one-link does not dial them itself yet), not only one when it has
+# none; SWITCHBENCH_OUT: a directory the logs are kept in
 # (each side's events and what it sent or received, the cycles' times,
 # cycles.jsonl); SWITCHBENCH_BIN: the examples' directory;
 # SWITCHBENCH_NAME (sb): the containers' and networks' names;
@@ -59,6 +64,13 @@ esac
 [ -x "$bin/switchbench" ] || { echo "no $bin/switchbench: tools/link-docker.sh build --release --examples" >&2; exit 1; }
 quic=""
 [ "${SWITCHBENCH_QUIC:-}" != 1 ] || quic=--quic
+reserve=""
+[ "${SWITCHBENCH_RESERVE:-}" != 1 ] || reserve=--reserve
+flapped=${SWITCHBENCH_FLAP:-lan}
+case $flapped in
+    lan|p2p) ;;
+    *) echo "SWITCHBENCH_FLAP: lan or p2p" >&2; exit 2 ;;
+esac
 docker build -q -t plus-one-switchbench - < Dockerfile.switchbench > /dev/null
 work=$(mktemp -d)
 out=${SWITCHBENCH_OUT:-$work/out}
@@ -150,7 +162,7 @@ for path in $paths; do
     esac
 done
 docker exec -d -u "$user" "$name-pc" sh -c "exec /b/switchbench pc --cert /w/pc/cert.pem --key /w/pc/key.pem \
-    --trust $(cat "$work/w/tablet/fp") --out /out $targets $upgrade --video $video $quic \
+    --trust $(cat "$work/w/tablet/fp") --out /out $targets $upgrade --video $video $quic $reserve \
     > /out/stdout.txt 2> /out/link.log"
 now() {
     docker exec "$name-pc" /b/switchbench now
@@ -207,7 +219,7 @@ for cycle in $(seq "$cycles"); do
     case $scenario in
         wifi) settle "lan p2p"; path=$(current) ;;
         bt) settle lan; path=lan ;;
-        flap) [ $((cycle % 10)) != 1 ] || { settle "lan p2p"; sleep 3; }; path=lan ;;
+        flap) [ $((cycle % 10)) != 1 ] || { settle "lan p2p"; sleep 3; }; path=$flapped ;;
     esac
     echo "$cycle down $path $how $(act down "$path")" >> "$out/actions.txt"
     sleep "$hold"
@@ -221,5 +233,5 @@ settle "$paths"
 sleep 5
 echo "end $(now)" >> "$out/actions.txt"
 sleep 1.5
-echo "## $scenario ($how, $cycles cycles, held $hold s$([ -z "$quic" ] || echo ", QUIC"))"
+echo "## $scenario ($how, $cycles cycles, held $hold s$([ -z "$quic" ] || echo ", QUIC")$([ -z "$reserve" ] || echo ", reserves")$([ "$scenario/$flapped" != flap/p2p ] || echo ", p2p flapping"))"
 python3 -I tools/switchbench-summary.py "$out"

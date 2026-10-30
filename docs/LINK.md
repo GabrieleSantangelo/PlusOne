@@ -429,6 +429,37 @@ messages older than one before them). How the bench is made:
 `tools/switchbench.sh`'s head; each cycle's numbers: `cycles.jsonl` among
 its logs (`SWITCHBENCH_OUT`).
 
+With reserves (stage 9's P3, 2026-10-30, at 95bd0ed; bt's at f15d805, the
+same handover): the session keeps a path of each kind it is given, the
+best the carrier, the others pinged once a second; the bench's dialer
+keeps one of each kind of the scenario up while the session has one
+(`SWITCHBENCH_RESERVE=1`: plus-one-link does not dial reserves itself
+yet). Median (worst) of 20 cycles, 8bae6a7 → reserves:
+
+| Scenario | On another path | Video gap | Frames lost | Sound's gap | Control's latest | Detached |
+|---|---|---|---|---|---|---|
+| wifi, kill | 0.8 s (1.5) → 9 ms (10) | 0.8 s (1.5) → 20 ms (54) | 46 (91) → 0 (1) | 0.8 s (1.5) → 5 ms (15) | 0.8 s (1.5) → 5 ms (10) | every cycle → never |
+| wifi, drop | 5.8 s (6.6) → 1.5 s (1.5) | 5.8 s (6.6) → 1.6 s (1.8) | 348 (394) → 92 (93) | 5.8 s (6.6) → 1.5 s (1.6) | 5.8 s (6.6) → 1.5 s (1.5) | every cycle → never |
+| bt, kill | 1.6 s (1.6) → 9 ms (9) | 1.7 s (1.8) → 28 ms (91) | 96 (98) → 0 (1) | 1.6 s (1.6) → 5 ms (15) | 1.6 s (1.6) → 22 ms (30) | every cycle → never |
+| flap, drop | never → in 1 cycle of 20 | 2.1 s (3.1) → 17 ms (1.6 s) | 123 (124) → 0 (93) | 2.1 s (2.1) → 0 (1.6 s) | 3.3 s (3.3) → 5 ms (1.5 s) | never → never |
+
+A path killed (its streams ended on both sides), the session is on its
+reserve 9 ms later, the time the system takes to tell; the video's gap
+54 ms at the 95th percentile on Wi-Fi, 82 ms on Bluetooth, no
+"Reconnecting…", no control message lost or late past 30 ms. The frame
+lost in some cycles is the one on its way on the network killed: nothing
+carried a copy of it (duplication is P5's). A path gone silent (drop) is
+left once suspect, 1.5 s (the system's events and a faster suspect are
+P4's). Flap here is p2p, the carrier, flapping (`SWITCHBENCH_FLAP=p2p`):
+its first outage moves the session to lan, and `FLAP_HOLD` keeps it there
+through the 19 others (17 ms, a frame's time: nothing lost); with lan
+flapping as the reserve (the default), nothing at all (17 ms, 0 lost).
+From bt the session is back on lan once its hold is over, 50 s after lan
+came back (60 s after it failed). Threads and descriptors the same at the
+start, at most and at the end of every run, on both sides. Moving from bt
+back to lan, about 10 ms of the pen's input still on bt's stream (3
+messages) is handed on after newer input that came over lan's UDP: input
+on a stream has no counter (P5's sealed frames on streams).
 
 ## Phases
 

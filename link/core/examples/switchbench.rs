@@ -7,7 +7,10 @@
 //! second); and it makes the paths as plus-one-link does: the first of
 //! --path it can reach, the next of them in order at once when the
 //! session has none and each second after, and, from a path of
-//! --upgrade-from, the ones before it each 2 s. The tablet's side takes
+//! --upgrade-from, the ones before it each 2 s; with --reserve, while the
+//! session has a path, each kind of --path it has none of, each second (a
+//! reserve: the session makes the best the carrier, link/core's
+//! session.rs; --upgrade-from is then left aside). The tablet's side takes
 //! them and records each frame (whole, decodable: a keyframe or the frame
 //! after one decodable; one that is not asks for a keyframe, again each
 //! 250 ms until one comes), sound packet and control message as it comes,
@@ -23,6 +26,7 @@
 //!   switchbench pc --cert PEM --key PEM --trust FINGERPRINT --out DIR
 //!                  --path KIND=ADDRESS|KIND=unix:SOCKET [--path ...]
 //!                  [--quic] [--video KBPS] [--upgrade-from KIND[,KIND]]
+//!                  [--reserve]
 //!   switchbench now        CLOCK_MONOTONIC in ns (the driver's times)
 //! The PC's side writes the path it is on in DIR/current ("none" while
 //! there is none).
@@ -259,11 +263,13 @@ fn tablet(value: &dyn Fn(&str) -> Option<String>, node: Node, peer: String, out:
 
 // -- the PC ----------------------------------------------------------------------
 
+#[derive(Clone)]
 enum Target {
     Tcp(SocketAddr),
     Unix(PathBuf),
 }
 
+#[derive(Clone)]
 struct Candidate {
     kind: String,
     target: Target,
@@ -312,6 +318,20 @@ fn dialer(node: Node, peer: String, candidates: Vec<Candidate>, upgrade: Vec<Str
             Some(_) => {}
         }
         let _ = woken.recv_timeout(DIAL_EVERY);
+    }
+}
+
+/// One kind of path kept up beside the session's carrier (--reserve): dialed
+/// each DIAL_EVERY while the session has a path and none of its kind (a
+/// thread for each kind: a dial waiting on a network that is down holds
+/// up no other's). With no path at all, dialer() dials, in order.
+fn keeper(node: Node, peer: String, candidate: Candidate, events: Arc<Lines>) {
+    loop {
+        std::thread::sleep(DIAL_EVERY);
+        let Some(session) = node.session(&peer).filter(|s| !s.is_closed()) else { continue };
+        if session.path().is_some() && !session.paths().iter().any(|path| path.kind == candidate.kind) {
+            dial(&node, &candidate, &events);
+        }
     }
 }
 
@@ -542,8 +562,9 @@ fn pc(value: &dyn Fn(&str) -> Option<String>, args: &[String], node: Node, peer:
         Candidate { kind: kind.into(), target }
     }).collect();
     assert!(!candidates.is_empty(), "--path KIND=ADDRESS");
-    let upgrade: Vec<String> = value("--upgrade-from").map(|kinds| kinds.split(',').map(str::to_owned).collect())
-        .unwrap_or_default();
+    let reserve = args.iter().any(|a| a == "--reserve");
+    let upgrade: Vec<String> = value("--upgrade-from").filter(|_| !reserve)
+        .map(|kinds| kinds.split(',').map(str::to_owned).collect()).unwrap_or_default();
     let kbps: u64 = value("--video").and_then(|v| v.parse().ok()).unwrap_or(8000);
     node.upgrade_to_quic(args.iter().any(|a| a == "--quic"));
     let events = Lines::create(out, "events.jsonl");
@@ -578,6 +599,12 @@ fn pc(value: &dyn Fn(&str) -> Option<String>, args: &[String], node: Node, peer:
         let (node, peer, lines) = (node.clone(), peer.clone(), files[2].clone());
         spawn("control", Box::new(move || send_stamped(node, peer, Flow::new("control", Class::Control),
                                                        Duration::from_millis(50), 64, lines)));
+    }
+    if reserve {
+        for candidate in &candidates {
+            let (node, peer, candidate, events) = (node.clone(), peer.clone(), candidate.clone(), events.clone());
+            spawn("keeper", Box::new(move || keeper(node, peer, candidate, events)));
+        }
     }
     println!("loaded");
     let _ = std::io::stdout().flush();
