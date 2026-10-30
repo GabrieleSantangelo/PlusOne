@@ -1620,6 +1620,7 @@ impl Session {
             Ok(live) => {
                 paths.lives.push(live);
                 self.carry(&mut paths, 0);
+                self.greet(&mut paths, 0);
             }
             Err(reason) => {
                 self.live.lock().unwrap().clear();
@@ -1631,10 +1632,14 @@ impl Session {
             if self.is_closed() {
                 break;
             }
-            if self.multipath {
-                self.join_all(&mut paths);
-            } else {
-                self.arrive(&mut paths);
+            // Closing: the bye goes on the paths there are; close() ends
+            // those that come.
+            if !self.closing.load(Ordering::SeqCst) {
+                if self.multipath {
+                    self.join_all(&mut paths);
+                } else {
+                    self.arrive(&mut paths);
+                }
             }
             if paths.lives.is_empty() {
                 // Closing: close() ends it. Else another path, or the end.
@@ -1668,8 +1673,8 @@ impl Session {
 
     /// A connection made a path the session's thread drives (path: made
     /// already, the first): its datagrams read from now on (a QUIC path's
-    /// budget told while it carries), what came with its hello taken. An
-    /// error (what came broke the protocol): the path ended.
+    /// budget told while it carries). What came with its hello is taken
+    /// once it is the carrier or a reserve (greet()).
     fn take_up(self: &Arc<Self>, mut established: Established, path: Option<Arc<Path>>) -> Result<Live, String> {
         let path = match path {
             Some(path) => path,
@@ -1711,10 +1716,15 @@ impl Session {
         conn.set_buffer_limit(None);
         let now = Instant::now();
         let prior = Some(path.budget.load(Ordering::Relaxed)).filter(|prior| *prior != 0);
-        let mut live = Live { path, conn, stream, decoder, drain: Drain::new(now, prior), next_ping: now, next_udp_ping: now,
-                              suspect_since: None, steady_since: now, taken_at: now, blocked: false, took: false,
-                              leaving: None };
-        // Frames that came with the hello.
+        Ok(Live { path, conn, stream, decoder, drain: Drain::new(now, prior), next_ping: now, next_udp_ping: now,
+                  suspect_since: None, steady_since: now, taken_at: now, blocked: false, took: false, leaving: None })
+    }
+
+    /// The frames that came with paths.lives[index]'s hello, taken (as the
+    /// path's first round would); an error (they broke the protocol): the
+    /// path lost.
+    fn greet(self: &Arc<Self>, paths: &mut Paths, index: usize) {
+        let live = &mut paths.lives[index];
         let greeted = (|| {
             while let Some((kind, channel, body)) = live.decoder.next().map_err(|e| e.to_string())? {
                 self.heard_on(&live.path);
@@ -1723,11 +1733,8 @@ impl Session {
             Ok::<(), String>(())
         })();
         if let Err(e) = greeted {
-            live.path.gone.store(true, Ordering::SeqCst);
-            end_path(&live.path);
-            return Err(e);
+            self.lose(paths, index, Lost::Failed(e));
         }
-        Ok(live)
     }
 
     /// Whether path is the one the session runs on now.
@@ -1827,7 +1834,8 @@ impl Session {
             return;
         }
         paths.last = Some((path.kind.clone(), reason));
-        if self.multipath && !ending {
+        // Closing too: the bye goes after what the lost one had not delivered.
+        if self.multipath && !self.is_closed() {
             if let Some(best) = self.best_reserve(paths, true) {
                 log!("{}: from {} to {} at once, the {} path lost", self.label(), path.kind, paths.lives[best].path.kind,
                      path.kind);
@@ -1881,6 +1889,7 @@ impl Session {
                 self.live.lock().unwrap().push(live.path.clone());
                 paths.lives.push(live);
                 self.carry(paths, 0);
+                self.greet(paths, 0);
             }
             Err(reason) => {
                 self.retire(None);
@@ -1903,6 +1912,9 @@ impl Session {
                 Ok(live) => live,
                 Err(e) => {
                     log!("{}: a {kind} path not taken ({e})", self.label());
+                    if paths.lives.is_empty() {
+                        paths.last = Some((kind, e));
+                    }
                     continue;
                 }
             };
@@ -1924,9 +1936,11 @@ impl Session {
                                        if forced { "the other side has no path" } else { "a better one of its kind" }),
                 }
                 self.carry(paths, new);
+                self.greet(paths, 0);
             } else {
                 log!("{}: a {kind} path ({}) taken as a reserve", self.label(), paths.lives[new].path.id);
                 self.tell_path(&paths.lives[new].path, PathState::Standby);
+                self.greet(paths, new);
             }
             if paths.lives.iter().filter(|live| live.leaving.is_none()).count() > MAX_PATHS {
                 let worst = paths.lives.iter().enumerate().skip(1).filter(|(_, live)| live.leaving.is_none())

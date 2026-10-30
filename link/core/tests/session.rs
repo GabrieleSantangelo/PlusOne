@@ -1326,3 +1326,57 @@ fn a_path_gone_suspect_is_not_made_the_carrier_again_for_a_while() {
         assert_eq!(said, expected, "{side}");
     }
 }
+
+#[test]
+fn a_session_closed_as_its_carrier_goes_says_bye_over_its_reserve() {
+    // usb the carrier, its stream full (the relay holding what comes, a
+    // transfer under way): the PC closes the session, and usb ends while
+    // its "bye" waits behind the transfer. bt takes the carrier's place
+    // all the same: what usb had not delivered goes again on it, then the
+    // bye, and the tablet's session is over at once. (Closing, the carrier
+    // lost was not replaced: what waited went on bt as it was, numbered
+    // past what the tablet had, which lost that path too; the bye never
+    // came, and the tablet waited for a path.)
+    let (pc, tablet, _address) = pair();
+    let (tell, told) = mpsc::channel();
+    tablet.on_event(move |event| {
+        let said = match event {
+            Event::Detached(_) => "detached".to_owned(),
+            Event::Gone(_, reason) => reason,
+            _ => return,
+        };
+        let _ = tell.send(said);
+    });
+    let (session, _bt) = stream_path(&pc, &tablet, "bt");
+    let (pcs, tablets, paused) = pausable();
+    std::thread::spawn({
+        let tablet = tablet.clone();
+        move || tablet.accept_stream(Box::new(tablets), "usb").map(|_| ())
+    });
+    let usb = pcs.try_clone().unwrap();
+    assert!(Arc::ptr_eq(&pc.connect_stream(Box::new(pcs), "usb").unwrap(), &session), "the same session, another path");
+    let theirs = tablet.sessions().pop().unwrap();
+    until("on usb on both sides", || session.path().as_deref() == Some("usb") && theirs.path().as_deref() == Some("usb")
+          && session.paths().len() == 2 && theirs.paths().len() == 2);
+    let sink = session.open("echo", "bulk", Class::Control).unwrap();
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    let filling = std::thread::spawn(move || {
+        let chunk = vec![7u8; 64 << 10];
+        for _ in 0..24 {
+            if sink.send(&chunk).is_err() {
+                break;
+            }
+        }
+        sink
+    });
+    std::thread::sleep(Duration::from_millis(300));  // usb's stream full: the PC's queue waits
+    let closing = {
+        let session = session.clone();
+        std::thread::spawn(move || session.close())
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    usb.shutdown(std::net::Shutdown::Both).unwrap();
+    closing.join().unwrap();
+    assert_eq!(told.recv_timeout(Duration::from_secs(2)).as_deref(), Ok("closed by the other side"));
+    drop(filling.join().unwrap());
+}
