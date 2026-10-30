@@ -7,8 +7,10 @@
 //! session's rate (a QUIC path's controller), and at a fixed 4 Mbit/s on
 //! both transports; input (285 states a second) and sound (a packet each
 //! 5 ms: its gaps) under a transfer, and beside the video; channels opened
-//! while a transfer runs (how long, how many never were). One line a test,
-//! key=value.
+//! while a transfer runs (how long, how many never were). The video is a
+//! Video channel's, a frame a group (on QUIC, a stream each, if the tablet
+//! reads them): after the sound beside it, what its groups did (av_groups),
+//! and at the end in all (groups). One line a test, key=value.
 //! With --chain S, only the desktop's chain after a cut, on QUIC (chain()):
 //! S seconds as appdisplay.py ran before l36 (chain_old), S as after
 //! (chain_new), on the same session; with --variant NAME[:KEY=VALUE...]
@@ -20,6 +22,7 @@
 //!             [--quic] [--seconds S] [--video KBPS] [--opens N] [--chain S
 //!             [--variant NAME[:KEY=VALUE...]]...]
 
+use plusone_link::groups::Stats as GroupStats;
 use plusone_link::session::MAX_DATAGRAM;
 use plusone_link::{Class, Identity, Node, Session};
 use std::collections::HashMap;
@@ -182,19 +185,21 @@ fn transfer(session: &Arc<Session>, feature: &str, seconds: f64) -> f64 {
 /// A video for seconds at kbps, or (None) at 0.85 of the session's rate
 /// less leave (bytes a second: the others' share, as the desktop leaves it).
 fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) -> String {
-    let channel = session.open("frames", "v", Class::Realtime).unwrap();
+    let channel = session.open("frames", "v", Class::Video).unwrap();
     let reader = channel.try_clone().unwrap();
     let sent_at: Arc<Mutex<HashMap<u32, u64>>> = Arc::default();
     let latencies: Arc<Mutex<Vec<f64>>> = Arc::default();
+    let wholes: Arc<Mutex<std::collections::HashSet<u32>>> = Arc::default();
     let done = Arc::new(AtomicBool::new(false));
     let collecting = {
-        let (sent_at, latencies, done) = (sent_at.clone(), latencies.clone(), done.clone());
+        let (sent_at, latencies, wholes, done) = (sent_at.clone(), latencies.clone(), wholes.clone(), done.clone());
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64];
             while !done.load(Ordering::SeqCst) {
                 if let Ok(Some(4)) = reader.recv(&mut buf, Some(Duration::from_millis(100))) {
                     let frame = u32::from_be_bytes(buf[..4].try_into().unwrap());
                     if let Some(at) = sent_at.lock().unwrap().remove(&frame) {
+                        wholes.lock().unwrap().insert(frame);
                         latencies.lock().unwrap().push((now_ns() - at) as f64 / 1e6);
                     }
                 }
@@ -222,7 +227,7 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
             packet.extend_from_slice(&(count as u16).to_be_bytes());
             packet.resize(8 + payload.min(size - index * payload), 0);
             bytes += packet.len() as u64;
-            let _ = channel.send(&packet);
+            let _ = channel.send_in_group(frame, frame % 120 == 0, index + 1 == count, &packet);
         }
         frame += 1;
     }
@@ -231,7 +236,19 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
     let _ = collecting.join();
     let whole = latencies.lock().unwrap().len();
     let mean = rates.iter().sum::<u64>() / rates.len().max(1) as u64;
-    format!("whole={:.1}% kbps={} target={} {}", 100.0 * whole as f64 / frame.max(1) as f64,
+    // Whole frames after a lost one of their GOP (a keyframe each 120): a
+    // decoder could not show them.
+    let (wholes, mut broken, mut undecodable) = (wholes.lock().unwrap(), false, 0);
+    for f in 0..frame {
+        broken &= f % 120 != 0;
+        match wholes.contains(&f) {
+            false => broken = true,
+            true if broken => undecodable += 1,
+            true => {}
+        }
+    }
+    format!("whole={:.1}% decodable={:.1}% undecodable={undecodable} kbps={} target={} {}",
+            100.0 * whole as f64 / frame.max(1) as f64, 100.0 * (whole - undecodable) as f64 / frame.max(1) as f64,
             (bytes as f64 * 8.0 / 1000.0 / seconds) as u64, mean * 8 / 1000, quantiles(latencies.lock().unwrap().clone()))
 }
 
@@ -567,6 +584,26 @@ fn chain(session: &Arc<Session>, seconds: f64, v: &Variant) -> String {
             (bytes * 8.0 / 1000.0 / seconds) as u64, quantiles(latencies))
 }
 
+/// What a QUIC path's groups did between before and after (all since it
+/// began, if before is None), and how much of what was lost soon after a
+/// cut QUIC sent again, estimated: the groups' share of the realtime sent
+/// (bulk aside).
+fn groups(before: Option<GroupStats>, after: Option<GroupStats>) -> String {
+    let Some(after) = after else { return "none=1".into() };
+    let b = before.unwrap_or_default();
+    let d = |a: u64, b: u64| a.saturating_sub(b);
+    let (stream, datagram) = (d(after.stream_bytes, b.stream_bytes), d(after.datagram_bytes, b.datagram_bytes));
+    let share = stream as f64 / (stream + datagram).max(1) as f64;
+    let lost_cut = d(after.lost_after_cut, b.lost_after_cut);
+    format!("groups={} late={} late_kb={:.1} superseded={} late_unsent={} dropped={} credit_waits={} window_full={} \
+             wait_ms={} control={} stream_kb={:.1} lost_kb={:.1} lost_cut_kb={:.1} cuts={} share={:.2} retx_cut_kb={:.1}",
+            d(after.groups, b.groups), d(after.late, b.late), d(after.late_bytes, b.late_bytes) as f64 / 1e3,
+            d(after.superseded, b.superseded), d(after.late_unsent, b.late_unsent), d(after.dropped, b.dropped),
+            d(after.credit_waits, b.credit_waits), d(after.window_full, b.window_full), d(after.wait_ms, b.wait_ms),
+            d(after.control, b.control), stream as f64 / 1e3, d(after.lost_bytes, b.lost_bytes) as f64 / 1e3,
+            lost_cut as f64 / 1e3, d(after.cuts, b.cuts), share, lost_cut as f64 * share / 1e3)
+}
+
 /// Until what the last test left on its way is gone (each test measures
 /// itself, not the one before's queue), 30 s at most.
 fn settle(session: &Arc<Session>) {
@@ -634,14 +671,22 @@ fn main() {
     let rt = realtime(&session, seconds);
     println!("test=rt_both {rt} mbs={:.2}", both.join().unwrap());
     settle(&session);
+    let before = session.group_stats();
     println!("test=video {}", video(&session, seconds, video_kbps, 0));
+    if session.by_quic() {
+        println!("test=video_groups {}", groups(before, session.group_stats()));
+    }
     settle(&session);
+    let before = session.group_stats();
     let up = {
         let session = session.clone();
         std::thread::spawn(move || transfer(&session, "sink", seconds))
     };
     let v = video(&session, seconds, video_kbps, 0);
     println!("test=video_up {v} mbs={:.2}", up.join().unwrap());
+    if session.by_quic() {
+        println!("test=up_groups {}", groups(before, session.group_stats()));
+    }
     settle(&session);
     // The same 4 Mbit/s on both transports: the path alone compared.
     println!("test=video4 {}", video(&session, seconds, Some(4000), 0));
@@ -662,6 +707,7 @@ fn main() {
     settle(&session);
     // The desktop and its sound together, as the tablet takes them (PCM's
     // 960 bytes each 5 ms): the sound must not wait behind the frames.
+    let before = session.group_stats();
     let sound = {
         let session = session.clone();
         std::thread::spawn(move || flow(&session, Class::Realtime, 960, Duration::from_millis(5), seconds))
@@ -670,6 +716,20 @@ fn main() {
     let (rtts, sent, gap) = sound.join().unwrap();
     println!("test=av_audio back={} sent={sent} gap={gap} {}", rtts.len(), quantiles(rtts));
     println!("test=av_video {v}");
+    if session.by_quic() {
+        println!("test=av_groups {}", groups(before, session.group_stats()));
+    }
+    settle(&session);
+    // Channels opened while the video goes alone: a control message's wait
+    // behind its frames.
+    let frames = {
+        let session = session.clone();
+        std::thread::spawn(move || video(&session, seconds, video_kbps, 0))
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let (times, failed) = opens(&session, 20);
+    let _ = frames.join();
+    println!("test=opens_video ok={} failed={failed} {}", times.len(), quantiles(times));
     settle(&session);
     let up = {
         let session = session.clone();
@@ -678,6 +738,9 @@ fn main() {
     std::thread::sleep(Duration::from_millis(500));
     let (times, failed) = opens(&session, opened);
     println!("test=opens_up ok={} failed={failed} {} mbs={:.2}", times.len(), quantiles(times), up.join().unwrap());
+    if session.by_quic() {
+        println!("test=groups {}", groups(None, session.group_stats()));
+    }
     println!("test=end dropped={} rate_kbps={:?}", session.dropped(),
              session.rate().map(|r| r * 8 / 1000));
 }

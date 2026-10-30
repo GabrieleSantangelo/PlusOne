@@ -1180,3 +1180,175 @@ fn the_sixty_fifth_channel_is_refused() {
     assert!(refused.contains("64 channels"), "{refused}");
     drop(open);
 }
+
+/// A Video channel by QUIC alone (the tablet reads groups or not): 30
+/// frames of 10 pieces sent in groups, echoed back by the tablet's end (a
+/// Realtime one); what came back, (frame, piece) each, and the groups'
+/// counts on the PC's side.
+fn video_by_quic(groups: bool) -> (Vec<(u32, u16)>, plusone_link::groups::Stats) {
+    let (pc, tablet, _address) = pair();
+    tablet.video_streams(groups);
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let session = pc.connect_quic(quic, Duration::from_secs(2), "lan").unwrap();
+    until("datagrams proven", || session.rtt().is_some());
+    let video = session.open("echo", "v", Class::Video).unwrap();
+    let reader = video.try_clone().unwrap();
+    let collecting = std::thread::spawn(move || {
+        let (mut buf, mut got) = (vec![0u8; 2048], Vec::new());
+        while let Ok(Some(n)) = reader.recv(&mut buf, Some(Duration::from_secs(1))) {
+            assert_eq!(n, 1000, "a message not as it was written");
+            got.push((u32::from_be_bytes(buf[..4].try_into().unwrap()), u16::from_be_bytes(buf[4..6].try_into().unwrap())));
+        }
+        got
+    });
+    for frame in 0..30u32 {
+        for piece in 0..10u16 {
+            let mut data = vec![0u8; 1000];
+            data[..4].copy_from_slice(&frame.to_be_bytes());
+            data[4..6].copy_from_slice(&piece.to_be_bytes());
+            video.send_in_group(frame, false, piece == 9, &data).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let got = collecting.join().unwrap();
+    let stats = session.group_stats().expect("a QUIC path");
+    (got, stats)
+}
+
+#[test]
+fn video_goes_in_groups_on_quic_streams_each_message_as_written() {
+    let (got, stats) = video_by_quic(true);
+    assert!(got.len() >= 295, "{} of 300 came back", got.len());
+    // Each frame's pieces in order (a frame's stream keeps them so).
+    for frame in 0..30u32 {
+        let pieces: Vec<u16> = got.iter().filter(|(f, _)| *f == frame).map(|(_, p)| *p).collect();
+        assert!(pieces.windows(2).all(|w| w[0] < w[1]), "frame {frame}: {pieces:?}");
+    }
+    assert_eq!((stats.groups, stats.late, stats.dropped), (30, 0, 0), "{stats}");
+    assert!(stats.stream_bytes >= 300 * 1000, "{stats}");
+}
+
+#[test]
+fn video_to_a_device_that_reads_no_groups_goes_as_realtime() {
+    let (got, stats) = video_by_quic(false);
+    assert!(got.len() >= 295, "{} of 300 came back", got.len());
+    assert_eq!((stats.groups, stats.stream_bytes), (0, 0), "{stats}");
+}
+
+#[test]
+fn video_on_a_tcp_path_goes_as_realtime() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let video = session.open("echo", "v", Class::Video).unwrap();
+    let mut buf = [0u8; 2048];
+    // Before UDP is proven (over the stream), and after.
+    video.send_in_group(1, false, true, b"early").unwrap();
+    assert_eq!(video.recv(&mut buf, WAIT).unwrap(), Some(5));
+    assert_eq!(&buf[..5], b"early");
+    until("UDP proven", || session.rtt().is_some());
+    video.send_in_group(2, false, false, b"later").unwrap();
+    assert_eq!(video.recv(&mut buf, WAIT).unwrap(), Some(5));
+    assert_eq!(&buf[..5], b"later");
+    assert!(session.group_stats().is_none());
+    // Shorter than a head: dropped, counted.
+    video.send(&[1, 0, 0]).unwrap();
+    assert_eq!(video.recv(&mut buf, Some(Duration::from_millis(300))).unwrap(), None);
+    assert!(session.dropped() >= 1);
+}
+
+/// A UDP relay to address: towards it at rate bytes a second, queue's
+/// worth of packets waiting at most (the rest dropped, as a router's), back
+/// as they come. Its address; it runs as long as the process.
+fn shaped(address: SocketAddr, rate: f64, queue: Duration) -> SocketAddr {
+    let near = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let far = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    far.connect(address).unwrap();
+    let via = near.local_addr().unwrap();
+    let from: Arc<std::sync::Mutex<Option<SocketAddr>>> = Arc::default();
+    let (back, answering, sender) = (near.try_clone().unwrap(), far.try_clone().unwrap(), from.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok(n) = answering.recv(&mut buf) {
+            if let Some(to) = *sender.lock().unwrap() {
+                let _ = back.send_to(&buf[..n], to);
+            }
+        }
+    });
+    let (due, leaving) = mpsc::channel::<(Vec<u8>, Instant)>();
+    std::thread::spawn(move || {
+        for (packet, at) in leaving {
+            std::thread::sleep(at.saturating_duration_since(Instant::now()));
+            let _ = far.send(&packet);
+        }
+    });
+    std::thread::spawn(move || {
+        let (mut buf, mut free) = ([0u8; 2048], Instant::now());
+        while let Ok((n, sender)) = near.recv_from(&mut buf) {
+            *from.lock().unwrap() = Some(sender);
+            let now = Instant::now();
+            let start = free.max(now);
+            if start - now > queue {
+                continue;
+            }
+            free = start + Duration::from_secs_f64(n as f64 / rate);
+            let _ = due.send((buf[..n].to_vec(), free));
+        }
+    });
+    via
+}
+
+/// Channels opened one after the other while a transfer fills a QUIC path
+/// at 100 KB/s, the PC's video streams on or off: how long each open took.
+fn opens_behind_a_transfer_by_quic(streams: bool) -> Vec<Duration> {
+    let (pc, tablet, _address) = pair();
+    pc.video_streams(streams);
+    let quic = tablet.listen_quic("127.0.0.1:0".parse().unwrap()).unwrap();
+    let session = pc.connect_quic(shaped(quic, 100_000.0, Duration::from_millis(200)), Duration::from_secs(3), "lan")
+        .unwrap();
+    until("datagrams proven", || session.rtt().is_some());
+    let bulk = session.open("echo", "bulk", Class::Control).unwrap();
+    let draining = {
+        let bulk = bulk.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 17];
+            while let Ok(Some(n)) = bulk.recv(&mut buf, Some(Duration::from_secs(3))) {
+                if n == 0 {
+                    break;
+                }
+            }
+        })
+    };
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sending = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let chunk = vec![7u8; 32 << 10];
+            while !done.load(std::sync::atomic::Ordering::SeqCst) && bulk.send(&chunk).is_ok() {}
+            bulk
+        })
+    };
+    std::thread::sleep(Duration::from_millis(1500));  // the transfer's queues full
+    let took = (0..3).map(|i| {
+        let begun = Instant::now();
+        let channel = session.open("echo", &format!("open{i}"), Class::Control).unwrap();
+        let took = begun.elapsed();
+        drop(channel);
+        took
+    }).collect();
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(sending.join().unwrap());
+    let _ = draining.join();
+    took
+}
+
+#[test]
+fn a_channel_opens_ahead_of_a_transfer_on_a_slow_quic_path() {
+    // The open and its answer go on each side's control stream, ahead of
+    // what the transfer has in quinn, in the bridge and in the stream's TLS
+    // (behind it, each took most of a second at this rate).
+    let on = opens_behind_a_transfer_by_quic(true);
+    let off = opens_behind_a_transfer_by_quic(false);
+    let longest = |took: &[Duration]| took.iter().max().copied().unwrap();
+    assert!(longest(&on) < Duration::from_millis(450), "opens behind a transfer took {on:?} ({off:?} with streams off)");
+    assert!(longest(&off) > longest(&on), "streams off as fast as on: {off:?}, {on:?}");
+}

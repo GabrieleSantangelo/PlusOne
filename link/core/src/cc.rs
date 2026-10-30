@@ -65,18 +65,36 @@ const STANDING_BUCKETS: usize = 6;
 /// PUBLISH_EVERY, going down at once.
 pub(crate) const PUBLISH_CHANGE: f64 = 0.10;
 pub(crate) const PUBLISH_EVERY: Duration = Duration::from_millis(100);
+/// Losses this soon after a cut count apart (Losses): what QUIC sends
+/// again of a group's lost data then goes while the network is full.
+const AFTER_CUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Default)]
 pub struct GccConfig {
     /// The rate (bytes a second) for the application to read.
     pub rate: Arc<AtomicU64>,
     pub budget: Arc<Budget>,
+    pub losses: Arc<Losses>,
 }
 
 impl ControllerFactory for GccConfig {
     fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
-        Box::new(Gcc::new(now, mtu, self.rate.clone(), self.budget.clone()))
+        let mut gcc = Gcc::new(now, mtu, self.rate.clone(), self.budget.clone());
+        gcc.losses = self.losses.clone();
+        Box::new(gcc)
     }
+}
+
+/// Bytes in the packets quinn declared lost, all told, and of those the
+/// ones within AFTER_CUT of a cut; the cuts (the rate down: the trend, a
+/// standing queue, loss). quinn sends a stream's lost data again (a
+/// group's: groups.rs), never a datagram's: what it sends again soon after
+/// a cut goes while the network is full.
+#[derive(Debug, Default)]
+pub struct Losses {
+    pub lost: AtomicU64,
+    pub after_cut: AtomicU64,
+    pub cuts: AtomicU64,
 }
 
 /// The rate as told the application, as it moves (PUBLISH_CHANGE): waited
@@ -191,6 +209,8 @@ struct Gcc {
     why: usize,
     /// Which controller this is, in a record (each connection has one).
     id: u32,
+    losses: Arc<Losses>,
+    last_cut: Option<Instant>,
 }
 
 const TRACE_EVERY: Duration = Duration::from_millis(250);
@@ -230,7 +250,14 @@ impl Gcc {
               acked_since: 0, loss_window: now, srtt: Duration::from_millis(50), last_over: now, samples: VecDeque::new(),
               traced: now, cuts: [0; 3], why: 0,
               id: { static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    NEXT.fetch_add(1, Ordering::Relaxed) } }
+                    NEXT.fetch_add(1, Ordering::Relaxed) },
+              losses: Arc::default(), last_cut: None }
+    }
+
+    /// The rate cut (Losses).
+    fn cut(&mut self, now: Instant) {
+        self.last_cut = Some(now);
+        self.losses.cuts.fetch_add(1, Ordering::Relaxed);
     }
 
     fn ms(&self, t: Instant) -> f64 {
@@ -358,6 +385,7 @@ impl Gcc {
         match self.state {
             State::Decrease => {
                 self.cuts[self.why] += 1;
+                self.cut(now);
                 self.slow_start = false;
                 // At most 30 % a cut.
                 self.rate = (BETA * acked).max(0.7 * self.rate).max(MIN_RATE).min(self.rate);
@@ -466,6 +494,7 @@ impl Gcc {
                 self.rate = (self.rate * (1.0 - 0.5 * loss)).max(MIN_RATE);
                 self.slow_start = false;
                 self.cuts[2] += 1;
+                self.cut(now);
             }
             self.lost = 0;
             self.acked_since = 0;
@@ -499,9 +528,14 @@ impl Controller for Gcc {
         record(format_args!("{} l {} {lost_bytes} {}", self.id, now.duration_since(self.start).as_micros(),
                             persistent as u8));
         self.lost += lost_bytes;
+        self.losses.lost.fetch_add(lost_bytes, Ordering::Relaxed);
+        if self.last_cut.is_some_and(|cut| now.saturating_duration_since(cut) <= AFTER_CUT) {
+            self.losses.after_cut.fetch_add(lost_bytes, Ordering::Relaxed);
+        }
         if persistent {
             self.rate = MIN_RATE;
             self.slow_start = false;
+            self.cut(now);
         }
     }
 
@@ -727,5 +761,25 @@ mod tests {
         // The same rate, the round trip 40 ms more and staying (a router's queue).
         carry(&mut gcc, &mut now, 2e6, 1.0, Duration::from_millis(50));
         assert!(gcc.cuts[1] > 0);
+    }
+
+    #[test]
+    fn losses_soon_after_a_cut_are_counted_apart() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
+        Controller::on_congestion_event(&mut gcc, now, now, false, 1000);
+        assert_eq!(gcc.losses.after_cut.load(Ordering::Relaxed), 0, "no cut yet");
+        // A queue standing: cut.
+        while gcc.losses.cuts.load(Ordering::Relaxed) == 0 {
+            assert!(now.duration_since(start) < Duration::from_secs(5), "never cut");
+            carry(&mut gcc, &mut now, 2e6, 0.01, Duration::from_millis(50));
+        }
+        let cut = gcc.last_cut.unwrap();
+        Controller::on_congestion_event(&mut gcc, cut + Duration::from_millis(400), cut, false, 2000);
+        Controller::on_congestion_event(&mut gcc, cut + Duration::from_millis(600), cut, false, 4000);
+        assert_eq!(gcc.losses.lost.load(Ordering::Relaxed), 7000);
+        assert_eq!(gcc.losses.after_cut.load(Ordering::Relaxed), 2000);
     }
 }

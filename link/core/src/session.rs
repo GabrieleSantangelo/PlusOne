@@ -29,13 +29,15 @@ use crate::stream::Stream;
 use crate::sys::{self, Wake};
 use crate::{log, Class};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
+
+pub mod grouped;
 
 /// A ping each this long, on the stream and over UDP.
 pub const PING_EVERY: Duration = Duration::from_secs(1);
@@ -129,6 +131,12 @@ const ACK_AFTER: u64 = 32;
 /// ACK_AFTER frames, 32 MiB at the very most; one that never does holds no
 /// more of ours than this).
 const UNACKED_MOST: usize = 64 << 20;
+/// Copies of the other side's session messages that came ahead (early):
+/// at most this many taken and not yet come on the stream, and none
+/// numbered further than EARLY_SPAN past the newest that did (more go by
+/// the stream alone).
+const EARLY_MOST: usize = 4096;
+const EARLY_SPAN: u64 = 1 << 16;
 const KEYS_LABEL: &[u8] = b"EXPORTER-plus-one-link datagrams";
 const ID_LABEL: &[u8] = b"EXPORTER-plus-one-link session";
 const DATAGRAM_PATH: u16 = 0;  // the datagrams' own channel: pings and pongs
@@ -253,11 +261,13 @@ impl End {
 
 /// A reliable frame not numbered yet: it is numbered as it leaves
 /// (Outbox::take), in the order frames leave, so the queue may put one
-/// ahead of others (the other side takes numbers in order only).
+/// ahead of others (the other side takes numbers in order only). early:
+/// one of the session's own messages that may go ahead (Session::early).
 struct Waiting {
     kind: u8,
     channel: u16,
     body: Vec<u8>,
+    early: bool,
 }
 
 impl Waiting {
@@ -350,6 +360,18 @@ impl Outbox {
         Some(waiting)
     }
 
+    /// The session's own messages waiting (Queue::Ahead), all at once, to
+    /// be numbered now: none while frames of a lost path are to be sent
+    /// again first (numbered before any new one).
+    fn take_ahead(&mut self) -> Vec<Waiting> {
+        if !self.resend.is_empty() {
+            return Vec::new();
+        }
+        let ahead: Vec<Waiting> = self.ahead.drain(..).collect();
+        self.reliable_bytes -= ahead.iter().map(Waiting::size).sum::<usize>();
+        ahead
+    }
+
     /// The next for TLS: every urgent frame and those to send again, then
     /// reliable frames up to reliable bytes (0: none now) to be numbered;
     /// and how many bytes of the reliable.
@@ -382,6 +404,9 @@ struct Reliable {
     unacked_bytes: usize,
     heard: u64,
     acknowledged: u64,  // the newest of theirs we said we have
+    /// Theirs taken from copies that came ahead (Session::early), past heard:
+    /// passed over as they come on the stream.
+    early: BTreeSet<u64>,
 }
 
 /// A path's state (LINK-STATES §4): heard lately; nothing heard for
@@ -709,6 +734,10 @@ pub(crate) struct Established {
     forced: bool,
     /// A QUIC path's connection (quic.rs).
     quic: Option<crate::quic::Quic>,
+    /// Our hello said we take Video's groups and the session's messages on
+    /// QUIC streams of their own (lib.rs video_streams): used if theirs
+    /// says so too.
+    streams: bool,
 }
 
 impl Established {
@@ -716,8 +745,12 @@ impl Established {
         &self.kind
     }
 
-    /// The connection under the stream is QUIC's: its datagrams carry ours.
-    pub(crate) fn set_quic(&mut self, quic: crate::quic::Quic) {
+    /// The connection under the stream is QUIC's: its datagrams carry ours
+    /// (and Video's groups and copies of the session's messages its
+    /// streams, if both hellos say so).
+    pub(crate) fn set_quic(&mut self, mut quic: crate::quic::Quic) {
+        let theirs = |key: &str| self.hello[key].as_u64() == Some(1);
+        quic.set_streams(self.streams && theirs("groups"), self.streams && theirs("control"));
         self.quic = Some(quic);
     }
 
@@ -783,6 +816,7 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
                         kind: &str, ours: &dyn Fn(&str) -> Option<(String, bool)>) -> io::Result<Established> {
     stream.set_timeouts(Some(HANDSHAKE))?;
     let until = Instant::now() + HANDSHAKE_WHOLE;
+    let streams = hello["groups"].as_u64() == Some(1) && hello["control"].as_u64() == Some(1);
     while conn.is_handshaking() {
         conn.complete_io(&mut Until(&mut stream, until))?;
     }
@@ -866,7 +900,7 @@ pub(crate) fn establish(mut conn: rustls::Connection, mut stream: Box<dyn Stream
         _ => kind.to_owned(),
     };
     Ok(Established { conn, stream, decoder, peer, hello: theirs, udp, udp_peer, sealer, opener, dialer,
-                     kind, id, resumes, forced, quic: None })
+                     kind, id, resumes, forced, quic: None, streams })
 }
 
 /// A connection made ready to be a path (id: the session's number for
@@ -1137,7 +1171,7 @@ impl Session {
         self.inbox(&end);
         let (answer, answered) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, answer);
-        self.send_message(json!({"t": "open", "id": id, "feature": feature, "channel": name, "class": class.name()}));
+        self.send_message(json!({"t": "open", "id": id, "feature": feature, "channel": name, "class": class.wire()}));
         let result = answered.recv_timeout(OPEN_WAIT);
         self.pending.lock().unwrap().remove(&id);
         match result {
@@ -1166,7 +1200,9 @@ impl Session {
         let handler = self.node.upgrade().and_then(|node| node.handler(&feature));
         // With its id as it came, whatever it is.
         let refuse = |reason: &str| self.send_message(json!({"t": "refuse", "id": message["id"], "reason": reason}));
-        let Some(class) = message["class"].as_str().and_then(Class::parse) else { return refuse("unknown class") };
+        let Some(class) = message["class"].as_str().and_then(Class::parse).filter(|c| *c != Class::Video) else {
+            return refuse("unknown class");
+        };
         let Some(handler) = handler else { return refuse("not served") };
         let Ok(id) = channel_id(message) else { return refuse("bad id") };
         if id == DATAGRAM_PATH || id % 2 == self.next_id.load(Ordering::Relaxed) % 2
@@ -1217,6 +1253,7 @@ impl Session {
                         me.wait_for_room(end.id);
                         me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
                     }
+                    Class::Video => me.send_grouped(end.id, &buf[..length], &mut sealed),
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
                 }
             }
@@ -1361,20 +1398,23 @@ impl Session {
             Some("bye") => Queue::Last,
             _ => Queue::Ahead,
         };
-        self.outbox.lock().unwrap().push(Waiting { kind: frame::SESSION, channel: 0, body: message.to_string().into_bytes() },
-                                         queue);
+        let early = matches!(queue, Queue::Ahead);
+        self.outbox.lock().unwrap().push(Waiting { kind: frame::SESSION, channel: 0, body: message.to_string().into_bytes(),
+                                                   early }, queue);
         self.wake.wake();
     }
 
     /// A channel's message, queued (numbered as it leaves).
     fn queue_reliable(&self, kind: u8, channel: u16, body: &[u8]) {
-        self.outbox.lock().unwrap().push(Waiting { kind, channel, body: body.to_vec() }, Queue::Channel(channel));
+        self.outbox.lock().unwrap().push(Waiting { kind, channel, body: body.to_vec(), early: false }, Queue::Channel(channel));
         self.wake.wake();
     }
 
     /// Frames leaving: numbered in the order they leave, kept until the
-    /// other side says it has them, onto out.
-    fn number(&self, fresh: Vec<Waiting>, out: &mut Vec<u8>) {
+    /// other side says it has them, onto out; the session's own messages
+    /// that may go ahead onto early too, if given (the same bytes: the
+    /// other side takes whichever comes first, once).
+    fn number(&self, fresh: Vec<Waiting>, out: &mut Vec<u8>, mut early: Option<&mut Vec<u8>>) {
         let mut reliable = self.reliable.lock().unwrap();
         for waiting in fresh {
             let number = reliable.next;
@@ -1384,6 +1424,9 @@ impl Session {
             let mut bytes = Vec::with_capacity(frame::HEADER + numbered.len());
             frame::encode(waiting.kind, waiting.channel, &numbered, &mut bytes);
             out.extend_from_slice(&bytes);
+            if let Some(early) = early.as_mut().filter(|_| waiting.early) {
+                early.extend_from_slice(&bytes);
+            }
             reliable.unacked_bytes += bytes.len();
             reliable.unacked.push_back((number, bytes));
         }
@@ -1480,10 +1523,11 @@ impl Session {
         }
         if let Some(quic) = &path.quic {
             let (me, here) = (self.clone(), path.clone());
+            let (early, there) = (self.clone(), path.clone());
             quic.read_datagrams(move |datagram| {
                 let mut buf = datagram.to_vec();
                 me.datagram_in(&here, &mut buf, None, &mut Vec::new());
-            });
+            }, move |kind, _, body| early.early(&there, kind, body));
             // Its budget told as it moves, until the path goes (quic.close();
             // not after a better one took over: retire()).
             let (me, budget, here) = (Arc::downgrade(self), quic.budget(), path.clone());
@@ -1616,6 +1660,22 @@ impl Session {
             if self.arriving.lock().unwrap().is_some() {
                 return Ok(());  // a better path: the session's thread takes it
             }
+            // The session's own messages on a QUIC path that takes them on a
+            // stream of their own: numbered now, whatever waits on the
+            // stream (into TLS's buffer after what is numbered already), and
+            // a copy at once on that stream, ahead of the video and of the
+            // bulk (the stream's is kept until acknowledged, for another
+            // path).
+            let control = path.quic.as_ref().filter(|quic| quic.control());
+            if let Some(quic) = control {
+                let ahead = self.outbox.lock().unwrap().take_ahead();
+                if !ahead.is_empty() {
+                    let (mut out, mut early) = (Vec::new(), Vec::new());
+                    self.number(ahead, &mut out, Some(&mut early));
+                    quic.send_control(&early);
+                    conn.writer().write_all(&out).map_err(|e| e.to_string())?;
+                }
+            }
             // Out: what was queued, once the last of it left: the urgent
             // first, then a slice of the reliable (Outbox::take).
             let mut paced = None;
@@ -1634,7 +1694,11 @@ impl Session {
                     self.room.notify_all();
                 }
                 if !fresh.is_empty() {
-                    self.number(fresh, &mut out);
+                    let mut early = Vec::new();
+                    self.number(fresh, &mut out, control.is_some().then_some(&mut early));
+                    if let Some(quic) = control.filter(|_| !early.is_empty()) {
+                        quic.send_control(&early);
+                    }
                 }
                 let mut pace = self.pace.lock().unwrap();
                 pace.spent(taken);
@@ -1787,6 +1851,9 @@ impl Session {
                         return Err(format!("frame {number} after {}", reliable.heard));
                     }
                     reliable.heard = number;
+                    if reliable.early.remove(&number) {
+                        return Ok(());  // taken from its copy, which came ahead
+                    }
                 }
                 if kind == frame::MESSAGE {
                     self.deliver(channel, &body[8..], true, None);
@@ -1810,6 +1877,34 @@ impl Session {
             _ => log!("{}: a frame of kind {kind}", self.label()),
         }
         Ok(())
+    }
+
+    /// A copy of one of the other side's session messages that came ahead
+    /// on path, on a QUIC stream of its own (quic.rs control; on its
+    /// runtime): taken now, unless it was already, and passed over when it
+    /// comes on the stream (numbered the same: frame()). Only those that
+    /// may go ahead of what is numbered before them: opens and their
+    /// answers, credits, features (a close goes after its channel's data, a
+    /// bye after everything: by the stream alone).
+    fn early(self: &Arc<Self>, path: &Path, kind: u8, body: Vec<u8>) {
+        if kind != frame::SESSION || body.len() < 8 {
+            return;
+        }
+        let number = u64::from_be_bytes(body[..8].try_into().unwrap());
+        let Ok(message) = serde_json::from_slice::<Value>(&body[8..]) else { return };
+        if !matches!(message["t"].as_str(), Some("open" | "accept" | "refuse" | "credit" | "features")) {
+            return;
+        }
+        {
+            let mut reliable = self.reliable.lock().unwrap();
+            if number <= reliable.heard || number - reliable.heard > EARLY_SPAN || reliable.early.len() >= EARLY_MOST
+                || !reliable.early.insert(number) {
+                return;
+            }
+        }
+        path.heard();
+        self.heard_on(path);
+        self.message(&message);
     }
 
     fn message(self: &Arc<Self>, message: &Value) {
@@ -2280,6 +2375,51 @@ mod tests {
         let answer = fake.heard(&["accept", "refuse"]);
         assert_eq!((&answer["t"], &answer["id"], &answer["reason"]), (&json!("refuse"), &json!(65538), &json!("bad id")));
         assert_eq!(session.channels(), 0);
+        devices.pc.close();
+    }
+
+    #[test]
+    fn a_session_message_that_came_ahead_is_taken_once() {
+        // An open's copy on the control stream (Session::early) is taken as
+        // it comes; the same open on the stream after it, numbered the
+        // same, is passed over (taken twice, the second was refused: "bad
+        // id"). A close's copy is not taken ahead of its channel's data, nor
+        // a copy of one heard already.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (told, opened) = mpsc::channel();
+        devices.pc.serve("echo", 1, move |incoming| {
+            let _ = told.send(incoming.channel.id);
+            let mut buf = [0u8; 64];
+            while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let (session, mut fake) = devices.by_cable(false, None);
+        let path = session.current().unwrap();
+        let copy = |number: u64, message: Value| {
+            let mut body = number.to_be_bytes().to_vec();
+            body.extend_from_slice(message.to_string().as_bytes());
+            body
+        };
+        let open = json!({"t": "open", "id": 2, "feature": "echo", "channel": "x", "class": "control"});
+        session.early(&path, frame::SESSION, copy(fake.next, open.clone()));
+        let answer = fake.heard(&["accept", "refuse"]);
+        assert_eq!((&answer["t"], &answer["id"]), (&json!("accept"), &json!(2)));
+        assert_eq!(opened.recv_timeout(Duration::from_secs(5)), Ok(2));
+        fake.say(open);  // the same, by the stream
+        // Its copy again, and a close's: neither taken.
+        session.early(&path, frame::SESSION, copy(fake.next - 1, json!({"t": "open", "id": 4, "feature": "echo",
+                                                                          "channel": "y", "class": "control"})));
+        session.early(&path, frame::SESSION, copy(fake.next, json!({"t": "close", "id": 2})));
+        fake.say(json!({"t": "open", "id": 6, "feature": "echo", "channel": "z", "class": "control"}));
+        let answer = fake.heard(&["accept", "refuse"]);
+        assert_eq!((&answer["t"], &answer["id"]), (&json!("accept"), &json!(6)), "the open taken twice");
+        assert_eq!(opened.recv_timeout(Duration::from_secs(5)), Ok(6));
+        assert_eq!(session.channels(), 2, "the close taken ahead");
+        assert!(session.reliable.lock().unwrap().early.is_empty());
         devices.pc.close();
     }
 

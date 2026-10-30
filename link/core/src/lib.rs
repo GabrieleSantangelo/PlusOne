@@ -12,6 +12,7 @@ pub use cc::fuzz as fuzz_controller;
 mod dscp;
 pub mod frame;
 mod gate;
+pub mod groups;
 pub mod identity;
 pub mod mdns;
 pub mod node;
@@ -38,6 +39,16 @@ pub enum Class {
     Input,
     /// Unreliable; late is lost (sound, video).
     Realtime,
+    /// Realtime in groups (a video's frames): each message the feature
+    /// writes starts with session::grouped::HEAD's bytes (the group, whether
+    /// it is a key one and whether this is its last: Channel::send_in_group),
+    /// which the link takes off. On a QUIC path whose other side reads groups
+    /// (its hello), a group goes on a QUIC stream of its own: what is lost is
+    /// sent again within the controller's rate, and the group is reset once
+    /// late or superseded (groups.rs); else each message as Realtime. The
+    /// other side's end is a Realtime one: its feature sees the messages as
+    /// they were written.
+    Video,
 }
 
 impl Class {
@@ -46,6 +57,16 @@ impl Class {
             Class::Control => "control",
             Class::Input => "input",
             Class::Realtime => "realtime",
+            Class::Video => "video",
+        }
+    }
+
+    /// What the other side is told the channel is: Video is Realtime to it
+    /// (a peer from before groups knows no other).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Class::Video => "realtime",
+            other => other.name(),
         }
     }
 
@@ -54,9 +75,25 @@ impl Class {
             "control" => Some(Class::Control),
             "input" => Some(Class::Input),
             "realtime" => Some(Class::Realtime),
+            "video" => Some(Class::Video),
             _ => None,
         }
     }
+}
+
+/// Video's groups on QUIC streams and the session's messages on a stream of
+/// their own (groups.rs; q3, option B), said in each hello and used where
+/// both say so: on unless PLUSONE_LINK_VIDEO_STREAMS=0 (a live A/B against
+/// the way before them, with no build: either side off, both are).
+pub(crate) fn video_streams() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("PLUSONE_LINK_VIDEO_STREAMS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::log!("video streams off (PLUSONE_LINK_VIDEO_STREAMS=0): video as datagrams, as before them");
+        }
+        on
+    })
 }
 
 /// A line on stderr, with the time (the journal, under a service).
