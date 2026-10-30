@@ -1924,10 +1924,10 @@ impl Session {
                                        if forced { "the other side has no path" } else { "a better one of its kind" }),
                 }
                 self.carry(paths, new);
-                continue;
+            } else {
+                log!("{}: a {kind} path ({}) taken as a reserve", self.label(), paths.lives[new].path.id);
+                self.tell_path(&paths.lives[new].path, PathState::Standby);
             }
-            log!("{}: a {kind} path ({}) taken as a reserve", self.label(), paths.lives[new].path.id);
-            self.tell_path(&paths.lives[new].path, PathState::Standby);
             if paths.lives.iter().filter(|live| live.leaving.is_none()).count() > MAX_PATHS {
                 let worst = paths.lives.iter().enumerate().skip(1).filter(|(_, live)| live.leaving.is_none())
                     .min_by_key(|(_, live)| live.path.rank()).map(|(index, _)| index);
@@ -1951,9 +1951,15 @@ impl Session {
         let soon = |at: Instant, next: &mut Option<Instant>| *next = Some(next.map_or(at, |next| next.min(at)));
         let mut index = 0;
         while index < paths.lives.len() {
-            let done = match &paths.lives[index].leaving {
+            let live = &mut paths.lives[index];
+            // The one that took its place gone already: it stays as it was.
+            if live.leaving.as_ref().is_some_and(|(by, _)| by.gone.load(Ordering::SeqCst)) {
+                live.leaving = None;
+                live.path.leaving.store(false, Ordering::SeqCst);
+            }
+            let done = match &live.leaving {
                 Some((by, until)) => {
-                    let done = by.heard_us.load(Ordering::Relaxed) > 1 || by.gone.load(Ordering::SeqCst) || now >= *until;
+                    let done = by.heard_us.load(Ordering::Relaxed) > 1 || now >= *until;
                     if !done {
                         soon(*until, &mut next);
                     }
