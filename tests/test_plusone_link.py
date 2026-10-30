@@ -15,7 +15,7 @@ import time
 import pytest
 
 import plusone_link
-from plusone_link import CONTROL, REALTIME, Link, LinkError
+from plusone_link import CONTROL, HEAD, REALTIME, VIDEO, Link, LinkError
 
 BIN = os.environ.get("PLUSONE_LINK_BIN")
 
@@ -36,6 +36,16 @@ def identity(directory):
 @pytest.fixture
 def world(tmp_path):
     """plus-one-link, a tablet paired with it, a Link: (link, tablet's address, tablet's id, the tablet's process)."""
+    yield from _world(tmp_path)
+
+
+@pytest.fixture
+def quic_world(tmp_path):
+    """As world, the session moving to QUIC once made (PLUSONE_LINK_QUIC=1)."""
+    yield from _world(tmp_path, quic=True)
+
+
+def _world(tmp_path, quic=False):
     if not BIN:
         pytest.skip("PLUSONE_LINK_BIN: the link's binaries")
     pc = tmp_path / "pc"
@@ -43,12 +53,14 @@ def world(tmp_path):
     tablet_cert, tablet_key, tablet_fp = identity(tmp_path / "tablet")
     (pc / "paired.json").write_text(json.dumps({tablet_fp: {"name": "Test tablet"}}))
     tablet = subprocess.Popen([os.path.join(BIN, "examples", "tablet"), "--cert", tablet_cert, "--key", tablet_key,
-                               "--trust", pc_fp], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                               "--trust", pc_fp] + (["--quic"] if quic else []),
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     port = int(tablet.stdout.readline().split()[1])
     path = str(tmp_path / "run" / "link")
+    environ = dict(os.environ, PLUSONE_LINK_QUIC="1" if quic else "0")
     daemon = subprocess.Popen([os.path.join(BIN, "plus-one-link"), "--socket", path, "--config", str(pc),
                                "--name", "test-pc", "--state", str(tmp_path / "state.json")],
-                              stderr=subprocess.DEVNULL)
+                              stderr=subprocess.DEVNULL, env=environ)
     for _ in range(100):
         if os.path.exists(path):
             break
@@ -85,6 +97,52 @@ def test_control_and_realtime_channels(world):
             if channel.recv(timeout=0.5):
                 got += 1
         assert got >= 195
+
+
+def echoed_in_groups(link, tablet_id):
+    """A VIDEO channel to the tablet's echo: frames of three pieces each, a
+    group each (a keyframe every tenth), and a message of no group; what
+    came back, and what was sent (as written, the heads not with them)."""
+    sent, got = [], []
+    with link.open(tablet_id, "echo", "frames", VIDEO) as channel:
+        assert channel.kind == VIDEO
+        for frame in range(1, 61):
+            pieces = [frame.to_bytes(4, "big") + bytes([index]) + os.urandom(plusone_link.MAX_DATAGRAM - HEAD.size - 5)
+                      for index in range(3)]
+            for index, piece in enumerate(pieces):
+                channel.send_in_group(frame, frame % 10 == 1, index == 2, piece)
+            sent += pieces
+            for _ in pieces:  # back before the next frame: none superseded by a key one
+                body = channel.recv(timeout=0.5)
+                if body:
+                    got.append(body)
+        channel.send(b"of no group")
+        sent.append(b"of no group")
+        while body := channel.recv(timeout=0.5):
+            got.append(body)
+    return sent, got
+
+
+def test_a_video_channel_s_messages_come_as_written(world):
+    # TCP: the heads taken off, each message as realtime's.
+    link, address, tablet_id, _ = world
+    link.connect(address)
+    sent, got = echoed_in_groups(link, tablet_id)
+    assert set(got) <= set(sent) and len(got) >= len(sent) * 0.95 and b"of no group" in got
+
+
+def test_on_quic_a_video_channel_s_groups_come_as_written(quic_world):
+    # QUIC: each frame on a stream of its own (both sides read groups), the
+    # tablet's end a realtime one, what it reads the pieces as written.
+    link, address, tablet_id, _ = quic_world
+    link.connect(address)
+    for _ in range(100):
+        if link.devices()[0].get("transport") == "quic":
+            break
+        time.sleep(0.05)
+    assert link.devices()[0]["transport"] == "quic"
+    sent, got = echoed_in_groups(link, tablet_id)
+    assert set(got) <= set(sent) and len(got) >= len(sent) * 0.95 and b"of no group" in got
 
 
 def test_refused_and_unknown(world):
@@ -226,6 +284,50 @@ def test_events_refused_or_garbled_close_their_connection(daemon, reply):
     with pytest.raises((ValueError, LinkError)):
         plusone_link._Events("fake", {"op": "watch"}, lambda event, fd: None, "test-watch")
     assert plusone_link._connect("fake").fileno() == -1
+
+
+def test_a_video_channel_is_asked_for_as_video(daemon):
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with_fd(daemon, json.dumps({"ok": True, "id": 4}).encode(), ours.fileno())
+    ours.close()
+    channel = Link("fake").open("tab", "display", "media", VIDEO)
+    assert json.loads(daemon.recv(4096))["class"] == "video" and channel.kind == VIDEO
+    channel.send(b"ping")  # of no group: the head says so
+    assert theirs.recv(2048) == b"\0\0\0\0\0ping"
+    channel.close()
+    theirs.close()
+
+
+def channel_on_a_pair(kind):
+    """A channel of kind, and plus-one-link's end of it."""
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    return plusone_link.Channel(ours.detach(), "tab", "display", "media", kind, 2), theirs
+
+
+def test_a_video_channel_s_messages_carry_the_head_the_link_takes_off():
+    channel, link_end = channel_on_a_pair(VIDEO)
+    channel.send_in_group(7, True, False, b"key 1")
+    channel.send_in_group(7, True, True, b"key 2")
+    channel.send_in_group(8, False, False, b"p 1")
+    channel.send_in_group(8, False, True, b"p 2")
+    channel.send_in_group(2 ** 32 + 9, False, True, b"on")  # a u32: round again
+    channel.send(b"pong")  # of no group
+    assert [link_end.recv(2048) for _ in range(6)] == [
+        b"\x05\0\0\0\x07key 1", b"\x07\0\0\0\x07key 2", b"\x01\0\0\0\x08p 1", b"\x03\0\0\0\x08p 2",
+        b"\x03\0\0\0\x09on", b"\0\0\0\0\0pong"]
+    assert HEAD.size == 5
+    channel.close()
+    link_end.close()
+
+
+def test_a_group_s_message_on_another_class_goes_as_it_is():
+    # REALTIME where plus-one-link refused VIDEO: the caller's code the same.
+    channel, link_end = channel_on_a_pair(REALTIME)
+    channel.send_in_group(7, True, True, b"key")
+    channel.send(b"pong")
+    assert [link_end.recv(2048) for _ in range(2)] == [b"key", b"pong"]
+    channel.close()
+    link_end.close()
 
 
 def test_a_descriptor_with_the_answer_to_a_stream_is_closed(daemon):

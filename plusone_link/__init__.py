@@ -5,12 +5,14 @@ channels through its socket. A channel is a message socket: one send, one
 message; close it and the channel closes; an empty read is its end (closed
 by the tablet, or the session over).
 
-    from plusone_link import Link, REALTIME
+    from plusone_link import Link, REALTIME, VIDEO
     link = Link()
     tablet = link.connect("192.168.1.20:47000")
     video = link.open(tablet, "display", "video", REALTIME)
     video.send(packet)
     data = video.recv(timeout=0.1)       # None: nothing in time
+    frames = link.open(tablet, "display", "frames", VIDEO)
+    frames.send_in_group(number, keyframe, last, piece)  # a frame's piece
     server = link.serve("speakers", lambda channel: ...)
     watcher = link.watch(lambda event: ...)
 
@@ -22,10 +24,11 @@ import json
 import os
 import select
 import socket
+import struct
 import threading
 import traceback
 
-CONTROL, INPUT, REALTIME = "control", "input", "realtime"
+CONTROL, INPUT, REALTIME, VIDEO = "control", "input", "realtime", "video"
 REQUEST = 64 << 10
 # Seconds plus-one-link has to answer a request, besides what the request
 # waits for itself (a connect's timeout, a browse's wait); and what open()
@@ -38,6 +41,22 @@ SESSION_WAIT = 15.0
 # too: plus-one-link's session.rs MAX_DATAGRAM).
 MAX_CONTROL = 200 << 10
 MAX_DATAGRAM = 1380
+# VIDEO: realtime in groups, a video's frames (plus-one-link's lib.rs
+# Class::Video). Each message written into the channel starts with HEAD:
+# its flags (IN_GROUP, LAST, KEY) and its group (the frame's number), which
+# plus-one-link takes off (session/grouped.rs); send() and send_in_group()
+# write it. On a QUIC path whose tablet reads groups, a group goes on a
+# QUIC stream of its own (what is lost sent again within the controller's
+# rate, the group given up once late or superseded by a key one: groups.rs);
+# elsewhere, and a message of no group anywhere, as REALTIME's. The
+# tablet's end is a REALTIME one: it reads the messages as they were
+# written, without the head; what it sends comes as it does on REALTIME.
+# A plus-one-link from before it refuses the class (LinkError, "no class"):
+# REALTIME then. Only the PC opens one (the tablet's would be refused).
+HEAD = struct.Struct("!BI")
+IN_GROUP = 1  # one of a group's messages (else a message of its own)
+LAST = 2      # the group's last: its stream is finished
+KEY = 4       # a key group (a keyframe's): ahead of all, the older ones given up
 
 
 class LinkError(Exception):
@@ -81,7 +100,7 @@ def _receive(sock):
 
 class Channel:
     """One channel's end. device: the tablet's id; feature, name, kind
-    (CONTROL, INPUT or REALTIME), id: what it is."""
+    (CONTROL, INPUT, REALTIME or VIDEO), id: what it is."""
 
     def __init__(self, fd, device, feature, name, kind, id):
         self.sock = socket.socket(fileno=fd)
@@ -89,8 +108,20 @@ class Channel:
         self._largest = MAX_CONTROL if kind == CONTROL else MAX_DATAGRAM
 
     def send(self, data):
-        """One message (waits for room)."""
-        self.sock.send(data)
+        """One message (waits for room); on a VIDEO channel one of no group
+        (as REALTIME's), its head before it."""
+        self.sock.send(HEAD.pack(0, 0) + data if self.kind == VIDEO else data)
+
+    def send_in_group(self, group, key, last, data):
+        """One message of group (a frame's piece; the frame's number, u32),
+        whether the group is a key one (a keyframe's) and whether this is its
+        last (waits for room). On a channel not VIDEO (REALTIME where
+        plus-one-link refused VIDEO), data alone, as send()."""
+        if self.kind != VIDEO:
+            self.sock.send(data)
+            return
+        flags = IN_GROUP | (LAST if last else 0) | (KEY if key else 0)
+        self.sock.send(HEAD.pack(flags, group & 0xFFFFFFFF) + data)
 
     def recv(self, timeout=None):
         """One message; b"" at the channel's end; None if nothing came
