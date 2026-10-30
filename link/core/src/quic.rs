@@ -3,7 +3,8 @@
 //! TCP connection is: its first bidirectional stream carries the session's
 //! frames, bridged to a socket pair as the cable's are (little room on the
 //! session's end), and its datagrams the session's sealed realtime ones.
-//! The congestion controller is ours (cc.rs): the stream's bulk and the
+//! The congestion controller is ours (cc.rs; or the one PLUSONE_LINK_CC
+//! chose, for a live A/B, under the same rules): the stream's bulk and the
 //! datagrams share one rate, the datagrams first in each packet (quinn's
 //! order), and realtime that would wait longer than LATE for the window is
 //! dropped, not queued. A Video channel's groups (a video's frames) go on
@@ -20,7 +21,7 @@ use crate::log;
 use bytes::Bytes;
 use quinn::{ClientConfig, Connection, ConnectionId, ConnectionIdGenerator, EndpointConfig, ServerConfig,
             TransportConfig};
-use crate::cc::{Budget, GccConfig};
+use crate::cc::{Budget, CcConfig};
 use crate::dscp::Marking;
 use crate::gate::Gate;
 use crate::groups::{self, Groups};
@@ -88,7 +89,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn transport(cc: Arc<GccConfig>) -> TransportConfig {
+fn transport(cc: Arc<CcConfig>) -> TransportConfig {
     let mut t = TransportConfig::default();
     // The session says when a path is dead (PATH_SILENCE); QUIC's own
     // timeout only frees what the session dropped.
@@ -124,7 +125,7 @@ fn transport(cc: Arc<GccConfig>) -> TransportConfig {
 pub struct Quic {
     pub(crate) conn: Connection,
     /// What its controller shares: the rate, the budget told.
-    cc: Arc<GccConfig>,
+    cc: Arc<CcConfig>,
     /// Realtime bytes sent on it, all told: the bulk gets what they leave.
     realtime: Arc<AtomicU64>,
     /// quinn's datagram room with none waiting: what it holds is this less
@@ -314,11 +315,11 @@ impl Quic {
     }
 }
 
-fn client_config(client: &Arc<rustls::ClientConfig>) -> Result<(ClientConfig, Arc<GccConfig>), String> {
+fn client_config(client: &Arc<rustls::ClientConfig>, cc: CcConfig) -> Result<(ClientConfig, Arc<CcConfig>), String> {
     let mut tls = (**client).clone();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|e| e.to_string())?;
-    let cc: Arc<GccConfig> = Arc::default();
+    let cc = Arc::new(cc);
     let mut config = ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport(cc.clone())));
     Ok((config, cc))
@@ -332,8 +333,8 @@ fn server_crypto(server: &Arc<rustls::ServerConfig>) -> Result<Arc<quinn::crypto
 }
 
 /// A connection's: its own controller, and what it shares.
-fn server_config(crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>) -> (ServerConfig, Arc<GccConfig>) {
-    let cc: Arc<GccConfig> = Arc::default();
+fn server_config(crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>) -> (ServerConfig, Arc<CcConfig>) {
+    let cc: Arc<CcConfig> = Arc::default();
     let mut config = ServerConfig::with_crypto(crypto.clone());
     config.transport_config(Arc::new(transport(cc.clone())));
     (config, cc)
@@ -423,7 +424,13 @@ impl ConnectionIdGenerator for MacCids {
 /// connection. Blocking (not on the runtime).
 pub(crate) fn dial(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, address: SocketAddr, timeout: Duration)
                    -> Result<(UnixStream, Quic), String> {
-    let (config, cc) = client_config(client)?;
+    dial_with(endpoint, client, address, timeout, CcConfig::default())
+}
+
+/// As dial(), its controller cc.
+fn dial_with(endpoint: &Endpoint, client: &Arc<rustls::ClientConfig>, address: SocketAddr, timeout: Duration,
+             cc: CcConfig) -> Result<(UnixStream, Quic), String> {
+    let (config, cc) = client_config(client, cc)?;
     runtime().block_on(async {
         let connecting = endpoint.quinn.connect_with(config, address, "plus-one.invalid").map_err(|e| e.to_string())?;
         let conn = tokio::time::timeout(timeout, connecting).await.map_err(|_| "no answer".to_owned())?
@@ -863,6 +870,43 @@ mod tests {
         crate::frame::encode(crate::frame::SESSION, 0, b"12345678{}", &mut control);
         quic.send_control(&control);
         assert!(frames.recv_timeout(Duration::from_millis(500)).is_err());
+    }
+
+    #[test]
+    fn each_controller_carries_the_stream_and_tells_a_budget() {
+        let pc = identity();
+        let (tablet, address, paths) = tablet_for(&pc);
+        let client = pc.client_config(only(tablet.fingerprint())).unwrap();
+        let endpoint = endpoint(([127, 0, 0, 1], 0).into(), None).unwrap();
+        for name in crate::cc::NAMES {
+            let cc = CcConfig::with(crate::cc::Choice::parse(Some(name), None).0);
+            let (mut stream, quic) = dial_with(&endpoint, &client, address, Duration::from_secs(3), cc).unwrap();
+            let sent: Vec<u8> = (0..2u32 << 20).map(|i| (i % 249) as u8).collect();
+            let writer = {
+                let sent = sent.clone();
+                std::thread::spawn(move || {
+                    stream.write_all(&sent).unwrap();
+                    // The budget is told first PUBLISH_EVERY after the start:
+                    // more past it (on loopback the rest took less).
+                    std::thread::sleep(Duration::from_millis(150));
+                    stream.write_all(&sent[..64 << 10]).unwrap();
+                    stream
+                })
+            };
+            let (mut theirs, _) = paths.recv_timeout(Duration::from_secs(3)).unwrap();
+            theirs.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut came = vec![0u8; sent.len() + (64 << 10)];
+            let started = Instant::now();
+            theirs.read_exact(&mut came).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(came[..sent.len()] == sent[..] && came[sent.len()..] == sent[..64 << 10], "{name}");
+            assert!(started.elapsed() < Duration::from_secs(10), "{name}: {:?}", started.elapsed());
+            // A datagram goes too, under the same window.
+            assert!(quic.send(&[1u8; 1000]).is_ok(), "{name}: a datagram refused");
+            let (told, rate) = quic.budget().last();
+            assert!(told >= 1 && rate >= 30_000 && quic.rate() >= 30_000, "{name}: {told} told, {rate}");
+            drop(writer.join().unwrap());
+            quic.close();
+        }
     }
 
     #[test]

@@ -256,6 +256,8 @@ pub struct Node(Arc<NodeInner>);
 impl Node {
     /// name: ours, as the other side shows it.
     pub fn new(name: &str, identity: &Identity, paired: Paired) -> Result<Node, String> {
+        // Its QUIC paths' controller (PLUSONE_LINK_CC), read and said now.
+        crate::cc::selected();
         Ok(Node(Arc::new(NodeInner {
             name: name.to_owned(),
             identity_fingerprint: identity.fingerprint(),

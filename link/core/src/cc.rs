@@ -15,6 +15,20 @@
 //! packets with no queue). The window is the rate times the round trip
 //! (quinn paces at window / rtt); the rate is shared with the session, for
 //! realtime late to be dropped and for the encoders to follow.
+//!
+//! For a live A/B, another controller may run in its place
+//! (PLUSONE_LINK_CC, select.rs): this one with the l23 rules, Copa, C4
+//! (c4.rs, after Huitema's), or quinn's BBR and Cubic; each tells the budget, shares the rate,
+//! records and traces as this one does (shared.rs).
+
+mod c4;
+mod copa;
+mod select;
+mod shared;
+
+pub(crate) use select::{selected, Choice};
+#[cfg(test)]
+pub(crate) use select::NAMES;
 
 use quinn::congestion::{Controller, ControllerFactory};
 use quinn_proto::RttEstimator;
@@ -25,13 +39,33 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const GROUP: Duration = Duration::from_millis(5);
+/// gcc-l23 (GccParams::l23), from the l23 branch (9ae489c): a burst
+/// (packets let go together, WebRTC's BelongsToBurst) spans BURST_MOST of
+/// arrivals at most. The acknowledgements silent past SILENCE (and past
+/// SILENCE_GAPS of their usual gap): the radio away, a background scan's (on
+/// a phone's hotspot, every 304 s for 3.8 s, about 20 silences of 130 ms).
+/// What is acknowledged in RELEASE after it was let go together, held at
+/// the access point or in a radio's queue: one burst, no queue of ours. Read
+/// as a delay growing, each scan took 3-4 cuts, the rate to a third (91 of
+/// 106 cuts by trend in 144 min of a hotspot's record; none with this). A
+/// silence only if the packet acknowledged after it waited through half of
+/// it: the network held it. An application sending nothing is none (its
+/// next packet acknowledged a round trip after it was sent: 3283 of the
+/// 3522 in that record, each read as a release).
+const SILENCE_GAPS: u32 = 4;
+const RELEASE: Duration = Duration::from_millis(50);
+/// gcc-l23: for HELD_FOR after the acknowledgements stopped past HELD (and
+/// SILENCE_GAPS usual gaps), what came after held through half of it, a
+/// packet sent with its group's last (a batch split by GROUP's end, or over
+/// two acknowledgements) joins it, and the rest of its acknowledgement with
+/// it: a radio's trickle (a scan; a Wi-Fi's retries, 32-45 ms on the
+/// emulated spikes). Always, it chained a transfer's acknowledgements into
+/// groups a quarter to a half fewer, the trend on them slower to see a
+/// queue: both ways at once, emulated, the other side's controller saw it
+/// first and was cut while starting (a hotspot's 4.2 MB/s to 2.8).
+const HELD_FOR: Duration = Duration::from_secs(1);
 const TREND_WINDOW: usize = 20;
 const SMOOTHING: f64 = 0.9;
-const THRESHOLD_GAIN: f64 = 4.0;
-const OVERUSE_TIME_MS: f64 = 20.0;
-const K_UP: f64 = 0.0087;
-const K_DOWN: f64 = 0.039;
-const BETA: f64 = 0.85;
 /// What is acknowledged, measured over this. Over 200 ms a keyframe filled
 /// it: on a hotspot's replay the rate allowed was 3.3 times what went
 /// through, 2.3 over 500 ms; on the emulated grid a fixed 4 Mbit/s video
@@ -69,20 +103,15 @@ pub(crate) const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// again of a group's lost data then goes while the network is full.
 const AFTER_CUT: Duration = Duration::from_millis(500);
 
-#[derive(Debug, Clone, Default)]
-pub struct GccConfig {
+/// A QUIC path's controller (the one PLUSONE_LINK_CC chose, else GCC),
+/// and what it shares with the session.
+#[derive(Debug, Clone)]
+pub struct CcConfig {
     /// The rate (bytes a second) for the application to read.
     pub rate: Arc<AtomicU64>,
     pub budget: Arc<Budget>,
     pub losses: Arc<Losses>,
-}
-
-impl ControllerFactory for GccConfig {
-    fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
-        let mut gcc = Gcc::new(now, mtu, self.rate.clone(), self.budget.clone());
-        gcc.losses = self.losses.clone();
-        Box::new(gcc)
-    }
+    choice: Choice,
 }
 
 /// Bytes in the packets quinn declared lost, all told, and of those the
@@ -95,6 +124,127 @@ pub struct Losses {
     pub lost: AtomicU64,
     pub after_cut: AtomicU64,
     pub cuts: AtomicU64,
+}
+
+impl Default for CcConfig {
+    fn default() -> CcConfig {
+        CcConfig::with(selected().clone())
+    }
+}
+
+impl CcConfig {
+    pub(crate) fn with(choice: Choice) -> CcConfig {
+        CcConfig { rate: Arc::default(), budget: Arc::default(), losses: Arc::default(), choice }
+    }
+}
+
+impl ControllerFactory for CcConfig {
+    fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
+        let (rate, budget, losses) = (self.rate.clone(), self.budget.clone(), self.losses.clone());
+        match &self.choice {
+            Choice::Gcc(params) => {
+                let mut gcc = Gcc::new(now, mtu, rate, budget, params.clone());
+                gcc.losses = losses;
+                Box::new(gcc)
+            }
+            choice => shared::build(choice, now, mtu, rate, budget, losses),
+        }
+    }
+}
+
+/// GCC's tunables (PLUSONE_LINK_CC_PARAMS): by default today's constants,
+/// as they were, and the l23 rules off.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GccParams {
+    /// gcc-l23: a radio's silence, and its trickle after, read as one burst.
+    pub l23: bool,
+    /// The threshold's least and most (ms of trend), as it follows the
+    /// trend's own size.
+    pub threshold_min: f64,
+    pub threshold_max: f64,
+    /// The trend: the slope times the deltas (60 at most) times this.
+    pub threshold_gain: f64,
+    /// How fast the threshold follows the trend up and down (a ms).
+    pub k_up: f64,
+    pub k_down: f64,
+    /// Over the threshold this long before a cut (ms), counted in the delay's
+    /// growth (today's) or, overuse_send_time, in send time (WebRTC's).
+    pub overuse_ms: f64,
+    pub overuse_send_time: bool,
+    /// A cut: to this share of what was acknowledged.
+    pub beta: f64,
+    /// A queue standing past this (ms): cut, whatever its slope.
+    pub queue_limit_ms: f64,
+    /// Loss past this share of a second's packets: cut by half of it.
+    pub loss_cut: f64,
+    /// gcc-l23's SILENCE, HELD and BURST_MOST (ms).
+    pub silence_ms: f64,
+    pub held_ms: f64,
+    pub burst_most_ms: f64,
+}
+
+impl Default for GccParams {
+    fn default() -> GccParams {
+        GccParams { l23: false, threshold_min: 6.0, threshold_max: 600.0, threshold_gain: 4.0, k_up: 0.0087,
+                    k_down: 0.039, overuse_ms: 20.0, overuse_send_time: false, beta: 0.85,
+                    queue_limit_ms: QUEUE_LIMIT.as_millis() as f64,
+                    loss_cut: 0.1, silence_ms: 60.0, held_ms: 30.0, burst_most_ms: 100.0 }
+    }
+}
+
+impl GccParams {
+    /// One tunable from its text; Err why not (unknown, not a number, out
+    /// of its safe range, or one of gcc-l23's with its rules off).
+    pub(crate) fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let l23_only = |l23: bool| if l23 { Ok(()) } else { Err("only with gcc-l23".to_owned()) };
+        match key {
+            "threshold_min" => self.threshold_min = select::number(value, 1.0, 100.0)?,
+            "threshold_max" => self.threshold_max = select::number(value, 10.0, 1000.0)?,
+            "threshold_gain" => self.threshold_gain = select::number(value, 0.5, 20.0)?,
+            "k_up" => self.k_up = select::number(value, 0.0, 0.1)?,
+            "k_down" => self.k_down = select::number(value, 0.0, 0.5)?,
+            "overuse_ms" => self.overuse_ms = select::number(value, 1.0, 500.0)?,
+            "overuse_send_time" => self.overuse_send_time = select::flag(value)?,
+            "beta" => self.beta = select::number(value, 0.5, 0.95)?,
+            "queue_limit_ms" => self.queue_limit_ms = select::number(value, 5.0, 500.0)?,
+            "loss_cut" => self.loss_cut = select::number(value, 0.01, 0.5)?,
+            "silence_ms" => { l23_only(self.l23)?; self.silence_ms = select::number(value, 20.0, 500.0)? }
+            "held_ms" => { l23_only(self.l23)?; self.held_ms = select::number(value, 5.0, 200.0)? }
+            "burst_most_ms" => { l23_only(self.l23)?; self.burst_most_ms = select::number(value, 20.0, 500.0)? }
+            _ => return Err("unknown".into()),
+        }
+        Ok(())
+    }
+
+    /// What does not hold together, set back to its default: why.
+    pub(crate) fn check(&mut self) -> Option<String> {
+        if self.threshold_min > self.threshold_max {
+            let why = format!("threshold_min {} over threshold_max {}: both their defaults", self.threshold_min,
+                              self.threshold_max);
+            let default = GccParams::default();
+            (self.threshold_min, self.threshold_max) = (default.threshold_min, default.threshold_max);
+            return Some(why);
+        }
+        None
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let mut text = format!("threshold_min={} threshold_max={} threshold_gain={} k_up={} k_down={} overuse_ms={} \
+                                overuse_send_time={} beta={} queue_limit_ms={} loss_cut={}",
+                               self.threshold_min, self.threshold_max, self.threshold_gain, self.k_up, self.k_down,
+                               self.overuse_ms, self.overuse_send_time as u8, self.beta, self.queue_limit_ms,
+                               self.loss_cut);
+        if self.l23 {
+            text += &format!(" silence_ms={} held_ms={} burst_most_ms={}", self.silence_ms, self.held_ms,
+                             self.burst_most_ms);
+        }
+        text
+    }
+}
+
+/// ms as a Duration, to the µs (20 ms is 20 ms, as the constants were).
+fn millis(ms: f64) -> Duration {
+    Duration::from_micros((ms * 1000.0).round() as u64)
 }
 
 /// The rate as told the application, as it moves (PUBLISH_CHANGE): waited
@@ -119,7 +269,7 @@ impl Budget {
 
     /// How many told so far, and the last (bytes a second), not waiting.
     #[cfg(test)]
-    fn last(&self) -> (u64, u64) {
+    pub(crate) fn last(&self) -> (u64, u64) {
         let told = self.told.lock().unwrap();
         (told.0, told.1)
     }
@@ -160,10 +310,18 @@ struct Group {
     first_sent: Instant,
     last_sent: Instant,
     arrived: Instant,
+    first_arrived: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct Gcc {
+    /// Its tunables, and those in time: queue_limit_ms, silence_ms, held_ms,
+    /// burst_most_ms.
+    p: GccParams,
+    queue_limit: Duration,
+    silence: Duration,
+    held: Duration,
+    burst_most: Duration,
     start: Instant,
     mtu: u64,
     rate: f64,
@@ -176,6 +334,14 @@ struct Gcc {
     state: State,
     // Trendline.
     group: Option<Group>,
+    /// gcc-l23: the last acknowledgement's time, the usual gap between two
+    /// (smoothed, silences left out), until when what comes is a release
+    /// (SILENCE), and until when a packet sent with its group's last joins
+    /// it (HELD).
+    last_ack: Option<Instant>,
+    ack_gap: Duration,
+    released_until: Option<Instant>,
+    held_until: Option<Instant>,
     previous: Option<Group>,
     accumulated: f64,
     smoothed: f64,
@@ -215,6 +381,12 @@ struct Gcc {
 
 const TRACE_EVERY: Duration = Duration::from_millis(250);
 
+/// Each controller's number, in a record (each connection has one).
+fn next_id() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn tracing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PLUSONE_LINK_CC_TRACE").as_deref() == Ok("1"))
@@ -240,18 +412,21 @@ fn record(line: std::fmt::Arguments) {
 }
 
 impl Gcc {
-    fn new(now: Instant, mtu: u16, out: Arc<AtomicU64>, budget: Arc<Budget>) -> Gcc {
+    fn new(now: Instant, mtu: u16, out: Arc<AtomicU64>, budget: Arc<Budget>, p: GccParams) -> Gcc {
         out.store(START_RATE as u64, Ordering::Relaxed);
-        Gcc { start: now, mtu: mtu as u64, rate: START_RATE, out, budget, published: 0.0, published_at: now,
+        let id = next_id();
+        record(format_args!("{id} c {} {}", if p.l23 { "gcc-l23" } else { "gcc" }, p.describe()));
+        let threshold = 12.5f64.clamp(p.threshold_min, p.threshold_max);
+        Gcc { queue_limit: millis(p.queue_limit_ms), silence: millis(p.silence_ms), held: millis(p.held_ms),
+              burst_most: millis(p.burst_most_ms), p,
+              start: now, mtu: mtu as u64, rate: START_RATE, out, budget, published: 0.0, published_at: now,
               slow_start: true, state: State::Hold, group: None,
-              previous: None, accumulated: 0.0, smoothed: 0.0, history: VecDeque::new(), deltas: 0, threshold: 12.5,
+              last_ack: None, ack_gap: Duration::ZERO, released_until: None, held_until: None,
+              previous: None, accumulated: 0.0, smoothed: 0.0, history: VecDeque::new(), deltas: 0, threshold,
               last_update: None, over_time: -1.0, over_count: 0, previous_trend: 0.0, signal: Signal::Normal,
               acked: VecDeque::new(), acked_bytes: 0, max_mean: None, max_var: 0.4, last_change: now, lost: 0,
               acked_since: 0, loss_window: now, srtt: Duration::from_millis(50), last_over: now, samples: VecDeque::new(),
-              traced: now, cuts: [0; 3], why: 0,
-              id: { static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    NEXT.fetch_add(1, Ordering::Relaxed) },
-              losses: Arc::default(), last_cut: None }
+              traced: now, cuts: [0; 3], why: 0, id, losses: Arc::default(), last_cut: None }
     }
 
     /// The rate cut (Losses).
@@ -297,15 +472,18 @@ impl Gcc {
             (num + (x - mx) * (y - my), den + (x - mx) * (x - mx))
         });
         let slope = if den > 0.0 { num / den } else { 0.0 };
-        let trend = (self.deltas.min(60) as f64) * slope * THRESHOLD_GAIN;
-        self.detect(trend, delta, group.arrived);
+        let trend = (self.deltas.min(60) as f64) * slope * self.p.threshold_gain;
+        self.detect(trend, delta, send_delta, group.arrived);
     }
 
-    fn detect(&mut self, trend: f64, delta: f64, now: Instant) {
+    /// The trend against the threshold: over it for overuse_ms, counted in
+    /// the delay's growth (delta) or in send time (send_delta, WebRTC's).
+    fn detect(&mut self, trend: f64, delta: f64, send_delta: f64, now: Instant) {
         if trend > self.threshold {
-            self.over_time = if self.over_time < 0.0 { delta.max(0.0) / 2.0 } else { self.over_time + delta.max(0.0) };
+            let grown = if self.p.overuse_send_time { send_delta } else { delta };
+            self.over_time = if self.over_time < 0.0 { grown.max(0.0) / 2.0 } else { self.over_time + grown.max(0.0) };
             self.over_count += 1;
-            if self.over_time > OVERUSE_TIME_MS && self.over_count > 1 && trend >= self.previous_trend {
+            if self.over_time > self.p.overuse_ms && self.over_count > 1 && trend >= self.previous_trend {
                 self.over_time = 0.0;
                 self.over_count = 0;
                 self.signal = Signal::Over;
@@ -325,8 +503,9 @@ impl Gcc {
         let dt = self.last_update.map(|t| now.duration_since(t).as_secs_f64() * 1000.0).unwrap_or(0.0).min(100.0);
         self.last_update = Some(now);
         if trend.abs() <= self.threshold + 15.0 {
-            let k = if trend.abs() < self.threshold { K_DOWN } else { K_UP };
-            self.threshold = (self.threshold + k * (trend.abs() - self.threshold) * dt).clamp(6.0, 600.0);
+            let k = if trend.abs() < self.threshold { self.p.k_down } else { self.p.k_up };
+            self.threshold = (self.threshold + k * (trend.abs() - self.threshold) * dt)
+                .clamp(self.p.threshold_min, self.p.threshold_max);
         }
     }
 
@@ -352,7 +531,7 @@ impl Gcc {
 
     fn control(&mut self, now: Instant, app_limited: bool) {
         let Some(acked) = self.acked_rate(now) else { return };
-        if self.standing_queue(now) > QUEUE_LIMIT {
+        if self.standing_queue(now) > self.queue_limit {
             self.signal = Signal::Over;
             self.why = 1;
         }
@@ -388,7 +567,7 @@ impl Gcc {
                 self.cut(now);
                 self.slow_start = false;
                 // At most 30 % a cut.
-                self.rate = (BETA * acked).max(0.7 * self.rate).max(MIN_RATE).min(self.rate);
+                self.rate = (self.p.beta * acked).max(0.7 * self.rate).max(MIN_RATE).min(self.rate);
                 // Where it was cut: its mean and spread (near it, go up slowly).
                 let mean = self.max_mean.map(|m| 0.95 * m + 0.05 * acked).unwrap_or(acked);
                 let norm = mean.max(1.0);
@@ -448,7 +627,14 @@ impl Gcc {
             }
         }
         self.acked_since += bytes;
+        let released = self.p.l23 && self.released(now, sent);
+        let (l23, held, burst_most) = (self.p.l23, self.held_until.is_some_and(|until| now < until), self.burst_most);
         match &mut self.group {
+            // gcc-l23: let go after a silence (SILENCE), with the group it follows.
+            Some(g) if released => {
+                g.last_sent = g.last_sent.max(sent);
+                g.arrived = now;
+            }
             Some(g) if sent.saturating_duration_since(g.first_sent) <= GROUP => {
                 g.last_sent = g.last_sent.max(sent);
                 g.arrived = now;
@@ -456,18 +642,54 @@ impl Gcc {
             // A burst (WebRTC's BelongsToBurst): it came within GROUP of the
             // group, and sooner after it than it was sent (packets held by
             // the radio, its power saving, an aggregate, let go together):
-            // no queue of ours.
+            // no queue of ours. gcc-l23: or, the radio trickling (HELD),
+            // sent with its last (a batch's packets share one send time);
+            // BURST_MOST of arrivals at most.
             Some(g) if now.saturating_duration_since(g.arrived) < GROUP
-                && now.saturating_duration_since(g.arrived) < sent.saturating_duration_since(g.last_sent) => {
+                && if l23 {
+                    ((sent <= g.last_sent && held)
+                        || now.saturating_duration_since(g.arrived) < sent.saturating_duration_since(g.last_sent))
+                        && now.saturating_duration_since(g.first_arrived) < burst_most
+                } else {
+                    now.saturating_duration_since(g.arrived) < sent.saturating_duration_since(g.last_sent)
+                } => {
                 g.last_sent = g.last_sent.max(sent);
                 g.arrived = now;
             }
             _ => {
-                let done = self.group.replace(Group { first_sent: sent, last_sent: sent, arrived: now });
+                let group = Group { first_sent: sent, last_sent: sent, arrived: now, first_arrived: now };
+                let done = self.group.replace(group);
                 if let Some(done) = done {
                     self.group_done(done);
                 }
             }
+        }
+    }
+
+    /// gcc-l23: whether the packet sent at sent, acknowledged now, comes in a
+    /// release (RELEASE after a silence the network held it through); the
+    /// usual gap between acknowledgements, a silence's and a hold's times
+    /// kept.
+    fn released(&mut self, now: Instant, sent: Instant) -> bool {
+        let gap = self.last_ack.replace(now).map(|last| now.saturating_duration_since(last));
+        let held = gap.filter(|gap| *gap > self.ack_gap * SILENCE_GAPS && now.saturating_duration_since(sent) > *gap / 2);
+        if held.is_some_and(|gap| gap > self.held) {
+            self.held_until = Some(now + HELD_FOR);
+        }
+        match gap {
+            Some(gap) if gap > self.silence && held.is_some() => {
+                self.released_until = Some(now + RELEASE);
+                false
+            }
+            Some(gap) => {
+                // One acknowledgement's packets come at one time (quinn tells
+                // them one by one): the gap is between acknowledgements.
+                if !gap.is_zero() && gap <= self.silence {
+                    self.ack_gap = (self.ack_gap * 7 + gap) / 8;
+                }
+                self.released_until.is_some_and(|until| now < until)
+            }
+            None => false,
         }
     }
 
@@ -486,11 +708,11 @@ impl Gcc {
     /// An acknowledgement frame read through (quinn's on_end_acks).
     fn end_acks(&mut self, now: Instant, app_limited: bool) {
         record(format_args!("{} e {} {}", self.id, now.duration_since(self.start).as_micros(), app_limited as u8));
-        // Loss past 10 % over the last second: cut by half of it.
+        // Loss past loss_cut (10 %) over the last second: cut by half of it.
         if now.duration_since(self.loss_window) > Duration::from_secs(1) {
             let total = (self.lost + self.acked_since).max(1);
             let loss = self.lost as f64 / total as f64;
-            if loss > 0.1 {
+            if loss > self.p.loss_cut {
                 self.rate = (self.rate * (1.0 - 0.5 * loss)).max(MIN_RATE);
                 self.slow_start = false;
                 self.cuts[2] += 1;
@@ -567,7 +789,7 @@ impl Controller for Gcc {
 #[cfg(fuzzing)]
 pub fn fuzz(data: &[u8]) {
     let start = Instant::now();
-    let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+    let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
     let mut now = start;
     for event in data.chunks_exact(6) {
         now += Duration::from_micros(u16::from_be_bytes([event[0], event[1]]) as u64 * 16);
@@ -608,11 +830,252 @@ mod tests {
         }
     }
 
+    struct Rng(u64);
+
+    impl Rng {
+        fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            lo + (hi - lo) * ((self.0 >> 11) as f64 / (1u64 << 53) as f64)
+        }
+    }
+
+    /// A background scan's radio absences (µs from, to), at each of starts
+    /// (s), as a phone's hotspot recorded 28 of them (every 303.9 s): off
+    /// 130 / on 75 ms; [off, on] [125, 3] [85, 0.5] [75, 20] [60, 20] [60,
+    /// 20] [60, 100]; then 14 of off 120-140 / on 60-85 ms: 3.8 s in all.
+    fn scans(starts: &[f64]) -> Vec<(u64, u64)> {
+        let (mut rng, mut offs) = (Rng(0x9E37_79B9_7F4A_7C15), Vec::new());
+        for &s in starts {
+            let mut t = s * 1e6;
+            let mut cycle = |off: f64, on: f64| {
+                offs.push((t as u64, (t + off * 1e3) as u64));
+                t += (off + on) * 1e3;
+            };
+            for (off, on) in [(130.0, 75.0), (125.0, 3.0), (85.0, 0.5), (75.0, 20.0), (60.0, 20.0), (60.0, 20.0),
+                              (60.0, 100.0)] {
+                cycle(off, on);
+            }
+            for _ in 0..14 {
+                let (off, on) = (rng.uniform(120.0, 140.0), rng.uniform(60.0, 85.0));
+                cycle(off, on);
+            }
+        }
+        offs
+    }
+
+    /// A desktop through the controller, closed loop, for seconds: a frame
+    /// of 44.2 KB each 16.7 ms (and a sound's 200 bytes each 20 ms), what
+    /// waits past 100 ms dropped; a sender as quinn's (the window, a pacer
+    /// at 1.25 window a round trip in bursts of 2 ms, a frame's packets sent
+    /// at once); its radio off as offs says (what it sends waits in its
+    /// queue, what is acknowledged at the access point, let go together when
+    /// it is back); on, capacity(µs) bytes a second, 4.5 ms each way; the
+    /// receiver acknowledging what came 0.3 ms after the last, or 2 ms
+    /// after the first. The times of the cuts by trend, and the rate each
+    /// 100 µs.
+    fn desktop(params: GccParams, offs: &[(u64, u64)], seconds: f64, capacity: &dyn Fn(u64) -> f64)
+               -> (Vec<u64>, Vec<(u64, f64)>) {
+        let start = Instant::now();
+        let at = |us: u64| start + Duration::from_micros(us);
+        let mut gcc = Gcc::new(start, 1452, Arc::default(), Arc::default(), params);
+        let (dt, one_way, end) = (100u64, 4_500u64, (seconds * 1e6) as u64);
+        let mut app: VecDeque<(u64, u64)> = VecDeque::new();
+        let mut flight: VecDeque<(u64, u64, u64)> = VecDeque::new();
+        let mut radio: VecDeque<(u64, u64)> = VecDeque::new();
+        let mut to_receiver: VecDeque<(u64, u64)> = VecDeque::new();
+        let mut acks: VecDeque<(u64, Vec<u64>)> = VecDeque::new();
+        let mut pending: Vec<u64> = Vec::new();
+        let (mut flight_bytes, mut air, mut tokens, mut srtt) = (0u64, 0.0f64, 0.0f64, None::<f64>);
+        let (mut pn, mut next_frame, mut next_sound, mut first, mut last, mut off) = (0u64, 0u64, 0u64, 0u64, 0u64, 0);
+        let (mut cuts, mut rates, mut trend_cuts) = (Vec::new(), Vec::new(), gcc.cuts[0]);
+        let mut t = 0u64;
+        while t < end {
+            t += dt;
+            if t >= next_frame {
+                for _ in 0..(44_200 / 1452) {
+                    app.push_back((t, 1452));
+                }
+                next_frame += 16_667;
+            }
+            if t >= next_sound {
+                app.push_back((t, 200));
+                next_sound += 20_000;
+            }
+            while app.front().is_some_and(|(made, _)| t - made > 100_000) {
+                app.pop_front();
+            }
+            let window = gcc.window();
+            let pace = 1.25 * window as f64 / srtt.unwrap_or(0.05).max(0.001);
+            tokens = (tokens + pace * dt as f64 / 1e6).min((pace * 0.002).max(10.0 * 1452.0));
+            let mut blocked = false;
+            while let Some(&(_, bytes)) = app.front() {
+                if flight_bytes + bytes > window {
+                    blocked = true;
+                    break;
+                }
+                if tokens < bytes as f64 {
+                    break;
+                }
+                tokens -= bytes as f64;
+                app.pop_front();
+                flight.push_back((pn, t, bytes));
+                flight_bytes += bytes;
+                radio.push_back((pn, bytes));
+                pn += 1;
+            }
+            while off < offs.len() && offs[off].1 <= t {
+                off += 1;
+            }
+            let on = !(off < offs.len() && offs[off].0 <= t);
+            if on {
+                air += capacity(t) * dt as f64 / 1e6;
+                while radio.front().is_some_and(|(_, bytes)| air >= *bytes as f64) {
+                    let (packet, bytes) = radio.pop_front().unwrap();
+                    air -= bytes as f64;
+                    to_receiver.push_back((t + one_way, packet));
+                }
+                if radio.is_empty() {
+                    air = air.min(1452.0);
+                }
+            }
+            while to_receiver.front().is_some_and(|(came, _)| *came <= t) {
+                let (_, packet) = to_receiver.pop_front().unwrap();
+                if pending.is_empty() {
+                    first = t;
+                }
+                last = t;
+                pending.push(packet);
+            }
+            if !pending.is_empty() && (t - last >= 300 || t - first >= 2_000) {
+                acks.push_back((t + one_way, std::mem::take(&mut pending)));
+            }
+            while on && acks.front().is_some_and(|(came, _)| *came <= t) {
+                let (_, packets) = acks.pop_front().unwrap();
+                let largest = *packets.iter().max().unwrap();
+                if let Some(&(_, sent, _)) = flight.iter().find(|(p, _, _)| *p == largest) {
+                    let sample = (t - sent) as f64 / 1e6;
+                    srtt = Some(srtt.map_or(sample, |s| 0.875 * s + 0.125 * sample));
+                }
+                let rtt = Duration::from_secs_f64(srtt.unwrap_or(0.05));
+                for packet in packets {
+                    if let Some(i) = flight.iter().position(|(p, _, _)| *p == packet) {
+                        let (_, sent, bytes) = flight.remove(i).unwrap();
+                        flight_bytes -= bytes;
+                        gcc.ack(at(t), at(sent), bytes, rtt);
+                    }
+                }
+                gcc.end_acks(at(t), app.is_empty() && !blocked);
+            }
+            if gcc.cuts[0] != trend_cuts {
+                trend_cuts = gcc.cuts[0];
+                cuts.push(t);
+            }
+            rates.push((t, gcc.rate));
+        }
+        (cuts, rates)
+    }
+
+    /// gcc-l23 (its tests on the l23 branch, 9ae489c).
+    fn l23() -> GccParams {
+        GccParams { l23: true, ..GccParams::default() }
+    }
+
+    #[test]
+    fn a_wifi_scan_is_no_queue_with_l23() {
+        let starts = [20.0, 50.0, 80.0];
+        let (cuts, rates) = desktop(l23(), &scans(&starts), 100.0, &|_| 25e6);
+        for s in starts {
+            let (from, to) = ((s * 1e6) as u64, ((s + 6.0) * 1e6) as u64);
+            let during = cuts.iter().filter(|c| (from..to).contains(*c)).count();
+            let before = rates.iter().rev().find(|(t, _)| *t < from).unwrap().1;
+            let least = rates.iter().filter(|(t, _)| (from..to).contains(t)).map(|(_, r)| *r).fold(f64::MAX, f64::min);
+            // Read as a delay growing, each took 3-4 cuts, the rate to 35 %.
+            assert!(during <= 1, "the scan at {s} s: {during} cuts by trend");
+            assert!(least >= 0.7 * before, "the scan at {s} s: the rate to {:.0} %", 100.0 * least / before);
+        }
+    }
+
+    #[test]
+    fn a_wifi_scan_is_a_queue_without_l23() {
+        // The same scans through gcc as it was: cut by trend (the switch
+        // changes what it does).
+        let starts = [20.0, 50.0, 80.0];
+        let (plain, _) = desktop(GccParams::default(), &scans(&starts), 100.0, &|_| 25e6);
+        let (with, _) = desktop(l23(), &scans(&starts), 100.0, &|_| 25e6);
+        assert!(plain.len() > with.len(), "gcc {} cuts by trend, gcc-l23 {}", plain.len(), with.len());
+    }
+
+    #[test]
+    fn the_usual_gap_is_between_acknowledgements() {
+        // An acknowledgement each 25 ms (a sound's, delayed), two packets
+        // each: 70 ms is under four usual gaps, no silence.
+        let start = Instant::now();
+        let mut gcc = Gcc::new(start, 1452, Arc::default(), Arc::default(), l23());
+        let rtt = Duration::from_millis(10);
+        let mut t = start;
+        for _ in 0..40 {
+            t += Duration::from_millis(25);
+            for _ in 0..2 {
+                gcc.ack(t, t - Duration::from_millis(5), 200, rtt);
+            }
+            gcc.end_acks(t, true);
+        }
+        t += Duration::from_millis(70);
+        gcc.ack(t, t - Duration::from_millis(5), 200, rtt);
+        assert!(gcc.released_until.is_none(), "70 ms read as a silence (usual gap {:?})", gcc.ack_gap);
+    }
+
+    #[test]
+    fn a_queue_still_cuts_as_soon_with_l23() {
+        // The path takes 1.5 MB/s from 20 s, under the desktop's 2.7.
+        let (cuts, _) = desktop(l23(), &[], 22.0, &|t| if t >= 20_000_000 { 1.5e6 } else { 12e6 });
+        let first = cuts.iter().find(|c| **c >= 20_000_000).map(|c| (c - 20_000_000) / 1_000);
+        assert!(first.is_some_and(|ms| ms <= 300), "first cut {first:?} ms after");
+    }
+
+    #[test]
+    fn a_higher_floor_keeps_the_threshold_up() {
+        let start = Instant::now();
+        let mut now = start;
+        let params = GccParams { threshold_min: 11.0, ..GccParams::default() };
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), params);
+        // A clean path: the threshold follows the trend down, to its floor.
+        carry(&mut gcc, &mut now, 1e6, 5.0, Duration::from_millis(9));
+        assert_eq!(gcc.threshold, 11.0);
+        let mut plain = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
+        let mut now = start;
+        carry(&mut plain, &mut now, 1e6, 5.0, Duration::from_millis(9));
+        assert_eq!(plain.threshold, 6.0);
+    }
+
+    #[test]
+    fn overuse_in_send_time_sees_a_queue_as_soon() {
+        // The trend over the threshold counted in send time (WebRTC's): a
+        // queue growing is cut no later than with the delay's growth.
+        let first_cut = |params: GccParams| {
+            let start = Instant::now();
+            let mut now = start;
+            let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), params);
+            carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
+            let mut step = 0;
+            while gcc.cuts[0] == 0 && step < 100 {
+                step += 1;
+                carry(&mut gcc, &mut now, 2e6, 0.01, Duration::from_millis(10 + step / 2));
+            }
+            step
+        };
+        let delay = first_cut(GccParams::default());
+        let send = first_cut(GccParams { overuse_send_time: true, ..GccParams::default() });
+        assert!(delay < 100 && send <= delay, "cut after {send} steps in send time, {delay} in the delay's growth");
+    }
+
     #[test]
     fn sending_less_does_not_take_the_rate_down() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
         let rtt = Duration::from_millis(10);
         carry(&mut gcc, &mut now, 3e6, 3.0, rtt);
         let before = gcc.rate;
@@ -627,7 +1090,7 @@ mod tests {
     fn an_idle_path_in_power_saving_is_no_queue() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
         carry(&mut gcc, &mut now, 1e6, 2.0, Duration::from_millis(8));
         let before = gcc.rate;
         // Then a keepalive every 2 s, its round trip 30-60 ms (the radio asleep).
@@ -645,7 +1108,7 @@ mod tests {
     fn a_wifis_jitter_is_no_overuse() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
         let rtt = Duration::from_millis(9);
         carry(&mut gcc, &mut now, 1e6, 2.0, rtt);
         // Every 300 ms the round trip climbs to 30 ms in 40 ms and comes
@@ -663,7 +1126,7 @@ mod tests {
     fn a_queue_growing_is_cut_early() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
         carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
         // The path's rate falls under ours: the round trip grows 10 ms each 100 ms.
         for step in 1..=8u64 {
@@ -683,7 +1146,7 @@ mod tests {
         let Ok(text) = std::fs::read_to_string(path) else { return };
         let start = Instant::now();
         let at = |us: u64| start + Duration::from_micros(us);
-        let mut gcc = Gcc::new(start, 1452, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1452, Arc::default(), Arc::default(), GccParams::default());
         let mut through: VecDeque<(u64, u64)> = VecDeque::new();
         let (mut through_bytes, mut next, mut over_double, mut seconds) = (0u64, 1_000_000u64, 0u32, 0u32);
         let mut ratios = Vec::new();
@@ -731,7 +1194,7 @@ mod tests {
         let start = Instant::now();
         let mut now = start;
         let budget: Arc<Budget> = Arc::default();
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), budget.clone());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), budget.clone(), GccParams::default());
         carry(&mut gcc, &mut now, 2e6, 3.0, Duration::from_millis(10));
         let (count, rate) = budget.last();
         // Going up: at most one every PUBLISH_EVERY, each past 10 %.
@@ -756,7 +1219,7 @@ mod tests {
     fn a_queue_that_stands_is_cut() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
         carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
         // The same rate, the round trip 40 ms more and staying (a router's queue).
         carry(&mut gcc, &mut now, 2e6, 1.0, Duration::from_millis(50));
@@ -767,7 +1230,7 @@ mod tests {
     fn losses_soon_after_a_cut_are_counted_apart() {
         let start = Instant::now();
         let mut now = start;
-        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default());
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
         carry(&mut gcc, &mut now, 2e6, 2.0, Duration::from_millis(10));
         Controller::on_congestion_event(&mut gcc, now, now, false, 1000);
         assert_eq!(gcc.losses.after_cut.load(Ordering::Relaxed), 0, "no cut yet");
