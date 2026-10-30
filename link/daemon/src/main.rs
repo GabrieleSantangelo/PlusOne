@@ -90,7 +90,8 @@ struct Daemon {
     state: PathBuf,
     /// Held while state is read, changed and written again.
     changing: Mutex<()>,
-    finding: Mutex<()>,
+    /// Held while a tablet is reached (reach()): each tablet's its own.
+    finding: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     usb: usb::Watcher,
     /// The USB serial of the device last asked to be an accessory: its
     /// session, when it comes, remembers it.
@@ -211,7 +212,11 @@ impl Daemon {
         if !paired(&self.config).contains_key(device) {
             return Err("not a paired tablet".into());
         }
-        let _one_at_a_time = self.finding.lock().unwrap();
+        // One at a time for each tablet, not for all: one behind a host
+        // slow to answer (up to 8 s of handshake, 3 of mDNS) holds up none
+        // of the others.
+        let finding = self.finding.lock().unwrap().entry(device.to_owned()).or_default().clone();
+        let _one_at_a_time = finding.lock().unwrap();
         if let Some(session) = self.node.session(device).filter(|s| !s.is_closed() && s.path().is_some()) {
             return Ok(session);  // reached while this waited
         }
@@ -759,6 +764,29 @@ mod tests {
             assert!(started.elapsed() < within, "{what}: not in {within:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn reaching_one_tablet_holds_up_no_other() {
+        // One lock for every tablet, held through connecting, TLS and mDNS:
+        // a tablet whose address answers and says nothing held up reaching
+        // any other, here for 5 s (a read's timeout in the handshake).
+        let daemon = daemon("finding");
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        std::fs::write(daemon.config.join("paired.json"), json!({(a.clone()): "A", (b.clone()): "B"}).to_string()).unwrap();
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();  // takes the connection, says nothing
+        daemon.reached(&a, silent.local_addr().unwrap());
+        let held = {
+            let (daemon, a) = (daemon.clone(), a.clone());
+            std::thread::spawn(move || daemon.reach(&a).is_err())
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        assert!(daemon.reach(&b).is_err());  // nowhere to be found
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(4500), "{took:?} behind another tablet's reaching");
+        assert!(held.join().unwrap());
+        drop(silent);
     }
 
     #[test]

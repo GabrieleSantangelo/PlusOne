@@ -2,6 +2,10 @@
 
 ## Unreleased (1.0)
 
+- **One tablet slow to reach holds up no other**: plus-one-link reached
+  one tablet at a time, all tablets together: one whose last address
+  answered slowly made every other wait, up to about 19 s, and again at
+  each try while it was away. Each tablet waits only on itself now.
 - **A device that sends and takes nothing is given up**: the link gave
   up on a connection only once nothing came from the other side for
   5 s. A device that kept sending but took nothing (stuck, or hostile)
