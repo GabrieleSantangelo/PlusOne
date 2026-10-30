@@ -2,6 +2,11 @@
 
 ## Unreleased (1.0)
 
+- **A tablet away is looked for once, however often the network
+  flapped**: each time the tablet's session lost its path, plus-one-link
+  started looking for the tablet again, each a second, on top of the
+  looking already going on; a network that came and went left several
+  at once for as long as the tablet was away. There is one now.
 - **No tablet shown connected by a session already over**: a session
   the tablet ended right as it began (it said goodbye straight after
   hello) could be kept by plus-one-link all the same, closed: the tablet

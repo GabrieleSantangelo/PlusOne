@@ -96,6 +96,8 @@ struct Daemon {
     /// session, when it comes, remembers it.
     switched: Mutex<Option<String>>,
     watchers: Mutex<Vec<Arc<OwnedFd>>>,
+    /// The tablets reached for again now (come_back), each by one thread.
+    coming_back: Mutex<std::collections::HashSet<String>>,
     /// Who serves each feature now (a serial: the last one to ask).
     serving: Mutex<std::collections::HashMap<String, u64>>,
     serial: AtomicU64,
@@ -115,7 +117,8 @@ fn paired_name(entry: &Value) -> &str {
 impl Daemon {
     fn new(node: Node, config: PathBuf, ours: String, state: PathBuf) -> Daemon {
         Daemon { node, config, ours, state, changing: Mutex::default(), finding: Mutex::default(), usb: usb::Watcher::new(),
-                 switched: Mutex::default(), watchers: Mutex::default(), serving: Mutex::default(), serial: AtomicU64::new(0) }
+                 switched: Mutex::default(), watchers: Mutex::default(), coming_back: Mutex::default(),
+                 serving: Mutex::default(), serial: AtomicU64::new(0) }
     }
 
     fn devices(&self) -> Value {
@@ -213,12 +216,13 @@ impl Daemon {
             return Ok(session);  // reached while this waited
         }
         let (id, ours) = (device.to_owned(), self.ours.clone());
-        let looking = std::thread::spawn(move || {
+        // A name of its own (unnamed, it took its caller's: come_back's).
+        let looking = std::thread::Builder::new().name("link-find".into()).spawn(move || {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let mine = |f: &plusone_link::mdns::Found| plusone_link::mdns::announces(f, &id, &ours, now);
             plusone_link::mdns::browse(SERVICE, Duration::from_secs(3), mine).map_err(|e| e.to_string())
                 .and_then(|all| all.into_iter().find(|f| mine(f)).map(|f| f.address).ok_or_else(|| "not found nearby".to_owned()))
-        });
+        }).ok();
         let mut why = Vec::new();
         let remembered: Option<std::net::SocketAddr> =
             self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok());
@@ -239,15 +243,15 @@ impl Daemon {
         if let Some(session) = remembered.and_then(|address| attempt(address, &mut why)) {
             return Ok(session);
         }
-        match looking.join() {
-            Ok(Ok(address)) if Some(address) != remembered => {
+        match looking.map(|looking| looking.join()) {
+            Some(Ok(Ok(address))) if Some(address) != remembered => {
                 if let Some(session) = attempt(address, &mut why) {
                     return Ok(session);
                 }
             }
-            Ok(Ok(_)) => {}  // where the first try was
-            Ok(Err(e)) => why.push(e),
-            Err(_) => why.push("mDNS failed".into()),
+            Some(Ok(Ok(_))) => {}  // where the first try was
+            Some(Ok(Err(e))) => why.push(e),
+            _ => why.push("mDNS failed".into()),
         }
         Err(if why.is_empty() { "not reached".into() } else { why.join("; ") })
     }
@@ -445,18 +449,36 @@ impl Daemon {
 
     /// A session's path lost: another made at once, the network's (the
     /// cable's, if it is plugged in, comes by itself: usb.rs), until it
-    /// is on again or over.
+    /// is on again or over. One thread for each tablet, however many
+    /// times its session was detached meanwhile (each a thread of its
+    /// own, a session flapping left several reaching for it each second).
     fn come_back(self: &Arc<Self>, session: Arc<plusone_link::Session>) {
-        let me = self.clone();
-        let _ = std::thread::Builder::new().name("link-come-back".into()).spawn(move || {
-            while !session.is_closed() && session.path().is_none() {
-                match me.reach(&session.peer) {
-                    Ok(_) => return,
-                    Err(e) => log!("{}: not reached yet ({e})", session.name),
+        let (peer, name) = (session.peer.clone(), session.name.clone());
+        drop(session);
+        if !self.coming_back.lock().unwrap().insert(peer.clone()) {
+            return;
+        }
+        let (me, device) = (self.clone(), peer.clone());
+        let spawned = std::thread::Builder::new().name("link-come-back".into()).spawn(move || loop {
+            // Its session (a newer one's too) while it waits for a path.
+            let away = || me.node.session(&device).is_some_and(|s| !s.is_closed() && s.path().is_none());
+            if !away() {
+                let mut coming_back = me.coming_back.lock().unwrap();
+                // Detached again meanwhile: that come_back found this one going.
+                if !away() {
+                    coming_back.remove(&device);
+                    return;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                continue;
             }
+            if let Err(e) = me.reach(&device) {
+                log!("{name}: not reached yet ({e})");
+            }
+            std::thread::sleep(Duration::from_secs(1));
         });
+        if spawned.is_err() {
+            self.coming_back.lock().unwrap().remove(&peer);
+        }
     }
 
     /// One app's connection: its requests, until it goes.
@@ -657,15 +679,21 @@ mod tests {
     /// The tablet's session with the daemon over a stream an app hands it,
     /// as Bluetooth's: its id.
     fn by_bluetooth(daemon: &Arc<Daemon>, tablet: &Node) -> String {
+        bluetooth(daemon, tablet).0
+    }
+
+    /// As by_bluetooth(), and the tablet's end of the stream, to cut it.
+    fn bluetooth(daemon: &Arc<Daemon>, tablet: &Node) -> (String, std::os::unix::net::UnixStream) {
         let (app, _served) = app(daemon);
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cut = theirs.try_clone().unwrap();
         let accepter = tablet.clone();
         std::thread::spawn(move || accepter.accept_stream(Box::new(theirs), "bt").map(|_| ()));
         api::send_fds(app.as_raw_fd(), br#"{"op": "stream", "kind": "bt"}"#, &[ours.as_raw_fd()]);
         drop(ours);
         let reply = heard(&app).expect("no reply");
         assert_eq!(reply["ok"], true, "{reply}");
-        reply["device"].as_str().unwrap().to_owned()
+        (reply["device"].as_str().unwrap().to_owned(), cut)
     }
 
     /// The events an app watching hears, until one of each kind in kinds
@@ -731,6 +759,25 @@ mod tests {
             assert!(started.elapsed() < within, "{what}: not in {within:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn a_tablet_away_is_reached_for_by_one_thread() {
+        // Each detach of a session started a thread reaching for the
+        // tablet each second: a session flapping left several at once.
+        let (daemon, tablet) = paired_daemon("away");
+        let (device, cut) = bluetooth(&daemon, &tablet);
+        cut.shutdown(std::net::Shutdown::Both).unwrap();
+        until("the path lost", Duration::from_secs(2), || daemon.node.session(&device).is_some_and(|s| s.path().is_none()));
+        until("reached for", Duration::from_secs(2), || threads("link-come-back") == 1);
+        let session = daemon.node.session(&device).unwrap();
+        for _ in 0..2 {
+            daemon.event(Event::Detached(session.clone()));  // detached again, as a flapping path is
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(threads("link-come-back"), 1, "threads reaching for one tablet");
+        daemon.node.close();
+        tablet.close();
     }
 
     #[test]
