@@ -67,6 +67,7 @@ def device_status(kind, state, users=()):
         "tablet-stopped": _("Stopped on the tablet: on again when a program takes it anew"),
         "locked": _("Paused while this PC is locked"),
     }.get(state, "")
+REFRESH_MS = 1500  # the pair dialog asks where the apps are, while open
 CSS = b".pair-code { font-size: 300%; font-weight: 800; letter-spacing: 0.1em; }"
 _resources_added = False
 
@@ -665,7 +666,16 @@ class PairDialog(Adw.Dialog):
         self._listing = None
         self._list()
         app.listeners.append(self._list)
+        # Ask where the apps are now, and again while open: a tablet whose
+        # pairing was just opened shows up in a second or two, not at the
+        # next minute's recheck. Nothing of it runs once closed (power).
+        app.discovery.refresh()
+        self._refreshing = GLib.timeout_add(REFRESH_MS, self._refresh_discovery)
         self.connect("closed", self._on_closed)
+
+    def _refresh_discovery(self):
+        self.app.discovery.refresh()
+        return GLib.SOURCE_CONTINUE
 
     @staticmethod
     def _page(content, title):
@@ -786,6 +796,7 @@ class PairDialog(Adw.Dialog):
 
     def _on_closed(self, _dialog):
         self.closed = True
+        GLib.source_remove(self._refreshing)
         self._answered(False)  # closed while comparing: not paired
         self.app.listeners.remove(self._list)
 

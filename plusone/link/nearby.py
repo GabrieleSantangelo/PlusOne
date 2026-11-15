@@ -22,6 +22,7 @@ from .trust import Paired, fingerprint, identity
 AVAHI = "org.freedesktop.Avahi"
 SERVER = AVAHI + ".Server"
 BROWSER = AVAHI + ".ServiceBrowser"
+RESOLVER = AVAHI + ".ServiceResolver"
 QUICK_SHARE = "_FC9F5ED42C8A._tcp"
 KDE_CONNECT = "_kdeconnect._udp"
 COMPANION = "_plusone._tcp"  # Plus One's own app on the tablet (link.py)
@@ -35,6 +36,7 @@ RECHECK = 60  # seconds
 # minute to find a tablet that was there.
 RETRIES = (2, 5, 15)  # seconds
 RESOLVE_TIMEOUT = 10000  # ms; Avahi gives up after 5 s
+EARLY = 16  # resolvers' signals kept until their path is known
 
 
 def tablet_name(service, txt):
@@ -90,7 +92,14 @@ class Nearby:
         self._browsers = []
         self._failed = {}  # an app's service -> resolves failed in a row
         self.versions = {}  # an app's service -> its versionCode ("v"; 0 before 0.8)
-        self._subscription = self._watch = self._timer = None
+        # The app's services are followed, not only asked every RECHECK: its
+        # TXT changes in place when its user opens pairing (pair=1), under
+        # the same name, so no ItemNew says so; a resolver Avahi keeps
+        # running says Found again with the new record (measured: ~5 s).
+        self._followed = {}  # an app's service -> its resolver's path (None: being made)
+        self._following = {}  # a resolver's path -> the app's service
+        self._early = {}  # a resolver's path -> its last signal, before we knew the path
+        self._subscription = self._resolving = self._watch = self._timer = None
 
     def present(self):
         """A tablet is on the network, or there is no telling."""
@@ -132,6 +141,8 @@ class Nearby:
         # before we learn their paths.
         self._subscription = self.bus.signal_subscribe(
             None, BROWSER, None, None, None, Gio.DBusSignalFlags.NONE, self._signal)
+        self._resolving = self.bus.signal_subscribe(
+            None, RESOLVER, None, None, None, Gio.DBusSignalFlags.NONE, self._resolver_signal)
         self._watch = Gio.bus_watch_name_on_connection(
             self.bus, AVAHI, Gio.BusNameWatcherFlags.NONE, self._appeared, self._vanished)
         self._timer = GLib.timeout_add_seconds(RECHECK, self._recheck)
@@ -142,15 +153,21 @@ class Nearby:
         for path in self._browsers:
             self.bus.call(AVAHI, path, BROWSER, "Free", None, None,
                           Gio.DBusCallFlags.NONE, -1, None, None)
+        for path in self._following:
+            self._free(path)
         self.bus.signal_unsubscribe(self._subscription)
+        self.bus.signal_unsubscribe(self._resolving)
         Gio.bus_unwatch_name(self._watch)
         GLib.source_remove(self._timer)
-        self.bus = self._subscription = self._watch = self._timer = None
+        self.bus = self._subscription = self._resolving = self._watch = self._timer = None
         self._forget()
         self.known = False
 
     def _forget(self):
         self._browsers = []
+        self._followed.clear()  # Avahi gone (or stopped): its resolvers with it
+        self._following.clear()
+        self._early.clear()
         self.services.clear()
         self.tablets.clear()
         # Replaced, not cleared: other threads iterate it (tablets.targets).
@@ -187,8 +204,11 @@ class Nearby:
             if key not in self.services:
                 self.services.add(key)
                 self._resolve(key)
+                if key[3] == COMPANION:
+                    self._follow(key)
         else:
             self.services.discard(key)
+            self._unfollow(key)
             if key in self.companions:
                 self.companions = {k: v for k, v in self.companions.items() if k != key}
                 log("nearby: the Plus One app left the network")
@@ -202,12 +222,71 @@ class Nearby:
                       GLib.VariantType("(iissssisqaayu)"), Gio.DBusCallFlags.NONE,
                       RESOLVE_TIMEOUT, None, self._resolved, key)
 
+    def _follow(self, key):
+        """A resolver that stays. Its first Found may come before the reply
+        that says its path: kept in _early until then. (Avahi 0.8 lists
+        ServiceResolverPrepare, which would avoid that, but its daemon
+        answers UnknownMethod.)"""
+        if key in self._followed:
+            return
+        self._followed[key] = None
+        self.bus.call(AVAHI, "/", SERVER, "ServiceResolverNew",
+                      GLib.Variant("(iisssiu)", key + (INET, 0)),
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None, self._made, key)
+
+    def _made(self, bus, result, key):
+        try:
+            path = bus.call_finish(result).unpack()[0]
+        except GLib.Error as e:
+            self._followed.pop(key, None)  # the next RECHECK tries again
+            log("nearby: cannot follow the app:", e.message)
+            return
+        early = self._early.pop(path, None)
+        if self._followed.get(key, 0) is not None or self.bus is not bus:
+            self._free(path)  # gone meanwhile
+            return
+        self._followed[key] = path
+        self._following[path] = key
+        if early is not None:
+            self._resolver_signal(bus, None, path, RESOLVER, *early)
+
+    def _unfollow(self, key):
+        path = self._followed.pop(key, None)
+        if path is not None:
+            self._following.pop(path, None)
+            self._free(path)
+
+    def _free(self, path):
+        self.bus.call(AVAHI, path, RESOLVER, "Free", None, None, Gio.DBusCallFlags.NONE, -1, None, None)
+
+    def _resolver_signal(self, bus, sender, path, interface, signal, params):
+        key = self._following.get(path)
+        if key is None:
+            if None in self._followed.values() and len(self._early) < EARLY:
+                self._early[path] = (signal, params)  # ours, its path not known yet
+            return
+        if key not in self.services:
+            return
+        if signal == "Found":
+            reply = params.unpack()
+            self._result(key, reply, [bytes(entry) for entry in reply[9]])
+        elif signal == "Failure":
+            # Avahi ends a resolver that times out: the one-shot resolves
+            # (RECHECK, RETRIES) decide whether the app is gone; the next
+            # RECHECK follows it again.
+            self._followed.pop(key, None)
+            self._following.pop(path, None)
+            self._free(path)
+
     def _resolved(self, bus, result, key):
         try:
             reply = bus.call_finish(result).unpack()
             txt = [bytes(entry) for entry in reply[9]]
         except GLib.Error:
             reply = txt = None  # gone, or not answering any more
+        self._result(key, reply, txt)
+
+    def _result(self, key, reply, txt):
         if key not in self.services:
             return
         if key[3] == COMPANION:
@@ -285,4 +364,6 @@ class Nearby:
     def _recheck(self):
         for key in list(self.services):
             self._resolve(key)
+            if key[3] == COMPANION:
+                self._follow(key)
         return True
