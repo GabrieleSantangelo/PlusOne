@@ -755,8 +755,13 @@ impl Controller for Gcc {
             self.losses.after_cut.fetch_add(lost_bytes, Ordering::Relaxed);
         }
         if persistent {
-            self.rate = MIN_RATE;
-            self.slow_start = false;
+            // An ordinary cut (half), not the floor: from the floor the way
+            // back, near the last cut, was a packet a round trip; and the
+            // base round trip taken again (a path that came back, or changed,
+            // has its own: against the old one a queue stood for ten seconds).
+            self.rate = (0.5 * self.rate).max(MIN_RATE);
+            self.samples.clear();
+            self.last_over = now;
             self.cut(now);
         }
     }
@@ -1224,6 +1229,114 @@ mod tests {
         // The same rate, the round trip 40 ms more and staying (a router's queue).
         carry(&mut gcc, &mut now, 2e6, 1.0, Duration::from_millis(50));
         assert!(gcc.cuts[1] > 0);
+    }
+
+    /// What a closed loop came to: the rate (bytes a second) and what went
+    /// through it (the last 2 s).
+    #[derive(Debug)]
+    struct Loop {
+        rate: f64,
+        through: f64,
+    }
+
+    /// A closed loop: a FIFO bottleneck of cap_at(seconds) bytes a second and a
+    /// round trip of base_rtt over it, a sender as quinn's (window =
+    /// gcc.window(), the pacer at 1.25 window a round trip), the application
+    /// sending app(rate) bytes a second at most (a video follows the rate), at
+    /// each 10 ms events(gcc, seconds).
+    fn closed_loop(cap_at: impl Fn(f64) -> f64, base_rtt: f64, secs: f64, app_limited: bool,
+                   app: &dyn Fn(f64) -> f64, events: &mut dyn FnMut(&mut Gcc, f64)) -> Loop {
+        let start = Instant::now();
+        let mut gcc = Gcc::new(start, 1452, Arc::default(), Arc::default(), GccParams::default());
+        let packet = 1200.0f64;
+        let (mut t, mut free, mut inflight, mut srtt) = (0.0f64, 0.0f64, 0.0f64, base_rtt);
+        let mut acks: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u64)>> = Default::default();
+        let mut event_at = 0.0f64;
+        let mut delivered: VecDeque<(f64, f64)> = VecDeque::new();
+        while t < secs {
+            let window = gcc.window() as f64;
+            let pace = 1.25 * window / srtt;
+            let mut next_send = t + packet / app(gcc.rate).min(pace);
+            if inflight + packet > window {
+                if let Some(std::cmp::Reverse((at, _))) = acks.peek() {
+                    next_send = next_send.max(*at as f64 / 1e6);
+                }
+            }
+            while let Some(std::cmp::Reverse((at, sent))) = acks.peek().cloned() {
+                if at as f64 / 1e6 > next_send {
+                    break;
+                }
+                acks.pop();
+                let rtt = (at - sent) as f64 / 1e6;
+                srtt = 0.875 * srtt + 0.125 * rtt;
+                inflight -= packet;
+                delivered.push_back((at as f64 / 1e6, packet));
+                while delivered.front().is_some_and(|(when, _)| at as f64 / 1e6 - when > 2.0) {
+                    delivered.pop_front();
+                }
+                gcc.ack(start + Duration::from_micros(at), start + Duration::from_micros(sent), packet as u64,
+                        Duration::from_secs_f64(srtt));
+                gcc.end_acks(start + Duration::from_micros(at), app_limited);
+            }
+            if inflight + packet > window {
+                t = if acks.is_empty() { next_send } else { next_send.max(t) };
+                continue;
+            }
+            t = next_send;
+            if t - event_at > 0.01 {
+                event_at = t;
+                events(&mut gcc, t);
+            }
+            let capacity = cap_at(t);
+            let departs = free.max(t) + packet / capacity;
+            free = departs;
+            inflight += packet;
+            acks.push(std::cmp::Reverse((((departs + base_rtt) * 1e6) as u64, (t * 1e6) as u64)));
+        }
+        let through = delivered.iter().map(|(_, bytes)| bytes).sum::<f64>() / 2.0;
+        Loop { rate: gcc.rate, through }
+    }
+
+    #[test]
+    fn a_greedy_sender_follows_a_path_that_loses_capacity_down() {
+        // 5 MB/s, then 2 MB/s from 4 s: the rate follows it (its queue peaks
+        // at about 400 ms meanwhile: the cuts come a round trip apart and
+        // are 30 % at most).
+        let got = closed_loop(|t| if t < 4.0 { 5e6 } else { 2e6 }, 0.005, 8.0, false, &|_| f64::MAX, &mut |_, _| {});
+        assert!(got.rate < 2.6e6, "{got:?}");
+        assert!(got.through > 1.5e6, "{got:?}");
+    }
+
+    #[test]
+    fn a_persistent_congestion_is_a_cut_not_the_floor() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut gcc = Gcc::new(start, 1200, Arc::default(), Arc::default(), GccParams::default());
+        carry(&mut gcc, &mut now, 2e6, 3.0, Duration::from_millis(10));
+        let before = gcc.rate;
+        assert!(before > 4.0 * MIN_RATE);
+        Controller::on_congestion_event(&mut gcc, now, now, true, 5000);
+        assert!((gcc.rate - 0.5 * before).abs() < 1.0, "{} after {before}", gcc.rate);
+        assert!(gcc.samples.is_empty(), "the base round trip kept");
+        // The path came back with a round trip of its own (40 ms): no queue
+        // against the old 10 ms base, so no spiral of cuts.
+        let cuts = gcc.cuts;
+        carry(&mut gcc, &mut now, 1e6, 2.0, Duration::from_millis(50));
+        assert_eq!(gcc.cuts, cuts, "cut against a base that was gone");
+        assert!(gcc.rate >= 0.5 * before * 0.9, "{} after a persistent congestion", gcc.rate);
+    }
+
+    #[test]
+    fn a_persistent_congestion_does_not_send_it_to_the_floor_for_good() {
+        let mut told = false;
+        let got = closed_loop(|_| 5e6, 0.005, 12.0, false, &|_| f64::MAX, &mut |gcc, t| {
+            if t > 4.0 && !told {
+                told = true;
+                let now = Instant::now();
+                Controller::on_congestion_event(gcc, now, now, true, 3000);
+            }
+        });
+        assert!(got.through > 3.0e6, "never back to the path's rate: {got:?}");
     }
 
     #[test]
