@@ -12,6 +12,7 @@ fails once the tablet stops answering (RFC 6762, section 10).
 """
 import base64
 import binascii
+import threading
 
 from gi.repository import Gio, GLib
 
@@ -355,7 +356,12 @@ class Nearby:
             self._resolve(key)
 
     def refresh(self):
-        """Asked where the apps are now (the user wants a tablet)."""
+        """Asked where the apps are now (the user wants a tablet). From any
+        thread (the app display looks from its own): done on the main loop,
+        where the services change."""
+        if threading.current_thread() is not threading.main_thread():
+            GLib.idle_add(once(self.refresh))
+            return
         if self.bus is not None:
             for key in list(self.services):
                 if key[3] == COMPANION:

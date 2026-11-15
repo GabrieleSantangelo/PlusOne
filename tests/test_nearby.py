@@ -192,3 +192,19 @@ def test_resolver_signals_are_not_kept_when_none_is_being_made():
     nearby._resolver_signal(nearby.bus, ":1.5", "/Client1/ServiceResolver7", RESOLVER, "Found",
                             reply((3, 0, "x", COMPANION, "local"), []))
     assert not nearby._early
+
+
+def test_a_refresh_from_another_thread_is_done_on_the_main_loop(monkeypatch):
+    import threading
+    nearby, _changes = watching()
+    app = (3, 0, "Plus One on Tab", COMPANION, "local")
+    announce(nearby, "ItemNew", app)
+    before = len(nearby.bus.calls)
+    queued = []
+    monkeypatch.setattr(GLib, "idle_add", lambda f: queued.append(f))
+    worker = threading.Thread(target=nearby.refresh)
+    worker.start()
+    worker.join()
+    assert len(nearby.bus.calls) == before and len(queued) == 1  # nothing touched from there
+    queued[0]()
+    assert nearby.bus.calls[-1][3] == "ResolveService"
