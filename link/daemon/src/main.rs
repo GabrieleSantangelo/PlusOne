@@ -418,8 +418,16 @@ impl Daemon {
         if self.pairing_scanning.swap(true, Ordering::SeqCst) {
             return json!({"ok": true, "tablets": [], "busy": true});
         }
+        // Let go however the scan ends (a panic in it too): the next may scan.
+        struct Scanning<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Scanning<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let scanning = Scanning(&self.pairing_scanning);
         let found = bluez::pairing(Duration::from_secs_f64(wait));
-        self.pairing_scanning.store(false, Ordering::SeqCst);
+        drop(scanning);
         let tablets: Vec<Value> = found.iter().map(|t| json!({
             "id": t.id, "name": t.name, "address": t.address.ip().to_string(), "port": t.address.port()})).collect();
         json!({"ok": true, "tablets": tablets})

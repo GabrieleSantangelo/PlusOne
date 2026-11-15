@@ -34,12 +34,12 @@ class CompanionService : Service(), LinkServer.Host {
     var link: io.github.gabrielesantangelo.plusone.link.LinkCore? = null
         private set
     private var linkAnnouncer: MdnsAnnouncer? = null
-    private var networks: io.github.gabrielesantangelo.plusone.link.NetworkWatch? = null
+    @Volatile private var networks: io.github.gabrielesantangelo.plusone.link.NetworkWatch? = null
     /** Where the app's own listener takes pairing (LinkServer's), for the advertisement of a tablet with pairing open. */
     @Volatile private var pairingPort = 0
 
     /** The tablet's address advertised over Bluetooth LE, for the PCs that have no session. */
-    var ble: io.github.gabrielesantangelo.plusone.link.BleAnnouncer? = null
+    @Volatile var ble: io.github.gabrielesantangelo.plusone.link.BleAnnouncer? = null
         private set
     /** Both links' announcers: announced again as their tags change (announce()). */
     private val announcers = java.util.concurrent.CopyOnWriteArrayList<MdnsAnnouncer>()

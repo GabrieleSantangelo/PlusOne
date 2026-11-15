@@ -323,14 +323,14 @@ impl Node {
     /// is reached by a cable then has the Wi-Fi's address for when the
     /// cable is out, where mDNS does not go. Told again as they change.
     pub fn set_addresses(&self, addresses: Vec<std::net::IpAddr>) {
-        let sessions = {
+        {
             let mut ours = self.0.addresses.lock().unwrap();
             if *ours == addresses {
                 return;
             }
             *ours = addresses;
-            self.0.sessions.lock().unwrap().values().cloned().collect::<Vec<_>>()
-        };
+        }  // not held while the sessions are: no lock taken in the other order anywhere, and none should be
+        let sessions: Vec<_> = self.0.sessions.lock().unwrap().values().cloned().collect();
         for session in sessions {
             self.0.tell_addresses(&session);
         }
