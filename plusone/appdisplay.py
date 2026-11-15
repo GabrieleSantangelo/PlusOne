@@ -648,8 +648,19 @@ class RateControl:
         return self.budget(*self.last, now=now)
 
     def unbudgeted(self):
-        """The path has no controller of its own now (TCP, a cable)."""
+        """The path has no controller of its own now (TCP, a cable). What it
+        had cut to is no word on this path: back to the most at once (a cable
+        that takes 100 Mbit/s was held at the 5 a weak hotspot had cut to, and
+        went back by a tenth every few clean seconds, a keyframe each: 39 s
+        and 13 of them from 6 to 20 Mbit/s); the loss and the delay take it
+        down again if this path needs it. The bitrate now if it changed,
+        else None."""
+        followed = self.last is not None
         self.last = self.under = None
+        if not followed or self.kbps >= self.most:
+            return None
+        self.kbps, self.changed_at, self.why = self.most, time.monotonic(), "no budget"
+        return self.kbps
 
     def lower(self, kbps, why, now=None):
         """Down to kbps (never under MIN_KBPS) for a keyframe that would not
@@ -1053,8 +1064,10 @@ class AppStreamer:
             return
         if not kbps:
             with self._rate_lock:
-                self.rate.unbudgeted()
+                changed = self.rate.unbudgeted()
                 self.allowance.follow(None)
+                if changed is not None:
+                    self._bitrate(changed, self.rate.why)
             return
         others = self._others = self.channel.others_kbps() if hasattr(self.channel, "others_kbps") else 0
         with self._rate_lock:

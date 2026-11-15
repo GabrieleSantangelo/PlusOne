@@ -420,6 +420,23 @@ def test_on_a_path_with_its_own_congestion_control_the_bitrate_is_its_budget():
     assert rate.report(60, 0, 30, 20, budget=500, now=10) == appdisplay.MIN_KBPS  # nor below the least
 
 
+def test_a_path_with_no_budget_takes_the_bitrate_back_to_the_most_at_once():
+    # A weak hotspot's cut, then the cable (no controller of its own): the
+    # bitrate was held there and climbed a tenth every few clean seconds.
+    rate = appdisplay.RateControl(20000, tuning=HELD)
+    rate.budget(7000, now=-1)
+    assert rate.budget(7000, now=0) == 5950
+    assert rate.unbudgeted() == 20000
+    assert rate.kbps == 20000 and rate.last is None and rate.why == "no budget"
+    # Nothing to do again, nor where no budget was followed, nor at the most.
+    assert rate.unbudgeted() is None
+    fresh = appdisplay.RateControl(20000, tuning=HELD)
+    assert fresh.unbudgeted() is None and fresh.kbps == 20000
+    # The budget comes back (a Wi-Fi again): followed as ever.
+    rate.budget(10000, now=100)
+    assert rate.budget(10000, now=101) == 8500
+
+
 def test_each_change_is_a_keyframe_so_the_bitrate_changes_seldom():
     rate = appdisplay.RateControl(20000, tuning=HELD)
     rate.budget(10000, now=-1)
