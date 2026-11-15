@@ -12,6 +12,8 @@
 # p2p (300 Mbit/s, 1 ms, 0.05 %, 20 ms), or any as RATE,DELAY_MS,LOSS_%,QUEUE_MS
 # (tools/netbench-grid.sh runs a grid of them). VIDEO_KBPS: the video's bitrate
 # (else 0.85 of the session's rate on QUIC, 2 Mbit/s on TCP).
+# PLUSONE_LINK_VIDEO_STREAMS=0 in the environment: both sides without video
+# groups on streams (the datagram way, a live A/B).
 # NETBENCH_NAME (po): the containers' and their network's names, for two
 # benches side by side (two builds compared under the same load).
 # NETBENCH_ARGS: more of pathbench's arguments ("--chain 30": the desktop's
@@ -59,6 +61,8 @@ if [ -n "${NETBENCH_TABLET_CPUS:-}" ]; then
     tablet_cpus="--cpuset-cpus ${NETBENCH_TABLET_CPU:-0} --cpu-period 10000 \
         --cpu-quota $(awk -v share="$NETBENCH_TABLET_CPUS" 'BEGIN { print int(share * 10000) }')"
 fi
+streams=""
+[ -z "${PLUSONE_LINK_VIDEO_STREAMS:-}" ] || streams="-e PLUSONE_LINK_VIDEO_STREAMS=$PLUSONE_LINK_VIDEO_STREAMS"
 low=$(echo "$rate" | awk '{ n = $1 + 0; sub(/[0-9.]+/, "", $1); print int(n / 3 + 0.5) $1 }')
 docker build -q -t plus-one-netbench - < Dockerfile.netbench > /dev/null
 docker network inspect "$name-bench" > /dev/null 2>&1 || docker network create "$name-bench" > /dev/null
@@ -88,7 +92,7 @@ fi
 for run in $(seq "$runs"); do
     for transport in ${NETBENCH_TRANSPORTS:-tcp quic}; do
         docker rm -f "$name-tablet" > /dev/null 2>&1 || true
-        docker run -d --name "$name-tablet" $tablet_cpus --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" \
+        docker run -d --name "$name-tablet" $tablet_cpus --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" $streams \
             plus-one-netbench sh -c "$shape && $cross_tablet exec /b/tablet --cert /w/tablet/cert.pem --key /w/tablet/key.pem \
             --trust $(cat "$work/pc/fp") --listen 0.0.0.0:47101 --quic" > /dev/null
         sleep 1
@@ -96,7 +100,7 @@ for run in $(seq "$runs"); do
         flag=""
         [ "$transport" = quic ] && flag=--quic
         echo "== $profile run $run $transport"
-        docker run --rm --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" plus-one-netbench \
+        docker run --rm --network "$name-bench" --cap-add NET_ADMIN -v "$bin:/b:ro" -v "$work:/w:ro" $streams plus-one-netbench \
             sh -c "$shape && $cross_pc /b/pathbench --cert /w/pc/cert.pem --key /w/pc/key.pem --trust $(cat "$work/tablet/fp") \
             --tablet $ip:47101 --seconds $seconds --opens $opens $flag ${video:+--video $video} ${NETBENCH_ARGS:-}" \
             || echo "test=failed"
