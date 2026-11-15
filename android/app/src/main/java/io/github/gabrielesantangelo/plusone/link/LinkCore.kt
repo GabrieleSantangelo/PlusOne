@@ -98,6 +98,7 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
     private fun events() {
         while (!stopped) {
             val event = JSONObject(nativeNext(handle, EVENT_WAIT) ?: continue)
+            if (event.optString("event") == "stopped") continue  // close() woke the wait: stopped says so
             if (event.optString("event") == "incoming") {
                 val channel = LinkChannel(event.getInt("fd"), event.optString("device"), event.optString("feature"),
                     event.optString("channel"), event.optString("class"), event.optInt("id"))
@@ -135,7 +136,9 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
         const val INPUT = "input"
         const val REALTIME = "realtime"
         const val SERVICE_TYPE = "_plusone-link._tcp"
-        private const val EVENT_WAIT = 500  // ms: how soon close() is noticed
+        // ms the events thread waits in the core for an event: close() ends it with one ("stopped"),
+        // so it need not look again each half second (the app's process woke twice a second for ever).
+        private const val EVENT_WAIT = 60_000
 
         init { System.loadLibrary("plusonelink") }
     }

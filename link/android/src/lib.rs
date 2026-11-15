@@ -36,6 +36,16 @@ struct Core {
     sender: Sender<Value>,
 }
 
+impl Core {
+    /// Its node closed, and the events thread told: it waits in nativeNext
+    /// for as long as the app asks (a minute: a wait of half a second woke
+    /// the app twice a second for ever), so what ends it is an event.
+    fn stop(&self) {
+        let _ = self.sender.send(json!({"event": "stopped"}));
+        self.node.close();
+    }
+}
+
 /// The nodes started, by handle: a handle stopped (or never given) is an
 /// error, not a crash.
 static CORES: LazyLock<Mutex<HashMap<jlong, Arc<Core>>>> = LazyLock::new(Mutex::default);
@@ -447,7 +457,7 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
         let event = core.events.lock().unwrap().recv_timeout(wait);
         event.ok()
     }, || {
-        std::thread::sleep(wait);  // as if nothing came: the app's events thread asks again then, not at once
+        std::thread::sleep(wait.min(Duration::from_millis(500)));  // as if nothing came: the app's events thread asks again then, not at once
         None
     });
     match event {
@@ -463,7 +473,7 @@ pub extern "system" fn Java_io_github_gabrielesantangelo_plusone_link_LinkCore_n
         // Out of CORES first: its lock not held while the node closes.
         let core = CORES.lock().unwrap().remove(&handle);
         if let Some(core) = core {
-            core.node.close();
+            core.stop();
         }
     }, || ())
 }
@@ -517,6 +527,23 @@ mod tests {
         let mut buf = [0u8; 256];
         assert_eq!(pc.read(&mut buf).map_err(|e| e.kind()), Ok(0));
         cable.join().unwrap();
+    }
+
+    #[test]
+    fn a_core_stopped_wakes_the_events_thread_waiting_a_long_time() {
+        let (sender, events) = mpsc::channel();
+        let core = Arc::new(Core { node: node(), paired: Arc::default(), events: Mutex::new(events), sender });
+        let waiting = core.clone();
+        let thread = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let event = waiting.events.lock().unwrap().recv_timeout(Duration::from_secs(30)).ok();
+            (event, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        core.stop();
+        let (event, waited) = thread.join().unwrap();
+        assert_eq!(event, Some(json!({"event": "stopped"})));
+        assert!(waited < Duration::from_secs(5), "woken after {waited:?}");
     }
 
     #[test]

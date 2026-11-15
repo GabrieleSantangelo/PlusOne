@@ -161,7 +161,7 @@ const DRAIN_LEAST: f64 = 1000.0;
 /// realtime, a ping) queued meanwhile waits behind no more than this.
 const WRITE_SLICE: usize = 16 << 10;
 /// Room in the UDP socket, each way: a keyframe's packets at once.
-const UDP_BUFFER: libc::c_int = 4 << 20;
+pub(crate) const UDP_BUFFER: libc::c_int = 4 << 20;
 /// Room in a channel's socket, each way (the system caps it: a control
 /// message is at most about 200 KB; more goes on a bulk channel).
 const CHANNEL_BUFFER: usize = 1 << 20;
@@ -1427,8 +1427,8 @@ impl Session {
 
     /// Bytes sent and not yet on the air (the UDP socket's, the queue's,
     /// the Wi-Fi driver's: each packet counts until it is transmitted; on
-    /// QUIC, the datagrams quinn holds for the window) and the stream's
-    /// backlog: how far behind the network is. (Without quinn's, the
+    /// QUIC, the datagrams quinn holds for the window) and, where realtime
+    /// goes on the stream, the stream's backlog: how far behind the network is. (Without quinn's, the
     /// desktop never saw the realtime wait on QUIC: never a frame left out
     /// before it was encoded, and then packets dropped late, frames broken.)
     pub fn queued(&self) -> usize {
@@ -1438,7 +1438,14 @@ impl Session {
             unsafe { libc::ioctl(udp.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
         }
         let quic = path.as_ref().and_then(|path| path.quic.as_ref()).map_or(0, |quic| quic.queued());
-        queued.max(0) as usize + quic + self.outbox.lock().unwrap().len()
+        // The stream's backlog is the realtime's to wait behind only where
+        // it goes on the stream (a cable, Bluetooth, TCP before UDP is
+        // proven). On datagrams, a bulk transfer's backlog (up to a channel's
+        // CONTROL_BACKLOG) said the screen was behind and every frame was
+        // left out until it was done, and no keyframe fitted.
+        let outbox = self.outbox.lock().unwrap();
+        let waiting = if path.as_ref().is_some_and(|path| path.udp_works()) { outbox.urgent.len() } else { outbox.len() };
+        queued.max(0) as usize + quic + waiting
     }
 
     /// The channels open now.
@@ -2797,7 +2804,7 @@ impl Session {
     fn send_datagram_now(&self, path: &Path, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
         if let Some(quic) = &path.quic {
             self.sealer.seal(channel, body, sealed);
-            let unsent = quic.send(sealed).err();
+            let unsent = quic.send(sealed, channel == DATAGRAM_PATH).err();
             if unsent.is_some() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);  // late, or no room
             }

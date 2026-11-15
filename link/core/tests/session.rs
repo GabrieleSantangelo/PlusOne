@@ -108,6 +108,34 @@ fn a_big_transfer_never_runs_ahead_of_the_stream() {
 }
 
 #[test]
+fn a_transfer_backed_up_on_the_stream_is_no_wait_for_realtime_on_udp() {
+    // Over datagrams, what is queued is what realtime waits behind: the
+    // stream's backlog (a slow reader, up to a channel's allowance) is not.
+    // Before this the desktop saw it, left every frame out until the
+    // transfer was done, and no keyframe fitted.
+    let (pc, tablet, address) = pair();
+    tablet.serve("slow", 1, |incoming| {
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
+            if n == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    until("UDP proven", || session.rtt().is_some());
+    let channel = session.open("slow", "control", Class::Control).unwrap();
+    let chunk = vec![7u8; 64 << 10];
+    let mut most = 0;
+    for _ in 0..48 {
+        channel.send(&chunk).unwrap();
+        most = most.max(session.queued());
+    }
+    assert!(most <= 32 << 10, "{most} bytes counted as queued behind a transfer, on UDP");
+}
+
+#[test]
 fn realtime_goes_over_udp_once_proven() {
     let (pc, _tablet, address) = pair();
     let session = pc.connect(address, Duration::from_secs(2)).unwrap();

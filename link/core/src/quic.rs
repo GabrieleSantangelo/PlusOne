@@ -82,11 +82,16 @@ const CID_MAC: usize = 4;
 /// counts as its (architecture §3.14: under load, Retry is the cookie).
 const RETRY_OVER: usize = 2;
 
-/// The core's own runtime for quinn: two threads, whatever the program.
+/// The core's own runtime for quinn: one thread, whatever the program. A
+/// connection's endpoint, driver and stream tasks only hand bytes on (the
+/// crypto and the copies are short): it used 140 ms of CPU in 8 s of 20
+/// Mbit/s of video, and a second thread only added wakes between them (a
+/// third fewer context switches a packet on loopback with one, 45 % on
+/// the small flows; and half again in the idle seconds).
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("link-quic").enable_all().build()
+        tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("link-quic").enable_all().build()
             .expect("a runtime for QUIC")
     })
 }
@@ -205,13 +210,24 @@ pub(crate) fn send_window(rate: u64, rtt: Duration, groups: u64) -> u64 {
     ((rate as f64 * (rtt + AHEAD).as_secs_f64()) as u64).max(2 * BRIDGE_CHUNK as u64) + groups
 }
 
+/// Whether what quinn holds of datagrams (what its buffer, idle when
+/// empty, has less of room) would take longer than LATE to go at the rate
+/// (bytes a second; 0 before one is known).
+fn waits_too_long(rate: u64, idle: usize, room: usize) -> bool {
+    rate > 0 && idle.saturating_sub(room) as f64 > rate as f64 * LATE.as_secs_f64()
+}
+
 impl Quic {
     /// A sealed datagram out, unless it would wait longer than LATE for the
-    /// window or does not fit.
-    pub(crate) fn send(&self, sealed: &[u8]) -> Result<(), Unsent> {
+    /// window or does not fit. A ping or a pong (urgent) never waits for
+    /// that: they are what says the path is alive and measures it, a few
+    /// bytes each; held by the same rule as a full queue of video, three
+    /// seconds of them lost made the session take its video off the
+    /// datagrams.
+    pub(crate) fn send(&self, sealed: &[u8], urgent: bool) -> Result<(), Unsent> {
         let rate = self.cc.rate.load(Ordering::Relaxed);
         let room = self.conn.datagram_send_buffer_space();
-        if rate > 0 && self.idle.saturating_sub(room) as f64 > rate as f64 * LATE.as_secs_f64() {
+        if !urgent && waits_too_long(rate, self.idle, room) {
             return Err(Unsent::Late);
         }
         // Nor past quinn's room: it would drop the oldest to make some,
@@ -372,6 +388,12 @@ pub(crate) fn endpoint(address: SocketAddr, server: Option<&Arc<rustls::ServerCo
         None => None,
     };
     let socket = std::net::UdpSocket::bind(address)?;
+    // Room for a keyframe's burst when the thread that reads is a moment late
+    // (the default, about 200 KB, is lost to the kernel and read by the
+    // controller as loss), as the session's own UDP path has.
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        crate::sys::set_int(std::os::fd::AsRawFd::as_raw_fd(&socket), libc::SOL_SOCKET, option, crate::session::UDP_BUFFER);
+    }
     let key = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
         .map_err(|_| io::Error::other("no random key"))?;
     let mut config = EndpointConfig::default();
@@ -941,6 +963,16 @@ mod tests {
     }
 
     #[test]
+    fn a_datagram_waits_too_long_past_late_of_the_rate() {
+        // 1 MB/s: 100 KB is LATE's worth.
+        assert!(!waits_too_long(1_000_000, 500_000, 500_000), "an empty queue");
+        assert!(!waits_too_long(1_000_000, 500_000, 400_000), "100 KB is LATE's worth: not past it");
+        assert!(waits_too_long(1_000_000, 500_000, 399_000));
+        assert!(!waits_too_long(0, 500_000, 0), "no rate known yet");
+        assert!(!waits_too_long(1_000_000, 100, 500), "more room than the buffer had: nothing waits");
+    }
+
+    #[test]
     fn each_controller_carries_the_stream_and_tells_a_budget() {
         let pc = identity();
         let (tablet, address, paths) = tablet_for(&pc);
@@ -969,7 +1001,7 @@ mod tests {
             assert!(came[..sent.len()] == sent[..] && came[sent.len()..] == sent[..64 << 10], "{name}");
             assert!(started.elapsed() < Duration::from_secs(10), "{name}: {:?}", started.elapsed());
             // A datagram goes too, under the same window.
-            assert!(quic.send(&[1u8; 1000]).is_ok(), "{name}: a datagram refused");
+            assert!(quic.send(&[1u8; 1000], false).is_ok(), "{name}: a datagram refused");
             let (told, rate) = quic.budget().last();
             assert!(told >= 1 && rate >= 30_000 && quic.rate() >= 30_000, "{name}: {told} told, {rate}");
             drop(writer.join().unwrap());
