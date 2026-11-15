@@ -622,6 +622,8 @@ class PlusOneApp(Adw.Application):
         active = self.tablets.active()
         if active and active.fingerprint == fingerprint:
             self.controller.stop()  # its session, if it has one, ends with it
+        name = next((t.name for t in self.tablets.all() if t.fingerprint == fingerprint), "?")
+        log(f"tablets: forgot {name}, as asked")
         self.tablets.forget(fingerprint)
         self.devices.apply()
         self._on_nearby()

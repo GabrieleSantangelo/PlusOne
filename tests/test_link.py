@@ -82,6 +82,15 @@ def test_paired_tablets_are_remembered(tmp_path):
     assert link.Paired(str(tmp_path)).all() == {"ab" * 32: "Galaxy Tab"}
 
 
+
+def test_pairing_never_writes_over_a_file_it_cannot_read(tmp_path):
+    # Read as empty and written whole, it would forget every other tablet.
+    (tmp_path / "paired.json").write_text('{"aa": {"name": "Tab"')
+    link.Paired(str(tmp_path)).add("bb", "Other")
+    assert (tmp_path / "paired.json.unreadable").read_text() == '{"aa": {"name": "Tab"'
+    assert link.Paired(str(tmp_path)).all() == {"bb": "Other"}
+
+
 def test_text_from_the_app():
     marks = sign_jobs.to_marks({"pages": [{"page": 1, "marks": [
         {"type": "text", "x": 100, "y": 700, "text": "24/10/2026", "size": 11, "color": [0, 0, 0]}]}]})

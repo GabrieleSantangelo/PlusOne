@@ -298,6 +298,8 @@ _IT = {
     "No tablet paired": "Nessun tablet abbinato",
     "To use it again, pair it again: both screens show a code.":
         "Per usarlo di nuovo, abbinalo di nuovo: entrambi gli schermi mostreranno un codice.",
+    "A tablet that does not answer needs no forgetting: on another network, this PC finds it again by itself.":
+        "Un tablet che non risponde non va dimenticato: su un'altra rete questo PC lo ritrova da solo.",
     "Signing": "Firma",
     "General": "Generale",
     "In Files and Open With, for PDFs": "In File e Apri con, per i PDF",

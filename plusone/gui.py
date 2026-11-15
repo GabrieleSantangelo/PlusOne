@@ -526,10 +526,14 @@ class Window(Adw.ApplicationWindow):
 
     def _ask_forget(self, fingerprint, name):
         dialog = Adw.AlertDialog(heading=_("Forget {tablet}?").format(tablet=name),
-                                 body=_("To use it again, pair it again: both screens show a code."))
+                                 body=_("To use it again, pair it again: both screens show a code.") + "\n\n"
+                                 + _("A tablet that does not answer needs no forgetting: on another network, "
+                                     "this PC finds it again by itself."))
         dialog.add_response("cancel", _("Cancel"))
         dialog.add_response("forget", _("Forget"))
         dialog.set_response_appearance("forget", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
 
         def answered(_d, response):
             if response == "forget":
