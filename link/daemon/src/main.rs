@@ -194,6 +194,10 @@ impl Daemon {
         });
     }
 
+    fn forget_address(&self, device: &str) {
+        self.change(|state| state.remove(device).is_some());
+    }
+
     /// The session with a paired tablet: the one up, or a new one where it
     /// was last reached and wherever mDNS finds it, at once (the first to
     /// answer wins).
@@ -229,8 +233,14 @@ impl Daemon {
                 .and_then(|all| all.into_iter().find(|f| mine(f)).map(|f| f.address).ok_or_else(|| "not found nearby".to_owned()))
         }).ok();
         let mut why = Vec::new();
-        let remembered: Option<std::net::SocketAddr> =
+        let mut remembered: Option<std::net::SocketAddr> =
             self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok());
+        if let Some(address) = remembered.filter(|a| !plusone_link::sys::on_link(a.ip())) {
+            // Another network's: forgotten, not dialled (mDNS finds it here).
+            log!("link: {address} is not on this network: forgotten");
+            self.forget_address(device);
+            remembered = None;
+        }
         let attempt = |address: std::net::SocketAddr, why: &mut Vec<String>| match self.node.connect(address, Duration::from_millis(1500)) {
             Ok(session) if session.peer == device => {
                 self.reached(device, address);

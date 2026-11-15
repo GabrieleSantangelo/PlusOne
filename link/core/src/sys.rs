@@ -147,3 +147,87 @@ impl Wake {
         self.0.as_raw_fd()
     }
 }
+
+/// The networks of this machine's interfaces that are up (not loopback):
+/// each as one of its addresses and its netmask.
+pub fn networks() -> Vec<(std::net::IpAddr, std::net::IpAddr)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut found = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return found;
+    }
+    let ip = |at: *const libc::sockaddr| -> Option<IpAddr> {
+        if at.is_null() {
+            return None;
+        }
+        match unsafe { (*at).sa_family } as libc::c_int {
+            libc::AF_INET => Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                unsafe { &*(at as *const libc::sockaddr_in) }.sin_addr.s_addr)))),
+            libc::AF_INET6 => Some(IpAddr::V6(Ipv6Addr::from(
+                unsafe { &*(at as *const libc::sockaddr_in6) }.sin6_addr.s6_addr))),
+            _ => None,
+        }
+    };
+    let mut at = list;
+    while !at.is_null() {
+        let entry = unsafe { &*at };
+        let flags = entry.ifa_flags as libc::c_int;
+        if flags & libc::IFF_UP != 0 && flags & libc::IFF_LOOPBACK == 0 {
+            if let (Some(address), Some(mask)) = (ip(entry.ifa_addr), ip(entry.ifa_netmask)) {
+                found.push((address, mask));
+            }
+        }
+        at = entry.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
+/// The address is in one of these networks (address, netmask).
+pub fn in_networks(address: std::net::IpAddr, networks: &[(std::net::IpAddr, std::net::IpAddr)]) -> bool {
+    use std::net::IpAddr;
+    networks.iter().any(|(local, mask)| match (address, local, mask) {
+        (IpAddr::V4(a), IpAddr::V4(l), IpAddr::V4(m)) => {
+            let m = u32::from(*m);
+            u32::from(a) & m == u32::from(*l) & m
+        }
+        (IpAddr::V6(a), IpAddr::V6(l), IpAddr::V6(m)) => {
+            let m = u128::from(*m);
+            u128::from(a) & m == u128::from(*l) & m
+        }
+        _ => false,
+    })
+}
+
+/// The address is on a network this machine is on now: one learnt on
+/// another network is not dialled there (15/11: 10.151.253.132, from the
+/// network of before, tried at home). True when there is no telling.
+pub fn on_link(address: std::net::IpAddr) -> bool {
+    let networks = networks();
+    networks.is_empty() || in_networks(address, &networks)
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn an_address_of_another_network_is_not_on_link() {
+        let home = [("192.168.1.155".parse().unwrap(), "255.255.255.0".parse().unwrap()),
+                    ("2a01:e11:4002:66a0::5".parse().unwrap(), "ffff:ffff:ffff:ffff::".parse().unwrap())];
+        assert!(in_networks("192.168.1.112".parse().unwrap(), &home));
+        assert!(in_networks("2a01:e11:4002:66a0:1e4d::1".parse().unwrap(), &home));
+        assert!(!in_networks("10.151.253.132".parse().unwrap(), &home));
+        assert!(!in_networks("2a01:e11:4002:66a1::1".parse().unwrap(), &home));
+        assert!(!in_networks("192.168.1.112".parse().unwrap(), &[]));
+    }
+
+    #[test]
+    fn this_machines_networks_are_read() {
+        // Whatever is up here: each address is on its own network.
+        for (address, _mask) in networks() {
+            assert!(on_link(address));
+        }
+    }
+}

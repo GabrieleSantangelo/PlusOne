@@ -4,8 +4,33 @@ are the PC's. Where its app is: announced (discovery.py), or
 where it was last.
 """
 from dataclasses import dataclass
+import ipaddress
+import json
+import subprocess
 
 from .trust import MAX_NAME, Paired
+
+
+def on_link(host):
+    """The address is on a network this PC is on now (in the subnet of one of
+    its interfaces that is up): one learnt on another network is not tried
+    there (15/11: 10.151.253.132 from the network of before, tried for 5 s
+    at home). True when there is no telling."""
+    try:
+        address = ipaddress.ip_address(host)
+        found = json.loads(subprocess.run(["ip", "-j", "address", "show", "up"], capture_output=True,
+                                          text=True, timeout=2, check=True).stdout)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return True
+    for interface in found:
+        for entry in interface.get("addr_info", ()):
+            try:
+                net = ipaddress.ip_interface(f"{entry['local']}/{entry['prefixlen']}").network
+            except (KeyError, ValueError):
+                continue
+            if address in net and not net.is_loopback:
+                return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -77,7 +102,9 @@ class Tablets:
     def targets(self, tablet):
         """Where to reach its app: where it is announced, else where it was
         last (mDNS can miss a tablet asleep for a while; its address seldom
-        changes, and the TLS link proves it is the tablet either way)."""
+        changes, and the TLS link proves it is the tablet either way), if
+        that is on a network this PC is on now: one of another network is
+        forgotten."""
         found = self.addresses(tablet)
         if found:
             return found
@@ -85,4 +112,9 @@ class Tablets:
             self.discovery.refresh()
         at = self.paired.entries().get(tablet.fingerprint, {}).get("app_at", "")
         host, _colon, port = at.rpartition(":")
-        return [(host, int(port))] if host and port.isdigit() and 0 < int(port) < 65536 else []
+        if not (host and port.isdigit() and 0 < int(port) < 65536):
+            return []
+        if not on_link(host):
+            self.paired.learn(tablet.fingerprint, app_at="")  # another network's
+            return []
+        return [(host, int(port))]

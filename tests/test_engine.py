@@ -59,12 +59,19 @@ def test_no_screen_without_a_paired_tablet(monkeypatch):
     assert not controller.running and FakeAppDisplay.made == []
 
 
-def test_no_screen_without_the_app_on_the_network(monkeypatch):
+def test_an_app_not_found_yet_is_looked_for_then_said_not_there(monkeypatch):
+    # Not given up at once: the network may have just changed, the tablet's
+    # Wi-Fi may sleep. The app display looks (find) and says NotFound.
     controller = app_controller(monkeypatch, app_at=())
     controller.start()
+    shown = FakeAppDisplay.made[0]
+    assert controller.state == State.CONNECTING and shown.targets == []
+    controller.tablets.app_at = [("192.168.1.112", 47236)]
+    assert shown.callbacks["find"]() == [("192.168.1.112", 47236)]
+    shown.callbacks["on_ended"](link.NotFound("not found on this network"), False)
     assert controller.state == State.ERROR and controller.detail == (
         "{name} is not on the network: open Plus One on it", {"name": "Tab"})
-    assert FakeAppDisplay.made == []
+    assert not controller.running
 
 
 def test_the_app_shows_the_desktop(monkeypatch):

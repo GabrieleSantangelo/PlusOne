@@ -31,6 +31,10 @@ HANDSHAKE_FOR = 20           # seconds for TLS, hello and pairing messages (not 
 KEEPALIVE = 5                # seconds between a session's pings (the app lets go of a silent PC: LinkServer.kt SILENT_PC)
 
 
+class NotFound(OSError):
+    """The tablet's app is not on this PC's network: looked for, not found."""
+
+
 class Incompatible(Exception):
     """The app speaks another version of the protocol: one of the two needs updating."""
 

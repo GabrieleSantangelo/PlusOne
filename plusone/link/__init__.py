@@ -23,9 +23,9 @@ The primitives:
 from .datagrams import Datagrams
 from .discovery import Discovery
 from .link import (APP_PORT, IO_TIMEOUT, KEEPALIVE, LINK_TIMEOUT, PAIRING_TIMEOUT, PROTOCOL, Impostor,
-                   Incompatible, Link, PairingClosed, PairingRefused, Refused, connect, pair)
+                   Incompatible, Link, NotFound, PairingClosed, PairingRefused, Refused, connect, pair)
 from .nearby import Nearby
-from .tablets import Tablet, Tablets
+from .tablets import Tablet, Tablets, on_link
 from .trust import MAX_NAME, Paired, fingerprint, identity
 from .wire import MAX_HEADER, UNPAIRED_HEADER, Wire
 

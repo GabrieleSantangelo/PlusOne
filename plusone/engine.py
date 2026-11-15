@@ -79,6 +79,8 @@ def why_not(error, name):
         return "{name} no longer knows this PC: pair it again", {"name": name}
     if isinstance(error, link.Incompatible):
         return "Plus One on {name} and on this PC are different versions: update them", {"name": name}
+    if isinstance(error, link.NotFound):
+        return "{name} is not on the network: open Plus One on it", {"name": name}
     if isinstance(error, OSError):
         return "{name} did not answer: is Plus One open on it?", {"name": name}
     return "{error}", {"error": str(error)}
@@ -119,10 +121,10 @@ class Controller:
         if tablet is None:
             self._set_state(State.ERROR, "Pair a tablet first")
             return
+        # None found yet is no reason to give up: the link's daemon looks
+        # too, and the app display looks for a while (a tablet whose Wi-Fi
+        # sleeps answers mDNS late).
         targets = self.tablets.targets(tablet)
-        if not targets:
-            self._set_state(State.ERROR, "{name} is not on the network: open Plus One on it", name=tablet.name)
-            return
         if importlib.util.find_spec("cryptography") is None:  # from the sources, without it
             self._set_state(State.ERROR, "Needs python3-cryptography")
             return
@@ -195,7 +197,8 @@ class Controller:
                 self._set_state(State.ERROR, template, **args)
 
         self.app_display = AppDisplay(targets, tablet.app_id, mode, s.bitrate, self.encoder, touch=s.touch,
-                                      test=s.test_pattern, on_started=started, on_ended=ended, on_paused=paused)
+                                      test=s.test_pattern, on_started=started, on_ended=ended, on_paused=paused,
+                                      find=lambda: self.tablets.targets(tablet))
         self.app_display.gate(*self.gated)
         self.app_display.start()
 
