@@ -313,6 +313,16 @@ fn tablet(device: &Device) -> Option<Tablet> {
     Some(Tablet { id, name: name.trim().to_owned(), address })
 }
 
+/// The most tablets one scan lists: anyone nearby can advertise as many as they like.
+const MOST_TABLETS: usize = 16;
+
+/// A tablet heard, kept (the latest of each id) unless MOST_TABLETS others are.
+fn keep(found: &mut BTreeMap<String, Tablet>, tablet: Tablet) {
+    if found.len() < MOST_TABLETS || found.contains_key(&tablet.id) {
+        found.insert(tablet.id.clone(), tablet);
+    }
+}
+
 /// The tablets heard holding pairing open within window: scanned that long
 /// (what a device advertised before the scan is not of now). None if
 /// there is no BlueZ, or no adapter on.
@@ -327,7 +337,7 @@ pub fn pairing(window: Duration) -> Vec<Tablet> {
         let heard = scan.heard();
         for device in devices(&seen).iter().filter(|d| heard.contains(&d.address.to_ascii_uppercase())) {
             if let Some(tablet) = tablet(device) {
-                found.insert(tablet.id.clone(), tablet);
+                keep(&mut found, tablet);
             }
         }
         if scan.ended() {
@@ -413,5 +423,19 @@ mod tests {
                                ("Discovery started", None), ("Device 3F:9E:D1", None), ("Device ZZ:9E:D1:4F:A0:20 x", None)] {
             assert_eq!(address_in(line).as_deref(), wanted, "{line:?}");
         }
+    }
+
+    #[test]
+    fn a_scan_lists_a_few_tablets_however_many_advertise() {
+        let tablet = |i: usize, name: &str| Tablet { id: format!("{i:016x}"), name: name.into(), address: "10.0.0.2:1".parse().unwrap() };
+        let mut found = BTreeMap::new();
+        for i in 0..100 {
+            keep(&mut found, tablet(i, "a"));
+        }
+        assert_eq!(found.len(), MOST_TABLETS);
+        // One already listed is still updated (its name came in the scan response).
+        keep(&mut found, tablet(3, "named"));
+        assert_eq!(found[&format!("{:016x}", 3)].name, "named");
+        assert_eq!(found.len(), MOST_TABLETS);
     }
 }
