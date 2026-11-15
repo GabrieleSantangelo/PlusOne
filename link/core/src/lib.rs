@@ -9,6 +9,7 @@
 mod cc;
 #[cfg(fuzzing)]
 pub use cc::fuzz as fuzz_controller;
+pub mod ble;
 pub mod frame;
 mod gate;
 pub mod identity;

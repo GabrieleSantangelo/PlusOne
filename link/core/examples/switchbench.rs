@@ -123,6 +123,7 @@ fn watch(node: &Node, events: Arc<Lines>, current: Option<PathBuf>, wake: Option
             Event::Path(_, path) => (json!({"at": at, "ev": "path", "id": path.id, "kind": path.kind, "state": path.state.name(),
                                             "transport": path.transport, "silent_ms": path.silent_ms}), None),
             Event::Gone(_, why) => (json!({"at": at, "ev": "gone", "why": why}), Some(None)),
+            Event::Net(_) => return,
         };
         events.line(&line.to_string());
         events.flush();

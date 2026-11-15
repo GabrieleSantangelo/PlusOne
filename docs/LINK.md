@@ -64,13 +64,46 @@ Every source feeds one list of candidates per paired device:
   the next, nor learn which PCs it is paired with; its version comes over
   the link, authenticated. While the user holds pairing open on the
   tablet, its id and name are there too, for a new PC to list it;
-- **Bluetooth LE**: the app advertises a service with an id that changes
-  every 15 minutes, HMAC(the pairing's key, the time slot), its IPv4
-  address and port and which paths it has. Only a PC paired with it can
-  tell whose it is; nobody can follow the tablet from one slot to the
-  next. The PC scans only while it looks for a tablet (BlueZ, passive);
+- **Bluetooth LE**: the app advertises its own IPv4 address and port on the
+  network it is on, for each paired PC that has no session with it
+  (two at most in one advertisement, the others in turn every 8 s):
+  manufacturer data (company 0xFFFF, not connectable, Android's lowest
+  rate) of a version byte and, for each PC, a block of a nonce, the
+  address and port encrypted, and a 5-byte MAC, with a key made of the
+  two fingerprints and a slot of a quarter of an hour (`ble.rs`,
+  `BleBlocks.kt`, one test vector for the two). Only that PC can read it
+  or tell it is its tablet's, nobody can follow the tablet from one slot
+  to the next. The PC scans only while it looks for a tablet and the last
+  addresses and mDNS found nothing, for 5 s at most and once in 30 s for
+  each tablet: `bluetoothctl` holds the scan and the manufacturer data
+  BlueZ keeps is read through `busctl` (`bluez.rs`). What it reads is a
+  hint, dialled as any: the certificate says who answers;
+- **a tablet holding pairing open, over Bluetooth LE** (as earphones to be
+  paired appear among the devices nearby): for the two minutes its user
+  holds "Pair a new PC" open, the tablet advertises, in the clear (no
+  key is between it and a PC yet), manufacturer data of a marker, the
+  start of its fingerprint (8 bytes), its IPv4 address and port, and in
+  the scan response its name (`ble.rs`, `BleBlocks.kt`, one test vector
+  for the two). The PC lists it on the pairing page beside those mDNS
+  finds (`blenearby.py`: only while that page is open, one scan of 3 s at a
+  time; plus-one-link's `pairing_scan`): where multicast does not go it is
+  there all the same. It only says who and where; what pairs is the
+  code both screens show;
 - **the last addresses** each side was reached at, tried directly, both
-  ways (each side listens);
+  ways (each side listens), and the ones the tablet tells itself: the
+  addresses of its Wi-Fi and Ethernet, with its port, in a `net`
+  message over any session, the cable's too, and again when its
+  networks change. The PC keeps a few for each tablet (those of the
+  networks it has been on, a network's newer one replacing its old) and
+  dials only those on a network it is on now. An address is kept only
+  once the tablet has answered there: the PC dials each it is told (on a
+  network it is on) with the session's own handshake, and the
+  certificate says who answers; another place's network with the same
+  addresses (192.168.1.x), or one where clients cannot reach each other,
+  answers nothing and is not kept. The path that makes is closed at
+  once if the session has a better one (the cable). A tablet plugged in
+  at home is found by Wi-Fi where multicast does not go, once the cable
+  is out (`addresses.rs`, `session.rs`, `main.rs` verify());
 - **Wi-Fi Direct's peers**.
 
 On eduroam multicast is blocked, and clients usually cannot reach each
