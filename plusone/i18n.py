@@ -258,9 +258,9 @@ _IT = {
     "1080p takes about twice the bandwidth. A change waits until no program uses the camera":
         "1080p usa circa il doppio della banda. Un cambio attende che nessun programma usi la fotocamera",
     "Pair another tablet…": "Abbina un altro tablet…",
-    "With Plus One on your Wi-Fi": "Con Plus One sulla tua Wi-Fi",
-    "Not there? Open Plus One on the tablet, on the same Wi-Fi as this PC.":
-        "Non c'è? Apri Plus One sul tablet, sulla stessa Wi-Fi di questo PC.",
+    "Tablets with Plus One nearby": "Tablet con Plus One vicini",
+    "Not there? On the tablet, open Plus One and tap “Pair a new PC”.":
+        "Non c'è? Sul tablet apri Plus One e tocca «Abbina un nuovo PC».",
     "Looking for tablets…": "Cerco i tablet…",
     "Paired": "Abbinato",
     "Pair only if the tablet shows this same code. Confirm there too.":
@@ -291,8 +291,8 @@ _IT = {
         "e come webcam.",
     "Get the tablet app": "Scarica l'app per il tablet",
     "Not found: open Plus One on the tablet": "Non trovato: apri Plus One sul tablet",
-    "No tablet found yet. Open Plus One on the tablet, on the same Wi-Fi as this PC.":
-        "Ancora nessun tablet. Apri Plus One sul tablet, sulla stessa Wi-Fi di questo PC.",
+    "No tablet found yet. On the tablet, open Plus One and tap “Pair a new PC”.":
+        "Ancora nessun tablet. Sul tablet apri Plus One e tocca «Abbina un nuovo PC».",
     "The one in use gets the desktop and the PDFs. Forget one you no longer use.":
         "Quello in uso riceve lo schermo e i PDF. Dimentica quelli che non usi più.",
     "No tablet paired": "Nessun tablet abbinato",

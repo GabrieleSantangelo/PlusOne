@@ -20,6 +20,7 @@ The primitives:
 - Datagrams (datagrams.py): a session's UDP, sealed both ways, for what
   must not wait (frames, input, sound); its key goes over the link.
 """
+from .blenearby import BleNearby
 from .datagrams import Datagrams
 from .discovery import Discovery
 from .link import (APP_PORT, IO_TIMEOUT, KEEPALIVE, LINK_TIMEOUT, PAIRING_TIMEOUT, PROTOCOL, Impostor,
@@ -29,7 +30,7 @@ from .tablets import Tablet, Tablets, on_link
 from .trust import MAX_NAME, Paired, fingerprint, identity
 from .wire import MAX_HEADER, UNPAIRED_HEADER, Wire
 
-__all__ = ["APP_PORT", "Datagrams", "Discovery", "IO_TIMEOUT", "Impostor", "Incompatible", "KEEPALIVE", "LINK_TIMEOUT",
+__all__ = ["APP_PORT", "BleNearby", "Datagrams", "Discovery", "IO_TIMEOUT", "Impostor", "Incompatible", "KEEPALIVE", "LINK_TIMEOUT",
            "Link", "MAX_HEADER", "MAX_NAME", "Nearby", "PAIRING_TIMEOUT", "PROTOCOL", "Paired", "PairingClosed",
            "PairingRefused",
            "Refused", "Tablet", "Tablets", "UNPAIRED_HEADER", "Wire", "connect", "fingerprint", "identity", "pair"]

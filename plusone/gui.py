@@ -656,16 +656,17 @@ class PairDialog(Adw.Dialog):
         self.set_child(self.nav)
 
         page = Adw.PreferencesPage()
-        self.found = Adw.PreferencesGroup(title=_("With Plus One on your Wi-Fi"),
-                                          description=_("Not there? Open Plus One on the tablet, on the same "
-                                                        "Wi-Fi as this PC."))
+        # Found on the network, or over Bluetooth while its user holds pairing open.
+        self.found = Adw.PreferencesGroup(title=_("Tablets with Plus One nearby"),
+                                          description=_("Not there? On the tablet, open Plus One and tap "
+                                                        "“Pair a new PC”."))
         page.add(self.found)
         self.rows = []
         self.searching = Adw.ActionRow(title=_("Looking for tablets…"))
         self.searching.add_prefix(Gtk.Spinner(spinning=True))
         # Nothing after a while: what to do, not a spinner forever.
         GLib.timeout_add_seconds(10, once(lambda: self.closed or self.searching.set_title(
-            _("No tablet found yet. Open Plus One on the tablet, on the same Wi-Fi as this PC."))))
+            _("No tablet found yet. On the tablet, open Plus One and tap “Pair a new PC”."))))
         self.nav.add(self._page(page, _("Pair a tablet")))
         self._listing = None
         self._list()
@@ -674,11 +675,13 @@ class PairDialog(Adw.Dialog):
         # pairing was just opened shows up in a second or two, not at the
         # next minute's recheck. Nothing of it runs once closed (power).
         app.discovery.refresh()
+        app.discovery.refresh_pairing()
         self._refreshing = GLib.timeout_add(REFRESH_MS, self._refresh_discovery)
         self.connect("closed", self._on_closed)
 
     def _refresh_discovery(self):
         self.app.discovery.refresh()
+        self.app.discovery.refresh_pairing()
         return GLib.SOURCE_CONTINUE
 
     @staticmethod

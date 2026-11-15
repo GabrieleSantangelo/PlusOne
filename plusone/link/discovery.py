@@ -53,3 +53,11 @@ class Discovery:
         """Asked where the apps are now (the user wants a tablet)."""
         for source in self.sources:
             source.refresh()
+
+    def refresh_pairing(self):
+        """The user is pairing a new tablet: the sources that can hear one
+        whose pairing is open, where the others cannot, listen (blenearby.py)."""
+        for source in self.sources:
+            listen = getattr(source, "refresh_pairing", None)
+            if listen:
+                listen()

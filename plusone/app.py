@@ -30,7 +30,7 @@ from .engine import Controller, Settings, State  # noqa: E402
 from .i18n import _  # noqa: E402
 from .signing import Signing  # noqa: E402
 from .devices import SPEAKERS_NAME, BluetoothAudio, Devices, make_default_sink  # noqa: E402
-from .link import Discovery, Nearby, Tablets  # noqa: E402
+from .link import BleNearby, Discovery, Nearby, Tablets  # noqa: E402
 from .link.paths import Paths  # noqa: E402
 from .seat import Seat  # noqa: E402
 
@@ -242,8 +242,8 @@ class PlusOneApp(Adw.Application):
         # The system's language, as the Quick Settings toggle, Files and the
         # tablet have it: a choice of Plus One's own mixed languages.
         i18n.set_language("auto")
-        # Every way of finding the tablets' apps: mDNS for now.
-        self.discovery = Discovery([Nearby(on_change=self._on_nearby)])
+        # Every way of finding the tablets' apps: mDNS, and Bluetooth LE for one whose pairing is open.
+        self.discovery = Discovery([Nearby(on_change=self._on_nearby), BleNearby(on_change=lambda: GLib.idle_add(once(self._on_nearby)))])
         self.tablets = Tablets(self.settings, self.save_settings, self.discovery)
         # What the tablet is connected by (the link's events): in the status.
         self.paths = Paths(self._path_changed, on_link=self._link_up)

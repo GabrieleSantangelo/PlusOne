@@ -100,6 +100,12 @@ def test_refused_and_unknown(world):
         link.connect("127.0.0.1:1", timeout=1)
 
 
+def test_the_tablets_holding_pairing_open_are_asked_for(world):
+    link, *_ = world
+    # None heard here (or no BlueZ, or no adapter): a list all the same, not an error.
+    assert link.pairing_scan(1.0) == []
+
+
 def test_open_reconnects_where_the_tablet_was(world):
     link, address, tablet_id, _ = world
     link.connect(address)
