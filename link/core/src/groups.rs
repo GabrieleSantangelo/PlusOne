@@ -558,7 +558,10 @@ impl Shared {
 
     /// Until when channel's group lasts (lasts_in).
     fn lasts(&self, channel: u16, group: u32) -> Result<Option<Instant>, Over> {
-        let (rate, rtt) = (self.rate.load(Ordering::Relaxed), self.conn.rtt());
+        // The path's least round trip, not the smoothed one: that one holds
+        // the queue of the moment, and a group that waited in it would be
+        // given a longer time for it (up to LONGEST), the queue it is late for.
+        let (rate, rtt) = (self.rate.load(Ordering::Relaxed), self.base_rtt());
         let mut begun = self.begun.lock().unwrap();
         let Some(groups) = begun.get_mut(&channel) else { return Ok(None) };
         lasts_in(groups, group, rate, rtt).map(|until| until.map(Instant::from_std))

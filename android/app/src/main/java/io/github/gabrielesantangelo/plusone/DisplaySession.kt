@@ -298,7 +298,11 @@ class DisplaySession(private val packets: Packets) {
 
     private fun askKeyframe() {
         val now = System.nanoTime()
-        if (now - askedAt < KEYFRAME_AGAIN) return
+        // Not again before the last one's keyframe had its time: three round
+        // trips on a long path (250 ms on a short one), where asking at each
+        // frame lost made the desktop's keyframes pile up in the queue.
+        val again = if (bestRtt == Long.MAX_VALUE) KEYFRAME_AGAIN else minOf(maxOf(KEYFRAME_AGAIN, 3 * bestRtt), 1_000_000_000L)
+        if (now - askedAt < again) return
         askedAt = now
         Log.i(CompanionService.TAG, "display: asking for a keyframe (decoder ${codec != null}, ${free.size} buffers free)")
         send(byteArrayOf(KEYFRAME))

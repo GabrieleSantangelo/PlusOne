@@ -84,7 +84,7 @@ fn main() {
         // than the newest whole) is dropped. Once a frame says it is a
         // keyframe (count's top bit: pathbench's chain and video), a keyframe
         // asked for after a loss, a byte back, at each frame that is not one,
-        // 250 ms apart.
+        // 250 ms apart, or three round trips (DisplaySession.kt askKeyframe).
         let (mut newest, mut flagged, mut need, mut asked) = (None::<u32>, false, true, None::<std::time::Instant>);
         let mut answer: Vec<u8> = Vec::new();
         while let Ok(Some(n)) = incoming.channel.recv(&mut buf, None) {
@@ -118,7 +118,10 @@ fn main() {
             if flagged {
                 if keyframe {
                     need = false;
-                } else if need && asked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)) {
+                } else if need && asked.is_none_or(|at| {
+                    let again = incoming.session.rtt().map_or(0, |rtt| 3 * rtt.as_millis() as u64).clamp(250, 1000);
+                    at.elapsed() >= std::time::Duration::from_millis(again)
+                }) {
                     asked = Some(std::time::Instant::now());
                     let _ = incoming.channel.send(b"K");
                 }
