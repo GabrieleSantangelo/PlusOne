@@ -97,6 +97,14 @@ const UDP_PROOF: Duration = Duration::from_secs(3);
 const UDP_PROBE: Duration = Duration::from_millis(200);
 /// No room in the UDP socket: this long for some, then the packet is lost
 /// (a keyframe's tail where the system caps the socket's room).
+/// A QUIC path's side socket carries the datagrams up to this long
+/// (input, pen, audio's frames: a few hundred bytes), at most this much a
+/// second, and a tenth of what the path's controller allows: more goes on
+/// QUIC's datagrams, under its window. (The side socket is outside the
+/// controller; this keeps it a small, bounded part of the load.)
+const RAW_MAX: usize = 512;
+const RAW_RATE: f64 = 128_000.0;
+const RAW_BURST: f64 = 16_384.0;
 const UDP_STALL: Duration = Duration::from_millis(20);
 /// Each read and write of a connection's handshake and hellos waits this
 /// long at most, and the whole of them HANDSHAKE_WHOLE (a host that
@@ -582,6 +590,11 @@ struct Path {
     proven_us: AtomicU64,  // a pong's (0: none yet)
     rtt_us: AtomicU64,
     realtime_us: AtomicU64,  // since started: the last realtime or input datagram sent (0: none)
+    /// A QUIC path's side socket (udp): a pong's time on it (0: none yet);
+    /// small realtime goes on it only while it is proven, else on QUIC's
+    /// datagrams, and what it may carry is bounded (raw_room).
+    raw_us: AtomicU64,
+    raw_bucket: Mutex<(f64, Instant)>,
     /// Not the session's path any more (lost, or a better one took over;
     /// with a peer that keeps several, out of them).
     gone: AtomicBool,
@@ -639,6 +652,26 @@ impl Path {
     fn realtime_going(&self) -> bool {
         let last = self.realtime_us.load(Ordering::Relaxed);
         last != 0 && self.us().saturating_sub(last) < REALTIME_GOING.as_micros() as u64
+    }
+
+    /// Whether a datagram of this size may go on the side socket now: it
+    /// is proven (a pong came on it lately) and its bucket has room.
+    fn raw_room(&self, size: usize) -> bool {
+        let (Some(quic), Some(_)) = (&self.quic, &self.udp) else { return false };
+        let proven = self.raw_us.load(Ordering::Relaxed);
+        if size > RAW_MAX || proven == 0 || self.us().saturating_sub(proven) >= UDP_PROOF.as_micros() as u64 {
+            return false;
+        }
+        let rate = RAW_RATE.min(quic.rate_now() as f64 / 10.0);
+        let mut bucket = self.raw_bucket.lock().unwrap();
+        let now = Instant::now();
+        bucket.0 = (bucket.0 + rate * now.duration_since(bucket.1).as_secs_f64()).min(RAW_BURST);
+        bucket.1 = now;
+        if bucket.0 < size as f64 {
+            return false;
+        }
+        bucket.0 -= size as f64;
+        true
     }
 
     fn udp_works(&self) -> bool {
@@ -1223,6 +1256,7 @@ fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
+                       raw_us: AtomicU64::new(0), raw_bucket: Mutex::new((RAW_BURST, Instant::now())),
                        gone: AtomicBool::new(false), leaving: AtomicBool::new(false), ended: AtomicBool::new(false),
                        state: AtomicU8::new(PathState::Active as u8), budget: AtomicU64::new(budget),
                        drained: AtomicBool::new(false), prior: budget }))
@@ -2556,9 +2590,7 @@ impl Session {
                 continue;
             }
             if live.path.udp.is_some() || live.path.quic.is_some() {
-                let mut ping = vec![PING];
-                ping.extend_from_slice(&live.path.us().to_be_bytes());
-                self.send_datagram_now(&live.path, DATAGRAM_PATH, &ping, &mut Vec::new());
+                self.ping(&live.path);
             }
             pinged = true;
         }
@@ -2573,9 +2605,7 @@ impl Session {
             let busy = path.realtime_going() && self.outbox.lock().unwrap().reliable_bytes > 0;
             carrier.next_udp_ping = now + if busy && path.udp_works() { PROBE_BUSY }
                 else if path.udp_works() || !early { PING_EVERY } else { UDP_PROBE };
-            let mut ping = vec![PING];
-            ping.extend_from_slice(&path.us().to_be_bytes());
-            self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
+            self.ping(path);
         }
         let mut deadline = if datagrams { carrier.next_ping.min(carrier.next_udp_ping) } else { carrier.next_ping };
         for (index, live) in lives.iter().enumerate() {
@@ -2804,6 +2834,9 @@ impl Session {
     fn send_datagram_now(&self, path: &Path, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
         if let Some(quic) = &path.quic {
             self.sealer.seal(channel, body, sealed);
+            if channel != DATAGRAM_PATH && path.raw_room(sealed.len()) && self.send_raw(path, sealed) {
+                return;
+            }
             let unsent = quic.send(sealed, channel == DATAGRAM_PATH).err();
             if unsent.is_some() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);  // late, or no room
@@ -2823,6 +2856,25 @@ impl Session {
         }
         if result.is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A sealed datagram on a QUIC path's side socket (false: it did not go).
+    fn send_raw(&self, path: &Path, sealed: &[u8]) -> bool {
+        let (Some(udp), Some(to)) = (&path.udp, *path.udp_peer.lock().unwrap()) else { return false };
+        sys::send_to(udp.as_raw_fd(), sealed, &to).is_ok()
+    }
+
+    /// A ping on the path, and on a QUIC path's side socket too (its pong
+    /// proves the socket: raw_room).
+    fn ping(&self, path: &Path) {
+        let mut ping = vec![PING];
+        ping.extend_from_slice(&path.us().to_be_bytes());
+        self.send_datagram_now(path, DATAGRAM_PATH, &ping, &mut Vec::new());
+        if path.quic.is_some() && path.udp.is_some() {
+            let mut sealed = Vec::new();
+            self.sealer.seal(DATAGRAM_PATH, &ping, &mut sealed);
+            self.send_raw(path, &sealed);
         }
     }
 
@@ -2869,10 +2921,21 @@ impl Session {
         } else if body.len() == 9 && body[0] == PING {
             let mut pong = body.to_vec();
             pong[0] = PONG;
-            self.send_datagram_now(path, DATAGRAM_PATH, &pong, sealed);
+            if from.is_some() && path.quic.is_some() {
+                // On the side socket: back on it.
+                self.sealer.seal(DATAGRAM_PATH, &pong, sealed);
+                self.send_raw(path, sealed);
+            } else {
+                self.send_datagram_now(path, DATAGRAM_PATH, &pong, sealed);
+            }
         } else if body.len() == 9 && body[0] == PONG {
             let sent = u64::from_be_bytes(body[1..9].try_into().unwrap());
             let now = path.us();
+            if from.is_some() && path.quic.is_some() {
+                // The side socket's: proven; its round trip is not the path's.
+                path.raw_us.store(now.max(1), Ordering::Relaxed);
+                return;
+            }
             path.rtt_us.store(now.saturating_sub(sent), Ordering::Relaxed);
             path.proven_us.store(now.max(1), Ordering::Relaxed);
             // A QUIC path is paced by its own controller (cc.rs); pace.rs

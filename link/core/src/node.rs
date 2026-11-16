@@ -153,8 +153,9 @@ impl NodeInner {
     }
 
     /// As accept(), on a QUIC connection's stream (its datagrams the path's).
-    fn accept_quic(self: &Arc<Self>, stream: Box<dyn Stream>, quic: crate::quic::Quic) -> std::io::Result<Arc<Session>> {
+    fn accept_quic(self: &Arc<Self>, stream: std::os::unix::net::UnixStream, quic: crate::quic::Quic) -> std::io::Result<Arc<Session>> {
         let conn = rustls::ServerConnection::new(self.server.clone()).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let stream = addressed(stream, &quic);
         let mut established = match session::establish(conn.into(), stream, false, self.hello(), "lan", &|peer| self.ours(peer)) {
             Ok(established) => established,
             Err(e) => {
@@ -171,7 +172,7 @@ impl NodeInner {
         let (stream, quic) = crate::quic::dial(&endpoint, &self.client, address, timeout)?;
         let name = rustls::pki_types::ServerName::try_from("plus-one.invalid").unwrap();
         let conn = rustls::ClientConnection::new(self.client.clone(), name).map_err(|e| e.to_string())?;
-        let mut established = match session::establish(conn.into(), Box::new(stream), true, self.hello(), kind,
+        let mut established = match session::establish(conn.into(), addressed(stream, &quic), true, self.hello(), kind,
                                                        &|peer| self.ours(peer)) {
             Ok(established) => established,
             Err(e) => {
@@ -403,7 +404,7 @@ impl Node {
                 quic.close();
                 return;
             }
-            if let Err(e) = node.accept_quic(Box::new(stream), quic) {
+            if let Err(e) = node.accept_quic(stream, quic) {
                 log!("{from}: no session by QUIC ({e})");
             }
         });
@@ -609,4 +610,14 @@ mod tests {
         pc.close();
         tablet.close();
     }
+}
+
+/// A QUIC path's stream with the IP under it: the session's side socket
+/// for small realtime datagrams (session.rs) goes to the same host.
+/// PLUSONE_LINK_RAW=0: none (a live A/B).
+fn addressed(stream: std::os::unix::net::UnixStream, quic: &crate::quic::Quic) -> Box<dyn Stream> {
+    if std::env::var_os("PLUSONE_LINK_RAW").is_some_and(|v| v == "0") {
+        return Box::new(stream);
+    }
+    Box::new(crate::stream::Addressed::new(stream, quic.peer_ip()))
 }

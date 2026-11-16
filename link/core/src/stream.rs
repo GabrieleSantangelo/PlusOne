@@ -136,6 +136,71 @@ impl Stream for Rated {
     }
 }
 
+/// A QUIC connection's bridged stream with the IP addresses under it
+/// (Stream::addresses): the session binds a UDP socket beside the
+/// connection for what is small and must not wait behind the window
+/// (input, pen, audio), proven apart (session.rs, raw).
+pub struct Addressed {
+    stream: UnixStream,
+    addresses: Option<(IpAddr, IpAddr)>,
+}
+
+impl Addressed {
+    /// (peer, ours): ours is what the route to the peer leaves from (none
+    /// if there is no route: no addresses, no side socket).
+    pub fn new(stream: UnixStream, peer: IpAddr) -> Addressed {
+        let unspecified: IpAddr = if peer.is_ipv4() { [0u8; 4].into() } else { [0u16; 8].into() };
+        let local = std::net::UdpSocket::bind((unspecified, 0)).ok()
+            .and_then(|probe| probe.connect((peer, 9)).ok().and(probe.local_addr().ok()))
+            .map(|address| address.ip());
+        Addressed { stream, addresses: local.map(|local| (peer, local)) }
+    }
+}
+
+impl Read for Addressed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Addressed {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl AsRawFd for Addressed {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
+impl Stream for Addressed {
+    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(on)
+    }
+
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        Stream::set_timeouts(&self.stream, timeout)
+    }
+
+    fn shutdown(&self) {
+        Stream::shutdown(&self.stream);
+    }
+
+    fn try_clone(&self) -> io::Result<Box<dyn Stream>> {
+        Ok(Box::new(Addressed { stream: self.stream.try_clone()?, addresses: self.addresses }))
+    }
+
+    fn addresses(&self) -> Option<(IpAddr, IpAddr)> {
+        self.addresses
+    }
+}
+
 /// A device that moves bytes (a USB accessory, a Bluetooth socket's
 /// streams), bridged to a socket a session runs on: what read gives goes
 /// in, what the session writes goes to write. Each on a thread of its own;
