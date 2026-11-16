@@ -65,6 +65,11 @@ const BRIDGE_CHUNK: usize = 16 << 10;
 /// opened channel was never answered. As TCP_NOTSENT_LOWAT on a TCP path.
 const AHEAD: Duration = Duration::from_millis(30);
 const AHEAD_LEAST: f64 = 32.0 * 1024.0;
+/// What quinn's send window holds of the bulk past the rate's worth of the
+/// path's least round trip (not the smoothed one: it grows with the queue
+/// the window feeds): about the queue the bulk may make. As pace.rs holds a
+/// TCP path's to a few ms, the realtime and the video wait behind it.
+const WINDOW_AHEAD: Duration = Duration::from_millis(10);
 /// How often quinn's send window follows the rate (Bridge): what it holds
 /// unacknowledged, sent or not, the rate's worth of a round trip and AHEAD
 /// (handed a quarter over the rate, it kept up to SEND_WINDOW unsent: a
@@ -210,7 +215,7 @@ impl Drops {
 /// bridge), and the groups' bytes not all acknowledged yet (groups: they
 /// never wait for room the bulk took; their own deadlines bound them).
 pub(crate) fn send_window(rate: u64, rtt: Duration, groups: u64) -> u64 {
-    ((rate as f64 * (rtt + AHEAD).as_secs_f64()) as u64).max(2 * BRIDGE_CHUNK as u64) + groups
+    ((rate as f64 * (rtt + WINDOW_AHEAD).as_secs_f64()) as u64).max(2 * BRIDGE_CHUNK as u64) + groups
 }
 
 /// Whether what quinn holds of datagrams (what its buffer, idle when
@@ -261,11 +266,7 @@ impl Quic {
     /// and left out no frame, asked no keyframe to wait, however deep it was.
     fn group_backlog(&self) -> usize {
         let rate = self.cc.rate.load(Ordering::Relaxed) as f64;
-        let base = match self.cc.losses.base_rtt_us.load(Ordering::Relaxed) {
-            0 => self.conn.rtt(),
-            us => Duration::from_micros(us),
-        };
-        let carried = (rate * (base + QUEUE_OK).as_secs_f64()) as u64;
+        let carried = (rate * (self.groups.shared.base_rtt() + QUEUE_OK).as_secs_f64()) as u64;
         self.groups.shared.unacked().saturating_sub(carried) as usize
     }
 
@@ -614,7 +615,7 @@ fn bridge(conn: &Connection, mut send: quinn::SendStream, mut recv: quinn::RecvS
                     loop {
                         let now = tokio::time::Instant::now();
                         if now.duration_since(windowed) >= WINDOW_EVERY {
-                            groups.set_window(&conn, send_window(rate.load(Ordering::Relaxed), conn.rtt(), groups.unacked()));
+                            groups.set_window(&conn, send_window(rate.load(Ordering::Relaxed), groups.base_rtt(), groups.unacked()));
                             windowed = now;
                         }
                         let elapsed = now.duration_since(refilled).as_secs_f64();

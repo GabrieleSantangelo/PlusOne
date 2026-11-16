@@ -489,6 +489,15 @@ impl Shared {
         }
     }
 
+    /// The path's least round trip (the controller's, over BASE), else
+    /// quinn's smoothed one before it knows one.
+    pub(crate) fn base_rtt(&self) -> Duration {
+        match self.losses.base_rtt_us.load(Ordering::Relaxed) {
+            0 => self.conn.rtt(),
+            us => Duration::from_micros(us),
+        }
+    }
+
     /// Bytes on group streams not all acknowledged yet (unacked).
     pub(crate) fn unacked(&self) -> u64 {
         self.unacked.load(Ordering::Relaxed)
