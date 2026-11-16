@@ -31,9 +31,13 @@ class DisplayHandler(private val service: CompanionService) : Handler {
             return false
         }
         // Room for a keyframe's packets at once.
+        // H.265 when the PC offers it and this tablet decodes it (the answer
+        // says which: the frames' codec for the session); else H.264, as before.
+        val offered = request.optJSONArray("codecs")
+        val hevc = DisplaySession.hevcDecoder() && (0 until (offered?.length() ?: 0)).any { offered?.optString(it) == "hevc" }
         val datagrams = if (overCore) null else Datagrams(key, link.address, port, receiveBuffer = 4 shl 20)
         val packets = datagrams ?: LinkPackets(media!!, input, DisplaySession.INPUT)
-        show(service, DisplaySession(packets), link.pc,
+        show(service, DisplaySession(packets, hevc), link.pc, codec = if (hevc) "hevc" else "h264",
             ready = { link.send(if (datagrams != null) it.put("port", datagrams.port) else it) },
             hold = { link.hold() },
             end = { link.close() })
@@ -47,7 +51,7 @@ class DisplayHandler(private val service: CompanionService) : Handler {
         /** session on screen until hold returns (the PC hung up, or end ended
          * it here: Back, Stop); ready sends the PC "display-ready". */
         fun show(service: CompanionService, session: DisplaySession, pc: String,
-                 ready: (JSONObject) -> Unit, hold: () -> Unit, end: () -> Unit) {
+                 ready: (JSONObject) -> Unit, hold: () -> Unit, end: () -> Unit, codec: String = "h264") {
             // Ended here (Back, Stop): the link closes, and the PC with it.
             session.onEnd = { Thread { end() }.start() }
             session.onVisible = { service.lowLatency() }  // no low-latency Wi-Fi while nothing is shown
@@ -65,7 +69,7 @@ class DisplayHandler(private val service: CompanionService) : Handler {
                 ready(JSONObject().put("type", "display-ready")
                     .put("width", maxOf(mode.physicalWidth, mode.physicalHeight))
                     .put("height", minOf(mode.physicalWidth, mode.physicalHeight))
-                    .put("refresh", mode.refreshRate.toDouble()))
+                    .put("refresh", mode.refreshRate.toDouble()).put("codec", codec))
                 service.startActivity(Intent(service, DisplayActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 service.displaying = pc
                 service.showSessions()

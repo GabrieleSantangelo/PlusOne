@@ -927,7 +927,7 @@ class LinkPackets:
 class AppStreamer:
     """The virtual monitor (or a test pattern), encoded, to the app."""
 
-    def __init__(self, source, channel, width, height, fps, bitrate, encoder, on_stats=None, input=None,
+    def __init__(self, source, channel, width, height, fps, bitrate, encoder, on_stats=None, input=None, codec="h264",
                  on_visible=None, preview=False, on_error=None):
         """input: an Input for the fingers and the pen, or None.
         on_visible(shown): from the listening thread, when the app starts or
@@ -965,13 +965,16 @@ class AppStreamer:
                      f"video/x-raw,format={media.CAPTURE_FORMAT},width={width},height={height},"
                      f"max-framerate={fps}/1")
         self._rates(channel, fps, bitrate)  # (the bitrate it starts at, self.kbps: the budget's share, if told)
-        element, options, raw_format = media.ENCODERS[encoder]
+        self.codec = codec
+        element, options, raw_format = media.CODEC_ENCODERS[codec][encoder]
+        caps = "video/x-h265,profile=main" if codec == "hevc" else "video/x-h264,profile=high"
+        stream = "h265" if codec == "hevc" else "h264"
         enc = f"{element} name=enc " + options.format(bitrate=self.kbps, gop=fps * media.KEYFRAME_SECONDS)
         convert = media.CONVERT.get(encoder, f"videoconvert n-threads=4 ! video/x-raw,format={raw_format}")
         self.pipeline = Gst.parse_launch(
             f"{video} ! queue max-size-buffers=1 leaky=downstream ! {convert} ! "
-            f"{enc} ! video/x-h264,profile=high ! h264parse config-interval=-1 ! "
-            f"video/x-h264,stream-format=byte-stream,alignment=au ! "
+            f"{enc} ! {caps} ! {stream}parse config-interval=-1 ! "
+            f"video/x-{stream},stream-format=byte-stream,alignment=au ! "
             f"appsink name=out emit-signals=true sync=false async=false max-buffers=0")
         enc = self.enc = self.pipeline.get_by_name("enc")
         media.cap_keyframes(enc, self.kbps, fps)
@@ -987,7 +990,7 @@ class AppStreamer:
         self._feedback = threading.Thread(target=self._listen, daemon=True)
         to = (f"{channel.app[0]}:{channel.app[1]}" if isinstance(channel, Datagrams)
               else "the link, a frame a group" if getattr(channel, "grouped", False) else "the link")
-        log(f"app display: {width}x{height}@{fps} {encoder} {self.kbps} kbit/s"
+        log(f"app display: {width}x{height}@{fps} {encoder} {codec} {self.kbps} kbit/s"
             + (f" (the budget's share; at most {bitrate})" if self.kbps != bitrate else "") + f" -> {to}")
         log(f"app display: {self.l36.describe(self._restarts)}")
 
@@ -1596,6 +1599,7 @@ class AppDisplay:
         self.on_ended = on_ended or (lambda error, started: None)
         self.on_paused = on_paused or (lambda paused: None)
         self.channel = self.monitor = self.streamer = self.link = None
+        self.codec = "h264"  # what the tablet takes too (_run_over_the_link)
         self.tablet_size = None  # what the app said its screen is
         self.started = False
         self.gated, self.seat_active = False, True  # seat.py's, for the streamer
@@ -1639,9 +1643,9 @@ class AppDisplay:
             # PLUSONE_LINK_VIDEO_STREAMS=0 (the live A/B's way before q3,
             # plus-one-link's switch too): the media channel a realtime one,
             # its packets exactly as before VIDEO (no head, the payload whole).
-            media = (plusone_link.REALTIME if os.environ.get("PLUSONE_LINK_VIDEO_STREAMS", "1").strip() == "0"
-                     else plusone_link.VIDEO)
-            for name, kind in (("control", plusone_link.CONTROL), ("media", media),
+            media_class = (plusone_link.REALTIME if os.environ.get("PLUSONE_LINK_VIDEO_STREAMS", "1").strip() == "0"
+                           else plusone_link.VIDEO)
+            for name, kind in (("control", plusone_link.CONTROL), ("media", media_class),
                                ("input", plusone_link.INPUT)):
                 try:
                     channels.append(connection.open(device, "display", name, kind))
@@ -1652,7 +1656,8 @@ class AppDisplay:
                     log("app display: the frames as realtime, not video:", e)
                     channels.append(connection.open(device, "display", name, plusone_link.REALTIME))
             packets = LinkPackets(connection, device, *channels)
-            packets.control.send(json.dumps({"type": "display"}).encode())
+            offered = media.offered_codecs(self.encoder)
+            packets.control.send(json.dumps({"type": "display", "codecs": offered}).encode())
             answer = packets.control.recv(timeout=10)
             reply = json.loads(answer) if answer else {}
             if not isinstance(reply, dict):
@@ -1749,7 +1754,10 @@ class AppDisplay:
         if reply.get("type") != "display-ready":
             raise ValueError(f"the app answered {reply.get('type') or reply.get('reason')!r}")
         self.tablet_size = (int(reply["width"]), int(reply["height"]))
-        log(f"app display: over the link, {self.tablet_size[0]}x{self.tablet_size[1]}"
+        # The codec both take (the tablet's answer; none: H.264, as before it).
+        said = reply.get("codec")
+        self.codec = said if said in media.offered_codecs(self.encoder) else "h264"
+        log(f"app display: over the link, {self.codec}, {self.tablet_size[0]}x{self.tablet_size[1]}"
             f" at {float(reply.get('refresh', 0)):.0f} Hz")
         width, height, fps = self.mode
         if (width, height) not in sizes(self.tablet_size):
@@ -1791,7 +1799,7 @@ class AppDisplay:
             self.streamer = AppStreamer(source, self.channel, width, height, fps,
                                         bitrate_for(self.bitrate, (width, height)), self.encoder,
                                         on_stats=self._stats,
-                                        input=touch,
+                                        input=touch, codec=self.codec,
                                         on_visible=lambda shown: GLib.idle_add(once(self.on_paused, not shown)),
                                         preview=self.preview,
                                         on_error=lambda message: self._ended(RuntimeError(message)))

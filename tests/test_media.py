@@ -112,3 +112,16 @@ def test_keyframe_cap_is_set_on_the_encoder():
         pytest.skip("x264enc not installed")
     media.cap_keyframes(enc, 20000, 60)
     assert enc.get_property("vbv-buf-capacity") == int(1000 * media.VBV_FRAMES / 60)
+
+
+def test_hevc_is_offered_first_where_the_encoder_has_it_and_never_with_plusone_codec_h264(monkeypatch):
+    monkeypatch.delenv("PLUSONE_CODEC", raising=False)
+    names = {name: media.offered_codecs(name) for name in media.ENCODERS}
+    assert all(codecs[-1] == "h264" for codecs in names.values())
+    assert names["va"] == ["h264"]  # no HEVC twin of vah264enc
+    monkeypatch.setenv("PLUSONE_CODEC", "h264")
+    assert all(media.offered_codecs(name) == ["h264"] for name in media.ENCODERS)
+
+
+def test_every_hevc_encoder_has_an_h264_twin_of_the_same_name():
+    assert set(media.ENCODERS_HEVC) <= set(media.ENCODERS)

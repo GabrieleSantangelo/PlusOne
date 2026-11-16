@@ -31,7 +31,8 @@ import io.github.gabrielesantangelo.plusone.link.Packets
  * decoded here is measured, not guessed. (Not to the glass: MediaCodec's
  * "rendered" times only gave back the time it was released with.)
  */
-class DisplaySession(private val packets: Packets) {
+class DisplaySession(private val packets: Packets, private val hevc: Boolean = false) {
+    private val mime = if (hevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
     /** The PC's id over the link's core (its path is LinkStatus's); null over the link of before. */
     val device: String? = (packets as? io.github.gabrielesantangelo.plusone.link.LinkPackets)?.device
     /** Uptime ms of the last frame put on the screen (PathOverlay: steady again after a change). */
@@ -115,12 +116,12 @@ class DisplaySession(private val packets: Packets) {
     fun attach(surface: Surface) {
         detach()
         this.surface = surface
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, MAX_WIDTH, MAX_HEIGHT).apply {
+        val format = MediaFormat.createVideoFormat(mime, MAX_WIDTH, MAX_HEIGHT).apply {
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             setInteger(MediaFormat.KEY_PRIORITY, 0)  // real time
         }
         val decoder = try {
-            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            MediaCodec.createDecoderByType(mime)
         } catch (e: Exception) {
             // None free (another app holds them all): nothing shown, rather
             // than the process gone, the service and its other sessions with it.
@@ -374,6 +375,14 @@ class DisplaySession(private val packets: Packets) {
     }
 
     companion object {
+        /** Whether this tablet has an HEVC decoder (offered to the PC: DisplayHandler). */
+        fun hevcDecoder(): Boolean = try {
+            android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos
+                .any { !it.isEncoder && it.supportedTypes.any { type -> type.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, true) } }
+        } catch (e: Exception) {
+            false
+        }
+
         const val VIDEO: Byte = 1
         const val KEYFRAME: Byte = 2
         const val PING: Byte = 3

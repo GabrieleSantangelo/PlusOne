@@ -29,10 +29,26 @@ ENCODERS = {
     "x264": ("x264enc", "tune=zerolatency speed-preset=ultrafast bitrate={bitrate} "
              "key-int-max={gop} bframes=0", "I420"),
 }
+# The same, for H.265 (HEVC): about a third fewer bytes at the same picture,
+# and so a keyframe a third smaller to get through after a stall. Taken when
+# the tablet's decoder takes it too (AppDisplay's offer, DisplayHandler's
+# answer); PLUSONE_CODEC=h264 never.
+ENCODERS_HEVC = {
+    "va-lp": ("vah265lpenc", "rate-control=cbr bitrate={bitrate} key-int-max={gop} b-frames=0 "
+              "ref-frames=1 target-usage=7 aud=false", "NV12"),
+    "nvenc": ("nvh265enc", "preset=low-latency-hq zerolatency=true bframes=0 rc-mode=cbr "
+              "bitrate={bitrate} gop-size={gop} aud=false", "BGRA"),
+    "vaapi": ("vaapih265enc", "rate-control=cbr bitrate={bitrate} keyframe-period={gop} "
+              "max-bframes=0 tune=low-power", "NV12"),
+    "x264": ("x265enc", "tune=zerolatency speed-preset=ultrafast bitrate={bitrate} "
+             "key-int-max={gop} bframes=0", "I420"),
+}
+CODEC_ENCODERS = {"h264": ENCODERS, "hevc": ENCODERS_HEVC}
 # Encoders that start a new sequence, a keyframe, at each change of the
 # bitrate (measured, GStreamer 1.24: vah264lpenc and vaapih264enc; vah264enc
-# is vah264lpenc's own code). NVENC and x264 change it in place.
-RESTARTS = {"vah264lpenc", "vah264enc", "vaapih264enc"}
+# is vah264lpenc's own code; vah265lpenc is the same code). NVENC and x264
+# change it in place.
+RESTARTS = {"vah264lpenc", "vah264enc", "vaapih264enc", "vah265lpenc", "vaapih265enc"}
 # Mutter hands out BGRA as readily as BGRx; asking for it makes the colour
 # conversion a no-op for NVENC (it cost ~2.3 ms of CPU per 1920x1200 frame).
 CAPTURE_FORMAT = "BGRA"
@@ -54,7 +70,7 @@ class Keyframes:
     queue in front would stop. NVENC ignores the flush and honours the
     event; the others get the event."""
 
-    FLUSHED = {"vah264lpenc", "vah264enc"}
+    FLUSHED = {"vah264lpenc", "vah264enc", "vah265lpenc"}
 
     def __init__(self, enc, on_flush=None):
         """on_flush(): on the streaming thread, after a flush threw away the
@@ -114,6 +130,17 @@ def pick_encoder(preferred="auto"):
         if Gst.ElementFactory.find(ENCODERS[name][0]):
             return name
     raise RuntimeError("no H.264 encoder available")
+
+
+def offered_codecs(name):
+    """The codecs this encoder (a key of ENCODERS) can make here, best
+    first: HEVC when its element is there and PLUSONE_CODEC is not h264."""
+    import os
+    codecs = ["h264"]
+    element = ENCODERS_HEVC.get(name, (None,))[0]
+    if element and os.environ.get("PLUSONE_CODEC", "").strip().lower() != "h264" and Gst.ElementFactory.find(element):
+        codecs.insert(0, "hevc")
+    return codecs
 
 
 def warm_up(name):
