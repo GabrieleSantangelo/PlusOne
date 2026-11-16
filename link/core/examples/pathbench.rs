@@ -241,6 +241,7 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
     let (start, mut frame, mut bytes, mut rates) = (Instant::now(), 0u32, 0u64, Vec::new());
     let (mut keyframes, mut key_next, mut last_keyframe) = (std::collections::HashSet::new(), false, f64::NEG_INFINITY);
     let (mut asks_seen, mut answered) = (0u64, 0u64);
+    let mut skipped = std::collections::HashSet::new();
     while start.elapsed().as_secs_f64() < seconds {
         let due = start + Duration::from_secs_f64(frame as f64 / 60.0);
         std::thread::sleep(due.saturating_duration_since(Instant::now()));
@@ -258,7 +259,19 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
                 .clamp(12_500, 2_500_000),
         };
         rates.push(rate);
-        let keyframe = frame % 120 == 0 || std::mem::take(&mut key_next);
+        // As the desktop does (appdisplay.py QUEUE_MS): what waits to go out
+        // past 60 ms of the rate (64 KB at least) and the frame is not
+        // encoded; a keyframe waits for room for itself.
+        let behind = session.queued() as u64;
+        let room = (rate * 60 / 1000).max(64 << 10);
+        let keyframe = frame % 120 == 0 || key_next;
+        if behind > room || (keyframe && behind + (rate / 60) as u64 * 4 > 2 * room) {
+            skipped.insert(frame);
+            key_next |= keyframe;
+            frame += 1;
+            continue;
+        }
+        key_next = false;
         if keyframe {
             keyframes.insert(frame);
             last_keyframe = now;
@@ -282,10 +295,14 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
     let _ = collecting.join();
     let whole = wholes.lock().unwrap().len();
     let mean = rates.iter().sum::<u64>() / rates.len().max(1) as u64;
+    let sent = frame as usize - skipped.len();
     // Whole frames after a lost one since their keyframe: a decoder could
     // not show them.
     let (wholes, mut broken, mut undecodable) = (wholes.lock().unwrap(), false, 0);
     for f in 0..frame {
+        if skipped.contains(&f) {
+            continue;
+        }
         broken &= !keyframes.contains(&f);
         match wholes.contains(&f) {
             false => broken = true,
@@ -294,9 +311,9 @@ fn video(session: &Arc<Session>, seconds: f64, kbps: Option<u64>, leave: u64) ->
         }
     }
     format!("whole={:.1}% decodable={:.1}% lost={} undecodable={undecodable} asks={asks_seen} answered={answered} \
-             keyframes={} kbps={} target={} {}",
-            100.0 * whole as f64 / frame.max(1) as f64, 100.0 * (whole - undecodable) as f64 / frame.max(1) as f64,
-            frame as usize - whole, keyframes.len(), (bytes as f64 * 8.0 / 1000.0 / seconds) as u64, mean * 8 / 1000,
+             skipped={} keyframes={} kbps={} target={} {}",
+            100.0 * whole as f64 / sent.max(1) as f64, 100.0 * (whole - undecodable) as f64 / sent.max(1) as f64,
+            sent - whole, skipped.len(), keyframes.len(), (bytes as f64 * 8.0 / 1000.0 / seconds) as u64, mean * 8 / 1000,
             quantiles(latencies.lock().unwrap().clone()))
 }
 
