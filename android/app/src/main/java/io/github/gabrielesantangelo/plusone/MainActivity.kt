@@ -258,7 +258,10 @@ class MainActivity : AppCompatActivity() {
         val nearby = checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
         // Bluetooth with the PC (BtHandler): asked with them too.
         val bluetooth = checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-        if (notifications && nearby && bluetooth && overlay) return null
+        // And to be found over Bluetooth LE where multicast does not go (BleAnnouncer): the same
+        // question as Bluetooth's (Android's "Nearby devices").
+        val advertise = checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED
+        if (notifications && nearby && bluetooth && advertise && overlay) return null
         return MaterialCardView(this, null, M.attr.materialCardViewFilledStyle).apply {
             radius = dp(28f)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -273,7 +276,8 @@ class MainActivity : AppCompatActivity() {
                     // Notifications first (a question here), then "display over other apps" (a settings page).
                     val missing = listOfNotNull(Manifest.permission.POST_NOTIFICATIONS.takeIf { !notifications },
                                                 Manifest.permission.NEARBY_WIFI_DEVICES.takeIf { !nearby },
-                                                Manifest.permission.BLUETOOTH_CONNECT.takeIf { !bluetooth })
+                                                Manifest.permission.BLUETOOTH_CONNECT.takeIf { !bluetooth },
+                                                Manifest.permission.BLUETOOTH_ADVERTISE.takeIf { !advertise })
                     if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
                     else allowOverlay()
                 }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)

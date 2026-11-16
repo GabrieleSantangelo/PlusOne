@@ -50,7 +50,8 @@ def test_pairings_of_0_5_are_kept(tmp_path):
     assert store.entries() == {KITCHEN: {"name": "Tab S10", "app_at": "10.0.0.7:47236"}}
 
 
-def test_where_the_app_was_last_is_tried_when_it_is_not_announced(paired):
+def test_where_the_app_was_last_is_tried_when_it_is_not_announced(paired, monkeypatch):
+    monkeypatch.setattr(link.tablets, "on_link", lambda host: True)
     nearby = Nearby([("10.0.0.7", 47236, KITCHEN[:16])])
     tablets = Tablets(Settings(), paired=paired, discovery=nearby)
     kitchen = tablets.active()
@@ -65,6 +66,41 @@ def test_where_the_app_was_last_is_tried_when_it_is_not_announced(paired):
     assert tablets.targets(office) == []  # never seen: nowhere to try
     paired.learn(OFFICE, app_at="nonsense:99999")
     assert tablets.targets(office) == []
+
+
+
+def test_where_the_app_was_on_another_network_is_forgotten(paired, monkeypatch):
+    # 15/11: 10.151.253.132, from the network of before, tried for 5 s at home.
+    monkeypatch.setattr(link.tablets, "on_link", lambda host: host.startswith("192.168.1."))
+    tablets = Tablets(Settings(), paired=paired, discovery=Nearby())
+    kitchen = tablets.active()
+    paired.learn(KITCHEN, app_at="10.151.253.132:47236")
+    assert tablets.targets(kitchen) == []
+    assert not paired.entries()[KITCHEN].get("app_at")  # forgotten, not tried again
+    paired.learn(KITCHEN, app_at="192.168.1.112:47236")
+    assert tablets.targets(kitchen) == [("192.168.1.112", 47236)]
+
+
+def test_on_link_reads_this_pcs_networks(monkeypatch):
+    import json
+    import subprocess
+    up = [{"ifname": "lo", "addr_info": [{"local": "127.0.0.1", "prefixlen": 8}]},
+          {"ifname": "wlan0", "addr_info": [{"local": "192.168.1.155", "prefixlen": 24},
+                                            {"local": "2a01:e11::5", "prefixlen": 64}]}]
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(up), ""))
+    on_link = link.tablets.on_link
+    assert on_link("192.168.1.112") and on_link("2a01:e11::9")
+    assert not on_link("10.151.253.132") and not on_link("127.0.0.1")
+    assert on_link("not an address")  # no telling: tried
+
+
+def test_on_link_without_ip_tries(monkeypatch):
+    import subprocess
+
+    def missing(*a, **k):
+        raise FileNotFoundError("ip")
+    monkeypatch.setattr(subprocess, "run", missing)
+    assert link.tablets.on_link("10.0.0.7")
 
 
 def test_only_a_network_address_is_remembered(paired):

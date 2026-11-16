@@ -992,6 +992,36 @@ enum In {
     Notified,
 }
 
+/// The most addresses taken from one "net" message.
+const MAX_ADDRESSES: usize = 8;
+
+/// The addresses a "net" message names: each with its port, in the order
+/// told, none that cannot be dialled (loopback, unspecified, multicast,
+/// link-local: it needs the interface) or twice, and at most MAX_ADDRESSES.
+/// Whatever the other side sent is untrusted: it is only ever dialled, and
+/// whoever answers must be the device by its certificate.
+fn parse_addresses(message: &Value) -> Vec<SocketAddr> {
+    let Some(port) = message["port"].as_u64().filter(|p| (1..=65535).contains(p)) else { return Vec::new() };
+    let mut found: Vec<SocketAddr> = Vec::new();
+    for told in message["addresses"].as_array().into_iter().flatten() {
+        let Some(ip) = told.as_str().and_then(|a| a.parse::<std::net::IpAddr>().ok()) else { continue };
+        let dialable = match ip {
+            std::net::IpAddr::V4(a) => !(a.is_loopback() || a.is_unspecified() || a.is_multicast() || a.is_link_local()
+                                         || a.is_broadcast()),
+            std::net::IpAddr::V6(a) => !(a.is_loopback() || a.is_unspecified() || a.is_multicast()
+                                         || (a.segments()[0] & 0xffc0) == 0xfe80),
+        };
+        let address = SocketAddr::new(ip, port as u16);
+        if dialable && !found.contains(&address) {
+            found.push(address);
+        }
+        if found.len() == MAX_ADDRESSES {
+            break;
+        }
+    }
+    found
+}
+
 pub struct Session {
     /// The other side's certificate's fingerprint, and what its hello said.
     pub peer: String,
@@ -999,6 +1029,10 @@ pub struct Session {
     /// The session's, the same on both sides: a path for it names it.
     pub id: String,
     features: Mutex<Value>,
+    /// Where the other side says it can be reached on the networks it is
+    /// on (its "net" message; None before it said, Some(empty) once it
+    /// said it is on none).
+    addresses: Mutex<Option<Vec<SocketAddr>>>,
     node: Weak<NodeInner>,
     closed: AtomicBool,
     /// Said "bye": the path's end that follows is not a path lost.
@@ -1303,6 +1337,7 @@ impl Session {
             name: hello["name"].as_str().unwrap_or("").to_owned(),
             id: established.id.clone(),
             features: Mutex::new(hello["features"].clone()),
+            addresses: Mutex::new(None),
             node: Arc::downgrade(node),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1418,6 +1453,21 @@ impl Session {
     /// What the other side serves now: {feature: version}.
     pub fn features(&self) -> Value {
         self.features.lock().unwrap().clone()
+    }
+
+    /// Where the other side said it can be reached, as a "net" message of
+    /// its says (sent when it comes up and when its networks change, over
+    /// whatever path the session is on: a cable tells the Wi-Fi's address).
+    /// Empty before it says, and once it said it is on no network.
+    pub fn addresses(&self) -> Vec<SocketAddr> {
+        self.addresses.lock().unwrap().clone().unwrap_or_default()
+    }
+
+    /// Ours: the addresses the other side may dial us at, on the port we
+    /// listen on (told as they change).
+    pub(crate) fn our_addresses(&self, port: u16, addresses: &[std::net::IpAddr]) {
+        self.send_message(json!({"t": "net", "port": port,
+                                 "addresses": addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>()}));
     }
 
     /// Ours changed (a feature served or no longer): the other side told.
@@ -2812,6 +2862,15 @@ impl Session {
             "close" => self.close_channel(id, false),
             "bye" => self.end("closed by the other side"),
             "features" => *self.features.lock().unwrap() = message["features"].clone(),
+            "net" => {
+                let told = parse_addresses(message);
+                let changed = self.addresses.lock().unwrap().replace(told.clone()).as_ref() != Some(&told);
+                if changed {
+                    if let Some(node) = self.node.upgrade() {
+                        node.network(self);
+                    }
+                }
+            }
             "credit" => {
                 let end = self.channels.lock().unwrap().get(&id).cloned();
                 if let (Some(end), Some(taken)) = (end, message["taken"].as_u64()) {

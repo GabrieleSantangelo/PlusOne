@@ -58,9 +58,9 @@ machine at once (it does not wait for the round to end).
 | Offset | Method | Finds | Needs | Notes |
 |---|---|---|---|---|
 | 0 | the cable | `usb` | an Android device on the bus; its serial remembered, or the user's "use the cable" | PC: sysfs/udev; the app: the accessory intent **[built]** |
-| 0 | last addresses | `lan`, `ap` | the address it was reached at (per network) | tried directly, 1.5 s **[built]** |
+| 0 | last addresses | `lan`, `ap` | the addresses it was reached at, and those it told over a session (its `net` message: a cable's too), per network, those of the networks we are on, two at most | tried directly, 1.5 s each **[built]** |
 | 0 | mDNS | `lan` | multicast | one query, three repeats (0, 0.25, 1 s) **[built]** |
-| 0.3 s | Bluetooth LE | the tablet's rotating id, its IP:port, its paths | Bluetooth on | passive scan on the PC; the app advertises while it has a session or wants one |
+| after them | Bluetooth LE | the tablet's IPv4:port (sealed for this PC: the advertisement is public; `ble.rs`) | Bluetooth on | a scan on the PC; the app advertises while a paired PC has no session. **[built]**: BlueZ through `bluetoothctl` and `busctl`; after the last addresses and mDNS found nothing; 5 s, once in 30 s a tablet |
 | 0.5 s | Wi-Fi Direct peers | `wifi-direct` | P2P on both, not refused by the firmware's channel rules | only if no `lan` candidate within 1 s (it disturbs the Wi-Fi) |
 | 1 s | the PC's access point | `ap` | a second adapter (or one allowing AP+STA on different channels) | the app joins a local-only network (Android asks once) |
 | 2 s | relay | `relay` | an account; the internet | last resort |
@@ -71,7 +71,7 @@ nothing wants the device. While Connected below the best rank, a light
 look (cable, mDNS, BLE) every `UPGRADE_LOOK`.
 
 The tablet's side of discovery is announcing: mDNS (while its service
-runs) **[built]**, BLE advertising (while wanted or a session is up),
+runs) **[built]**, BLE advertising (while a paired PC has no session and it is on a Wi-Fi with an IPv4 address) **[built]**,
 listening on a stable port (47101, else any) **[built]**.
 
 ## 2. Device machine (PC side; the app's mirrors it, without dialing)

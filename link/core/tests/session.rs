@@ -47,6 +47,44 @@ fn hello_says_names_and_features() {
 }
 
 #[test]
+fn the_tablet_tells_where_it_can_be_dialled_and_when_that_changes() {
+    let (pc, tablet, address) = pair();
+    let (events, told) = mpsc::channel();
+    pc.on_event(move |event| {
+        if let Event::Net(session) = event {
+            let _ = events.send(session.addresses());
+        }
+    });
+    // Before the session: told with it. What cannot be dialled is dropped.
+    tablet.set_addresses(vec!["192.168.7.7".parse().unwrap(), "127.0.0.1".parse().unwrap(), "fe80::1".parse().unwrap(),
+                              "2001:db8::7".parse().unwrap()]);
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    let port = address.port();
+    let first = told.recv_timeout(Duration::from_secs(2)).expect("never told");
+    assert_eq!(first, vec![SocketAddr::new("192.168.7.7".parse().unwrap(), port),
+                           SocketAddr::new("2001:db8::7".parse().unwrap(), port)]);
+    assert_eq!(session.addresses(), first);
+    // Told again when the networks change, not when they do not.
+    tablet.set_addresses(vec!["192.168.7.7".parse().unwrap(), "2001:db8::7".parse().unwrap()]);
+    tablet.set_addresses(vec!["10.1.2.3".parse().unwrap()]);
+    let second = told.recv_timeout(Duration::from_secs(2)).expect("the change never told");
+    assert_eq!(second, vec![SocketAddr::new("10.1.2.3".parse().unwrap(), port)]);
+    assert!(told.recv_timeout(Duration::from_millis(300)).is_err(), "told again with nothing changed");
+    // On no network: nothing told (the PC keeps the old, which it dials only on a network it is on).
+    tablet.set_addresses(Vec::new());
+    assert!(told.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(session.addresses().len(), 1);
+}
+
+#[test]
+fn a_device_that_never_says_has_no_addresses() {
+    let (pc, _tablet, address) = pair();
+    let session = pc.connect(address, Duration::from_secs(2)).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(session.addresses().is_empty());
+}
+
+#[test]
 fn features_served_later_are_told() {
     let (pc, tablet, address) = pair();
     let session = pc.connect(address, Duration::from_secs(2)).unwrap();

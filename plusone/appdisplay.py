@@ -1572,6 +1572,10 @@ def describe(stats):
             + (f"; {sum(stats['dropped'].values())} encoded not sent ({_dropped(stats)})" if stats.get("dropped") else ""))
 
 
+LOOK = 15  # s an app not found yet is looked for (a sleeping tablet's Wi-Fi answers mDNS late)
+LOOK_EVERY = 1  # s between looks: the discovery's refresh asks again each time
+
+
 class AppDisplay:
     """A display session with the paired tablet's app: the virtual monitor
     (or a test pattern), its stream, the fingers and the pen, for as long as
@@ -1582,8 +1586,10 @@ class AppDisplay:
     on_ended(error or None, started), on_paused(paused)."""
 
     def __init__(self, targets, app_id, mode, bitrate, encoder, touch=True, test=False, preview=False,
-                 on_started=None, on_ended=None, on_paused=None):
+                 on_started=None, on_ended=None, on_paused=None, find=None):
+        """find(): where the app is now (asked again while it is looked for)."""
         self.targets, self.app_id, self.mode = targets, app_id, mode
+        self.find = find
         self.bitrate, self.encoder, self.touch, self.test = bitrate, encoder, touch, test
         self.preview = preview
         self.on_started = on_started or (lambda mode, screen: None)
@@ -1668,7 +1674,7 @@ class AppDisplay:
             if over_link is not None:
                 self._run_over_the_link(*over_link)
                 return
-            self.link = link.connect(self.targets, self.app_id)
+            self.link = self._connect()
             if self._stopped.is_set():
                 return
             self.channel = Datagrams()
@@ -1702,6 +1708,35 @@ class AppDisplay:
                 self.channel.close()  # stopped before teardown could see it (twice is harmless)
             if not self._stopped.is_set():
                 GLib.idle_add(once(self._ended, error))
+
+    def _connect(self):
+        """The link to the app where it is; where it is found next if none
+        is known or none answers (the network just changed, or its Wi-Fi
+        sleeps): looked for LOOK seconds, not given up at once."""
+        targets = list(self.targets)
+        if targets:
+            try:
+                return link.connect(targets, self.app_id)
+            except OSError as e:
+                if self.find is None:
+                    raise
+                log("app display: not where it was:", repr(e))
+        more = self._look(set(targets))
+        if not more:
+            raise link.NotFound("not found on this network")
+        return link.connect(more, self.app_id)
+
+    def _look(self, tried):
+        """Targets not tried yet, as find() says them, within LOOK seconds."""
+        if self.find is None:
+            return []
+        until = time.monotonic() + LOOK
+        while not self._stopped.is_set():
+            more = [t for t in self.find() if t not in tried]
+            if more or time.monotonic() >= until:
+                return more
+            self._stopped.wait(LOOK_EVERY)
+        return []
 
     def _run_over_the_link(self, packets, reply):
         """The session on the link's channels, as _run's (its errors raised

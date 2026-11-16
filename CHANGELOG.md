@@ -66,6 +66,36 @@
   each time until the cable was pulled. It now opens the cable again
   only once the session on it ended; and a cable that cannot be opened
   is tried again after 1, 2, 4... up to 16 s, and said once.
+- **The tablet's Wi-Fi address learnt by cable**: where multicast does
+  not go (eduroam, guest networks), the PC found a tablet again only if
+  the address it last dialled still held. The tablet now tells the PC
+  the addresses of its Wi-Fi and Ethernet networks (not the mobile
+  one) over any session, the cable's included, and again when they
+  change; the PC dials each one on a network it is on and keeps the
+  ones where the tablet answers (by its certificate: another place's
+  192.168.1.x, or a network where clients cannot reach each other,
+  answers nothing and is not kept), for each tablet, those of other
+  networks too (home and office), and dials the ones on a network it
+  is on. Pull
+  the cable and the link goes on over Wi-Fi at once. A tablet's
+  address is now a list in `link.json` (the old single address is still
+  read).
+- **A tablet to pair listed over Bluetooth LE, as earphones are**: with
+  "Pair a new PC" open on the tablet it advertises who and where it is
+  (its name too) for those two minutes, and the PC's pairing page lists
+  it beside those found on the network, where multicast does not go
+  (another network, a guest Wi-Fi, a PC on a cable and a tablet on
+  Wi-Fi). Pairing itself is as before, with the code on both screens.
+  The PC listens only while the pairing page is open.
+- **The tablet found over Bluetooth LE where multicast does not go**:
+  when the last addresses and mDNS find nothing, plus-one-link scans
+  Bluetooth LE for 5 s (once in 30 s for each tablet) for the
+  tablet's advertisement: its address on its Wi-Fi, encrypted so that
+  only the PC it is for can read it, advertised only while a paired PC
+  has no session with it. The PC dials the address, and the
+  certificate says who answers. Needs BlueZ's `bluetoothctl` and
+  `busctl`, and "Nearby devices" allowed on the tablet (asked with the
+  Bluetooth's, no new question).
 - **A session ended over there ends here at once**: when one side
   ended the session (closed by hand, idle, plus-one-link stopping) and
   its connection closed in the same moment, its goodbye could go unread:

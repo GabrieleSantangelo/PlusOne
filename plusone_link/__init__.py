@@ -253,6 +253,13 @@ class Link:
         "name", "version", "address"}]."""
         return self._request({"op": "browse", "wait": wait}, wait=wait)[0]["tablets"]
 
+    def pairing_scan(self, wait=3.0):
+        """The tablets whose user holds pairing open, heard over Bluetooth LE
+        for wait seconds (BlueZ; none where there is none): [{"id" (the start
+        of its fingerprint), "name", "address", "port"}]. One scan at a time:
+        another asking meanwhile gets none."""
+        return self._request({"op": "pairing_scan", "wait": wait}, wait=wait)[0]["tablets"]
+
     def use_usb(self, on=True):
         """Whether an Android tablet plugged in is asked to be Plus One's
         accessory (its file transfer off meanwhile); one reached by cable

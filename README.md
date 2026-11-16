@@ -146,7 +146,8 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-
 Once: install Plus One's app on the tablet (`plus-one-companion_*.apk` from
 the release, Android 13 or later) and open it. Then in Plus One's window on
 the PC, **Pair a tablet**: pick yours from the list of tablets with the app
-on your Wi-Fi, check that both screens show the same six-digit code and
+nearby (on your Wi-Fi, or heard over Bluetooth while the tablet's **Pair a
+new PC** is open), check that both screens show the same six-digit code and
 confirm on both. The window's **Tablets** page (or a click on the tablet's
 name at the top of the sidebar) pairs another, picks the one in use and
 forgets one.

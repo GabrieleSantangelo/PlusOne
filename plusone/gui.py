@@ -67,6 +67,7 @@ def device_status(kind, state, users=()):
         "tablet-stopped": _("Stopped on the tablet: on again when a program takes it anew"),
         "locked": _("Paused while this PC is locked"),
     }.get(state, "")
+REFRESH_MS = 1500  # the pair dialog asks where the apps are, while open
 CSS = b".pair-code { font-size: 300%; font-weight: 800; letter-spacing: 0.1em; }"
 _resources_added = False
 
@@ -525,10 +526,14 @@ class Window(Adw.ApplicationWindow):
 
     def _ask_forget(self, fingerprint, name):
         dialog = Adw.AlertDialog(heading=_("Forget {tablet}?").format(tablet=name),
-                                 body=_("To use it again, pair it again: both screens show a code."))
+                                 body=_("To use it again, pair it again: both screens show a code.") + "\n\n"
+                                 + _("A tablet that does not answer needs no forgetting: on another network, "
+                                     "this PC finds it again by itself."))
         dialog.add_response("cancel", _("Cancel"))
         dialog.add_response("forget", _("Forget"))
         dialog.set_response_appearance("forget", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
 
         def answered(_d, response):
             if response == "forget":
@@ -651,21 +656,33 @@ class PairDialog(Adw.Dialog):
         self.set_child(self.nav)
 
         page = Adw.PreferencesPage()
-        self.found = Adw.PreferencesGroup(title=_("With Plus One on your Wi-Fi"),
-                                          description=_("Not there? Open Plus One on the tablet, on the same "
-                                                        "Wi-Fi as this PC."))
+        # Found on the network, or over Bluetooth while its user holds pairing open.
+        self.found = Adw.PreferencesGroup(title=_("Tablets with Plus One nearby"),
+                                          description=_("Not there? On the tablet, open Plus One and tap "
+                                                        "“Pair a new PC”."))
         page.add(self.found)
         self.rows = []
         self.searching = Adw.ActionRow(title=_("Looking for tablets…"))
         self.searching.add_prefix(Gtk.Spinner(spinning=True))
         # Nothing after a while: what to do, not a spinner forever.
         GLib.timeout_add_seconds(10, once(lambda: self.closed or self.searching.set_title(
-            _("No tablet found yet. Open Plus One on the tablet, on the same Wi-Fi as this PC."))))
+            _("No tablet found yet. On the tablet, open Plus One and tap “Pair a new PC”."))))
         self.nav.add(self._page(page, _("Pair a tablet")))
         self._listing = None
         self._list()
         app.listeners.append(self._list)
+        # Ask where the apps are now, and again while open: a tablet whose
+        # pairing was just opened shows up in a second or two, not at the
+        # next minute's recheck. Nothing of it runs once closed (power).
+        app.discovery.refresh()
+        app.discovery.refresh_pairing()
+        self._refreshing = GLib.timeout_add(REFRESH_MS, self._refresh_discovery)
         self.connect("closed", self._on_closed)
+
+    def _refresh_discovery(self):
+        self.app.discovery.refresh()
+        self.app.discovery.refresh_pairing()
+        return GLib.SOURCE_CONTINUE
 
     @staticmethod
     def _page(content, title):
@@ -786,6 +803,7 @@ class PairDialog(Adw.Dialog):
 
     def _on_closed(self, _dialog):
         self.closed = True
+        GLib.source_remove(self._refreshing)
         self._answered(False)  # closed while comparing: not paired
         self.app.listeners.remove(self._list)
 

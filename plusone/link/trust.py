@@ -20,7 +20,7 @@ import threading
 
 from gi.repository import GLib
 
-from .. import write_private
+from .. import log, write_private
 
 MAX_NAME = 64
 # (Named after the app's first name: the identity and pairings made then stay.)
@@ -91,11 +91,26 @@ class Paired:
                                if key == "name" or (key == "app_at" and isinstance(value, str))}
         return entries
 
+    def _unreadable(self):
+        """The file is there but cannot be read as pairings."""
+        try:
+            with open(self.path) as f:
+                json.load(f)
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError):
+            return True
+        return False
+
     def all(self):
         """{fingerprint: name}."""
         return {fp: entry["name"] for fp, entry in self.entries().items()}
 
     def add(self, fp, name):
+        if self._unreadable():
+            # Written over, the other tablets would be forgotten: kept aside.
+            os.replace(self.path, self.path + ".unreadable")
+            log("tablets: paired.json could not be read, kept as paired.json.unreadable")
         data = self.entries()
         data[fp] = dict(data.get(fp, {}), name=name)
         write_private(self.path, data)

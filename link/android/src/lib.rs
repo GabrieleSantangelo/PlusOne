@@ -279,6 +279,15 @@ fn request(core: &Arc<Core>, request: &Value) -> Result<Value, String> {
             };
             Ok(json!({"ok": true, "port": bound.port(), "quic": quic}))
         }
+        // The addresses of the networks the app is on (Wi-Fi, Ethernet),
+        // where a PC may dial it on the listener's port: told to every PC
+        // with a session, over its cable too (for when the cable is out).
+        "addresses" => {
+            let told = request["addresses"].as_array().ok_or("no addresses")?;
+            let addresses = told.iter().filter_map(|a| a.as_str()?.parse::<std::net::IpAddr>().ok()).collect();
+            core.node.set_addresses(addresses);
+            Ok(json!({"ok": true}))
+        }
         "connect" => {
             let address = text("address")?.parse().map_err(|e| format!("the address: {e}"))?;
             let timeout = request["timeout"].as_f64().filter(|t| t.is_finite()).unwrap_or(5.0).clamp(0.1, 60.0);
@@ -410,6 +419,7 @@ fn start(env: &mut JNIEnv, name: JString, certificate: JByteArray, signer: JObje
             }
             Event::Detached(session) => json!({"event": "detached", "device": session.peer}),
             Event::Gone(device, reason) => json!({"event": "gone", "device": device, "reason": reason}),
+            Event::Net(_) => return,  // a PC says nothing of its networks
         };
         let _ = on_event.lock().unwrap().send(message);
     });

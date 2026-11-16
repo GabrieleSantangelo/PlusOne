@@ -65,6 +65,12 @@ class LinkCore(name: String, certificate: X509Certificate, key: PrivateKey) : Cl
         request(JSONObject().put("op", "accept_stream").put("fd", fd).put("path", path))
     }
 
+    /** The addresses of the networks the app is on, where a PC may dial it on
+     * the port it listens on (told to every PC with a session, by cable too). */
+    fun setAddresses(addresses: List<String>) {
+        request(JSONObject().put("op", "addresses").put("addresses", org.json.JSONArray(addresses)))
+    }
+
     /** A feature of the app's: the PC's channels for it to handler. */
     fun serve(feature: String, version: Int = 1, handler: (LinkChannel) -> Unit) {
         served[feature] = handler

@@ -33,6 +33,10 @@
 //!                                the app), the session made on it
 //!   {"op": "browse"[, "wait": S]}  the tablets announcing the link nearby
 //!                                (mDNS): id (its start), name, address
+//!   {"op": "pairing_scan"[, "wait": S]}  the tablets whose user holds pairing
+//!                                open, heard over Bluetooth LE for S seconds
+//!                                (3; 1 to 8; one scan at a time, "busy"
+//!                                for another asking): id, name, address
 //!   {"op": "queued", "device"}   bytes on their way to it, not yet sent;
 //!                                dropped, as devices' (one call each frame)
 //!   {"op": "close", "device"}    its session over (its channels with it)
@@ -66,7 +70,9 @@
 //! reached or where mDNS finds it, and closed after IDLE with no channel:
 //! nothing wakes the tablet's Wi-Fi while nothing is in use.
 
+mod addresses;
 mod api;
+mod bluez;
 mod usb;
 
 use plusone_link::{log, Class, Event, Identity, Node};
@@ -94,6 +100,12 @@ struct Daemon {
     state: PathBuf,
     /// Held while state is read, changed and written again.
     changing: Mutex<()>,
+    /// A scan for tablets holding pairing open is running (pairing_scan()).
+    pairing_scanning: std::sync::atomic::AtomicBool,
+    /// When each tablet was last looked for over Bluetooth LE (by_ble()).
+    scanned: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// A tablet's addresses being tried (verify()), each tablet's own.
+    verifying: Mutex<std::collections::HashMap<String, Arc<Verifying>>>,
     /// Held while a tablet is reached (reach()): each tablet's its own.
     finding: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     usb: usb::Watcher,
@@ -108,6 +120,22 @@ struct Daemon {
     serial: AtomicU64,
 }
 
+/// What a tablet's addresses being tried needs (verify()): one trying at a
+/// time, and one more waiting at most (it reads the newest addresses).
+#[derive(Default)]
+struct Verifying {
+    running: Mutex<()>,
+    queued: std::sync::atomic::AtomicBool,
+}
+
+/// A scan of Bluetooth LE for a tablet (bluez.rs) lasts this long at most...
+const BLE_WINDOW: Duration = Duration::from_secs(5);
+/// ...and is made for a tablet this often at most (a tablet away is reached for each second).
+const BLE_EVERY: Duration = Duration::from_secs(30);
+
+/// The most of the addresses a tablet tells that are dialled at once.
+const VERIFIED: usize = 4;
+
 fn paired(config: &Path) -> serde_json::Map<String, Value> {
     std::fs::read(config.join("paired.json")).ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -121,7 +149,7 @@ fn paired_name(entry: &Value) -> &str {
 
 impl Daemon {
     fn new(node: Node, config: PathBuf, ours: String, state: PathBuf) -> Daemon {
-        Daemon { node, config, ours, state, changing: Mutex::default(), finding: Mutex::default(), usb: usb::Watcher::new(),
+        Daemon { node, config, ours, state, changing: Mutex::default(), pairing_scanning: Default::default(), scanned: Mutex::default(), verifying: Mutex::default(), finding: Mutex::default(), usb: usb::Watcher::new(),
                  switched: Mutex::default(), watchers: Mutex::default(), coming_back: Mutex::default(),
                  serving: Mutex::default(), serial: AtomicU64::new(0) }
     }
@@ -187,13 +215,110 @@ impl Daemon {
             .and_then(|v| v.as_object().cloned()).unwrap_or_default()
     }
 
+    /// Where a tablet was reached (an address we dialled): one more of its addresses.
     fn reached(&self, device: &str, address: std::net::SocketAddr) {
-        let address = address.to_string();
+        self.learn(device, &[address]);
+    }
+
+    /// Whether a tablet is due to be looked for over Bluetooth LE: not
+    /// within BLE_EVERY of the last time (noted now, if it is).
+    fn ble_due(&self, device: &str, now: std::time::Instant) -> bool {
+        let mut scanned = self.scanned.lock().unwrap();
+        if scanned.get(device).is_some_and(|last| now.duration_since(*last) < BLE_EVERY) {
+            return false;
+        }
+        scanned.insert(device.to_owned(), now);
+        true
+    }
+
+    /// Where the tablet advertises that it can be dialled (ble.rs), read in a
+    /// scan of Bluetooth LE for BLE_WINDOW at most: BlueZ and an adapter on
+    /// are needed, and the tablet within reach.
+    fn by_ble(&self, device: &str) -> Option<std::net::SocketAddr> {
+        if !self.ble_due(device, std::time::Instant::now()) {
+            return None;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let found = bluez::scan(BLE_WINDOW, plusone_link::ble::COMPANY,
+                                |data| plusone_link::ble::read(device, &self.ours, now, data));
+        match found {
+            Some(address) => log!("{}: advertises {address} over Bluetooth LE", &device[..8.min(device.len())]),
+            None => log!("{}: not heard over Bluetooth LE", &device[..8.min(device.len())]),
+        }
+        found
+    }
+
+    /// The addresses a tablet told (its "net" message), on a network we are
+    /// on, tried one by one on a thread: kept only those that answer, as the
+    /// tablet itself (its certificate). A network of another place with the
+    /// same addresses (192.168.1.x are in every other home), or one where
+    /// clients cannot reach each other, answers nothing, or another device:
+    /// kept, it would cost a try every time the cable is out.
+    fn verify(self: &Arc<Self>, session: Arc<plusone_link::Session>) {
+        let verifying = self.verifying.lock().unwrap().entry(session.peer.clone()).or_default().clone();
+        if verifying.queued.swap(true, Ordering::SeqCst) {
+            return;  // one waits already: it reads what is told by then
+        }
+        let (daemon, waiting) = (self.clone(), verifying.clone());
+        let spawned = std::thread::Builder::new().name("link-verify".into()).spawn(move || {
+            let _one_at_a_time = waiting.running.lock().unwrap();
+            waiting.queued.store(false, Ordering::SeqCst);
+            daemon.verified(&session, |address| daemon.answers(&session.peer, address));
+        });
+        if spawned.is_err() {
+            verifying.queued.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The addresses the session's tablet told that answer (answers), not
+    /// known yet, kept.
+    fn verified(&self, session: &plusone_link::Session, answers: impl Fn(std::net::SocketAddr) -> bool) {
+        let known = addresses::read(self.remembered().get(&session.peer));
+        let told: Vec<_> = session.addresses().into_iter()
+            .filter(|a| plusone_link::sys::on_link(a.ip()) && !known.contains(a)).take(VERIFIED).collect();
+        let mut found = Vec::new();
+        for address in told {
+            if session.is_closed() {
+                return;
+            }
+            if answers(address) {
+                found.push(address);
+            }
+        }
+        if !found.is_empty() {
+            log!("{}: reachable at {}", session.name,
+                 found.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
+            self.learn(&session.peer, &found);
+        }
+    }
+
+    /// Whether the device answers at address: a session's path made there
+    /// (the one it has is kept if it is the better: a cable), by its certificate.
+    fn answers(&self, device: &str, address: std::net::SocketAddr) -> bool {
+        match self.node.connect(address, Duration::from_millis(1500)) {
+            Ok(session) if session.peer == device => true,
+            Ok(session) => {
+                log!("{address}: {} answered, not the tablet that told it", &session.peer[..8]);
+                false
+            }
+            Err(e) => {
+                log!("{address}: told by the tablet, no answer ({e}): not kept");
+                false
+            }
+        }
+    }
+
+    /// Addresses of a tablet, known now: kept with those it had on other
+    /// networks, the ones of the same network they replace (addresses.rs).
+    fn learn(&self, device: &str, new: &[std::net::SocketAddr]) {
+        let networks = plusone_link::sys::networks();
         self.change(|state| {
-            if state.get(device).and_then(Value::as_str) == Some(address.as_str()) {
+            let before = addresses::read(state.get(device));
+            let merged = addresses::merge(&before, new, &networks);
+            if merged == before {
                 return false;
             }
-            state.insert(device.to_owned(), json!(address));
+            state.insert(device.to_owned(), addresses::write(&merged));
             true
         });
     }
@@ -233,8 +358,10 @@ impl Daemon {
                 .and_then(|all| all.into_iter().find(|f| mine(f)).map(|f| f.address).ok_or_else(|| "not found nearby".to_owned()))
         }).ok();
         let mut why = Vec::new();
-        let remembered: Option<std::net::SocketAddr> =
-            self.remembered().get(device).and_then(Value::as_str).and_then(|a| a.parse().ok());
+        // Where it was reached before, or told it can be (over a cable, say),
+        // on the networks this PC is on now; those of others stay for later.
+        let remembered = addresses::to_dial(&addresses::read(self.remembered().get(device)),
+                                            &plusone_link::sys::networks());
         let attempt = |address: std::net::SocketAddr, why: &mut Vec<String>| match self.node.connect(address, Duration::from_millis(1500)) {
             Ok(session) if session.peer == device => {
                 self.reached(device, address);
@@ -249,18 +376,31 @@ impl Daemon {
                 None
             }
         };
-        if let Some(session) = remembered.and_then(|address| attempt(address, &mut why)) {
-            return Ok(session);
+        for address in &remembered {
+            if let Some(session) = attempt(*address, &mut why) {
+                return Ok(session);
+            }
         }
         match looking.map(|looking| looking.join()) {
-            Some(Ok(Ok(address))) if Some(address) != remembered => {
+            Some(Ok(Ok(address))) if !remembered.contains(&address) => {
                 if let Some(session) = attempt(address, &mut why) {
                     return Ok(session);
                 }
             }
-            Some(Ok(Ok(_))) => {}  // where the first try was
+            Some(Ok(Ok(_))) => {}  // where one of the tries was
             Some(Ok(Err(e))) => why.push(e),
             _ => why.push("mDNS failed".into()),
+        }
+        // Where multicast does not go and the last addresses no longer hold:
+        // the tablet's own advertisement, which only this PC can read.
+        match self.by_ble(device) {
+            Some(address) if !remembered.contains(&address) => {
+                if let Some(session) = attempt(address, &mut why) {
+                    return Ok(session);
+                }
+            }
+            Some(_) => {}  // where one of the tries was
+            None => {}
         }
         Err(if why.is_empty() { "not reached".into() } else { why.join("; ") })
     }
@@ -273,6 +413,28 @@ impl Daemon {
             "id": f.txt.get("id"), "name": f.txt.get("name"), "version": f.txt.get("v"),
             "address": f.address.to_string()})).collect();
         Ok(json!({"ok": true, "tablets": tablets}))
+    }
+
+    /// The tablets heard holding pairing open over Bluetooth LE (ble.rs), one
+    /// scan at a time: for another that asks meanwhile, none and "busy".
+    fn pairing_scan(&self, request: &Value) -> Value {
+        let wait = request["wait"].as_f64().filter(|w| w.is_finite()).unwrap_or(3.0).clamp(1.0, 8.0);
+        if self.pairing_scanning.swap(true, Ordering::SeqCst) {
+            return json!({"ok": true, "tablets": [], "busy": true});
+        }
+        // Let go however the scan ends (a panic in it too): the next may scan.
+        struct Scanning<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Scanning<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let scanning = Scanning(&self.pairing_scanning);
+        let found = bluez::pairing(Duration::from_secs_f64(wait));
+        drop(scanning);
+        let tablets: Vec<Value> = found.iter().map(|t| json!({
+            "id": t.id, "name": t.name, "address": t.address.ip().to_string(), "port": t.address.port()})).collect();
+        json!({"ok": true, "tablets": tablets})
     }
 
     /// The cable, every usb::EVERY.
@@ -441,6 +603,10 @@ impl Daemon {
                 (json!({"event": "detached", "device": session.peer}), None)
             }
             Event::Gone(device, reason) => (json!({"event": "gone", "device": device, "reason": reason}), None),
+            Event::Net(session) => {
+                self.verify(session);
+                return;
+            }
         };
         for message in std::iter::once(message).chain(also) {
             self.tell(&message);
@@ -516,6 +682,7 @@ impl Daemon {
                 "connect" => (self.connect(&request), None),
                 "stream" => (self.stream(&request, given), None),
                 "browse" => (self.browse(&request), None),
+                "pairing_scan" => (Ok(self.pairing_scan(&request)), None),
                 "queued" => (self.queued(&request), None),
                 "usb" => match request.get("use").map_or(Some(true), Value::as_bool) {
                     Some(on) => {
@@ -833,6 +1000,8 @@ mod tests {
         assert_eq!(ask(&app, json!({"op": "serve", "feature": "deaf"}))["ok"], true);
         while api::send_now(filling.as_raw_fd(), &json!({"event": "filler"})).is_ok() {}
         by_bluetooth(&daemon, &tablet);
+        // The PC's side is up when the tablet's may not be yet (its hellos end after).
+        until("the tablet's session", Duration::from_secs(2), || !tablet.sessions().is_empty());
         let session = tablet.sessions().pop().unwrap();
         let channel = session.open("deaf", "c", Class::Control).unwrap();
         let mut buf = [0u8; 64];
@@ -971,10 +1140,92 @@ mod tests {
         daemon.remember_usb("R52X");
         let state = daemon.remembered();
         assert_eq!(state.len(), 8 * 25 + 1);
-        assert_eq!(state["tablet-7-24"], "10.0.7.24:47101");
+        assert_eq!(state["tablet-7-24"], json!(["10.0.7.24:47101"]));
         assert_eq!(state["usb"], json!(["R52X"]));
         let folder = daemon.state.parent().unwrap();
         assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1, "the temporary files left");
+    }
+
+    /// An address of this PC's own network (any, if it cannot tell), and another of the same.
+    fn here_and_there() -> (std::net::IpAddr, std::net::IpAddr) {
+        let here = plusone_link::sys::networks().into_iter().map(|(address, _)| address)
+            .find(|a| matches!(a, std::net::IpAddr::V4(v4) if !v4.is_link_local()))
+            .unwrap_or("192.168.7.7".parse().unwrap());
+        let std::net::IpAddr::V4(v4) = here else { unreachable!() };
+        let [a, b, c, d] = v4.octets();
+        (here, std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, if d == 99 { 98 } else { 99 })))
+    }
+
+    #[test]
+    fn a_tablet_on_a_cable_tells_its_wifi_and_the_pc_keeps_only_what_answers() {
+        // Said over a stream that is no IP path (a cable's, Bluetooth's), each
+        // address is tried: kept if the tablet answers there, not if nothing
+        // does (another place's network, clients that cannot reach each other).
+        let (daemon, tablet) = paired_daemon("net");
+        let port = tablet.listen("127.0.0.1:0".parse().unwrap()).unwrap().port();
+        let (here, there) = here_and_there();
+        tablet.set_addresses(vec![here, there]);
+        let device = by_bluetooth(&daemon, &tablet);
+        let session = daemon.node.session(&device).unwrap();
+        until("told", Duration::from_secs(2), || session.addresses().len() == 2);
+        // The tries the event started find nothing at these (the tablet listens on loopback): none kept.
+        until("tried", Duration::from_secs(5), || threads("link-verify") == 0);
+        assert!(addresses::read(daemon.remembered().get(&device)).is_empty());
+        // One answers.
+        let (one, two) = (std::net::SocketAddr::new(here, port), std::net::SocketAddr::new(there, port));
+        daemon.verified(&session, |address| address == one);
+        assert_eq!(addresses::read(daemon.remembered().get(&device)), vec![one]);
+        // Known ones are not asked again; the other still is, and now answers.
+        let asked = Mutex::new(Vec::new());
+        daemon.verified(&session, |address| { asked.lock().unwrap().push(address); true });
+        assert_eq!(*asked.lock().unwrap(), vec![two]);
+        let known = addresses::read(daemon.remembered().get(&device));
+        // (Of one network, the newer replaces the older; with no networks up to tell, both stay.)
+        assert_eq!(known, if plusone_link::sys::networks().is_empty() { vec![two, one] } else { vec![two] });
+        daemon.node.close();
+        tablet.close();
+    }
+
+    #[test]
+    fn the_tablets_holding_pairing_open_are_asked_for_one_scan_at_a_time() {
+        let daemon = daemon("pairing-scan");
+        let (app, _served) = app(&daemon);
+        // No BlueZ here (the build's container) or none in range: none, and no error.
+        let told = ask(&app, json!({"op": "pairing_scan", "wait": 1}));
+        assert_eq!((&told["ok"], told["tablets"].as_array().map(Vec::len)), (&json!(true), Some(0)), "{told}");
+        // One scanning already: the other is told so at once.
+        daemon.pairing_scanning.store(true, Ordering::SeqCst);
+        let busy = ask(&app, json!({"op": "pairing_scan"}));
+        assert_eq!((&busy["busy"], &busy["ok"]), (&json!(true), &json!(true)), "{busy}");
+        // A wait that is no number, or far too long, is a short one.
+        daemon.pairing_scanning.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        assert_eq!(ask(&app, json!({"op": "pairing_scan", "wait": "x"}))["ok"], true);
+        assert!(started.elapsed() < Duration::from_secs(9));
+    }
+
+    #[test]
+    fn a_tablet_is_looked_for_over_bluetooth_le_once_in_a_while() {
+        let daemon = daemon("ble");
+        let now = std::time::Instant::now();
+        assert!(daemon.ble_due("a", now));
+        assert!(!daemon.ble_due("a", now + Duration::from_secs(1)), "each second");
+        assert!(daemon.ble_due("b", now + Duration::from_secs(1)), "another tablet");
+        assert!(!daemon.ble_due("a", now + BLE_EVERY - Duration::from_millis(1)));
+        assert!(daemon.ble_due("a", now + BLE_EVERY));
+    }
+
+    #[test]
+    fn an_address_answers_if_the_tablet_is_there_by_its_certificate() {
+        let (daemon, tablet) = paired_daemon("answers");
+        let address = tablet.listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        let device = by_bluetooth(&daemon, &tablet);
+        assert!(daemon.answers(&device, address));
+        assert!(!daemon.answers(&"a".repeat(64), address), "a tablet that is not the one told");
+        let nowhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();  // closed again
+        assert!(!daemon.answers(&device, nowhere));
+        daemon.node.close();
+        tablet.close();
     }
 
     #[test]

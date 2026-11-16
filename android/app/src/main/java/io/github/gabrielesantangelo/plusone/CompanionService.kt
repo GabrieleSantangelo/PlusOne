@@ -34,6 +34,13 @@ class CompanionService : Service(), LinkServer.Host {
     var link: io.github.gabrielesantangelo.plusone.link.LinkCore? = null
         private set
     private var linkAnnouncer: MdnsAnnouncer? = null
+    @Volatile private var networks: io.github.gabrielesantangelo.plusone.link.NetworkWatch? = null
+    /** Where the app's own listener takes pairing (LinkServer's), for the advertisement of a tablet with pairing open. */
+    @Volatile private var pairingPort = 0
+
+    /** The tablet's address advertised over Bluetooth LE, for the PCs that have no session. */
+    @Volatile var ble: io.github.gabrielesantangelo.plusone.link.BleAnnouncer? = null
+        private set
     /** Both links' announcers: announced again as their tags change (announce()). */
     private val announcers = java.util.concurrent.CopyOnWriteArrayList<MdnsAnnouncer>()
     private var announced: Pair<Long, Boolean>? = null  // the tags' epoch, pairing open: as last announced
@@ -43,6 +50,7 @@ class CompanionService : Service(), LinkServer.Host {
     private val pairedChanged = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         link?.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         announce(force = true)
+        ble?.refresh()
     }
 
     /** The announcements again when what they say changed: a quarter of an
@@ -53,6 +61,7 @@ class CompanionService : Service(), LinkServer.Host {
         if (!force && now == announced) return
         announced = now
         for (announcer in announcers) announcer.refresh()
+        ble?.refresh()  // the quarter of an hour turned, or Bluetooth allowed or on since
     }
 
     private fun announceCheck() {
@@ -91,7 +100,8 @@ class CompanionService : Service(), LinkServer.Host {
             host = this,
             // How the PCs reach the app, and learn where: another way is one more here.
             listeners = listOf(TcpListener()),
-            announcers = listOf(MdnsAnnouncer(this, pairing = Pairing::windowOpen).also { announcers += it }))
+            announcers = listOf(MdnsAnnouncer(this, pairing = Pairing::windowOpen).also { announcers += it },
+                io.github.gabrielesantangelo.plusone.link.PairingPortAnnouncer { pairingPort = it; ble?.refresh() }))
             .also { it.start() }
         startLink(sign, update)
         handler.postDelayed(::idleCheck, IDLE_CHECK)
@@ -110,7 +120,7 @@ class CompanionService : Service(), LinkServer.Host {
             return
         }
         link = core
-        core.onEvent = { LinkStatus.event(it) }
+        core.onEvent = { LinkStatus.event(it); ble?.event(it) }
         LinkStatus.listen(pathChanged)
         core.setPaired(io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
         PcOptions.adoptPaired(this, io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys)
@@ -143,6 +153,16 @@ class CompanionService : Service(), LinkServer.Host {
                     pairing = Pairing::windowOpen)
                     .also { announcers += it; it.announce("tcp", port, id, deviceName(this), appVersion()) }
                 Log.i(TAG, "link: listening on $port")
+                // Where the PCs may dial it, told over any session (a cable's too) and, for
+                // those with no session, advertised over Bluetooth LE.
+                val announcer = io.github.gabrielesantangelo.plusone.link.BleAnnouncer(this, id,
+                    paired = { io.github.gabrielesantangelo.plusone.link.Paired.all(this).keys },
+                    pairing = Pairing::windowOpen, name = { deviceName(this) }, pairingPort = { pairingPort })
+                ble = announcer
+                announcer.connected(core.devices().filter { !it.isNull("path") }.map { it.getString("id") }.toSet())
+                announcer.listening(port)
+                networks = io.github.gabrielesantangelo.plusone.link.NetworkWatch(this, core) { announcer.addresses(it) }
+                    .also { it.start() }
             } catch (e: Exception) {
                 Log.w(TAG, "link: cannot listen: $e")
             }
@@ -183,6 +203,8 @@ class CompanionService : Service(), LinkServer.Host {
         server?.stop()
         getSharedPreferences("paired", MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(pairedChanged)
         linkAnnouncer?.stop()
+        networks?.stop()
+        ble?.stop()
         bluetooth?.stop()
         link?.close()
         LinkStatus.unlisten(pathChanged)

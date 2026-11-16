@@ -42,6 +42,9 @@ pub enum Event {
     Path(Arc<Session>, PathInfo),
     /// A device's session over: (its fingerprint, why).
     Gone(String, String),
+    /// The device said where it can be reached, or that it moved to other
+    /// networks (session.addresses()).
+    Net(Arc<Session>),
 }
 
 pub(crate) struct NodeInner {
@@ -54,6 +57,11 @@ pub(crate) struct NodeInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     events: Mutex<Option<Arc<dyn Fn(Event) + Send + Sync>>>,
     listeners: Mutex<Vec<TcpListener>>,
+    /// The port the first listener took (0: none), where the other side
+    /// dials us at the addresses we tell it (set_addresses).
+    port: std::sync::atomic::AtomicU16,
+    /// The addresses of the networks we are on now, told to every session.
+    addresses: Mutex<Vec<std::net::IpAddr>>,
     /// Who may start a handshake, by TCP or QUIC (gate.rs).
     gate: Arc<crate::gate::Gate>,
     /// QUIC's endpoint: the listening one, or one to dial from.
@@ -136,6 +144,19 @@ impl NodeInner {
 
     pub(crate) fn moved(&self, session: &Arc<Session>) {
         self.event(Event::Moved(session.clone()));
+    }
+
+    pub(crate) fn network(&self, session: &Arc<Session>) {
+        self.event(Event::Net(session.clone()));
+    }
+
+    /// Our addresses told to a session (none until a listener and addresses are set).
+    fn tell_addresses(&self, session: &Session) {
+        let port = self.port.load(Ordering::SeqCst);
+        let addresses = self.addresses.lock().unwrap().clone();
+        if port != 0 && !addresses.is_empty() {
+            session.our_addresses(port, &addresses);
+        }
     }
 
     pub(crate) fn budget(&self, session: &Arc<Session>, rate: u64) {
@@ -243,6 +264,7 @@ impl NodeInner {
         }
         // Served since the hello went (the session was not among them yet).
         session.our_features(self.features());
+        self.tell_addresses(&session);
         if let Some(before) = before {
             before.close();
         }
@@ -287,6 +309,8 @@ impl Node {
             sessions: Mutex::default(),
             events: Mutex::default(),
             listeners: Mutex::default(),
+            port: std::sync::atomic::AtomicU16::new(0),
+            addresses: Mutex::default(),
             gate: crate::gate::Gate::new(),
             quic: Mutex::default(),
             quic_port: std::sync::atomic::AtomicU16::new(0),
@@ -308,6 +332,26 @@ impl Node {
     pub fn unserve(&self, feature: &str) {
         if self.0.served.lock().unwrap().remove(feature).is_some() {
             self.0.features_changed();
+        }
+    }
+
+    /// The addresses of the networks we are on (the app's Wi-Fi and
+    /// Ethernet, not the mobile network), where the devices we are paired
+    /// with may dial us on the port we listen on: told to every session up
+    /// and to each that comes, over whatever path it is on. A device that
+    /// is reached by a cable then has the Wi-Fi's address for when the
+    /// cable is out, where mDNS does not go. Told again as they change.
+    pub fn set_addresses(&self, addresses: Vec<std::net::IpAddr>) {
+        {
+            let mut ours = self.0.addresses.lock().unwrap();
+            if *ours == addresses {
+                return;
+            }
+            *ours = addresses;
+        }  // not held while the sessions are: no lock taken in the other order anywhere, and none should be
+        let sessions: Vec<_> = self.0.sessions.lock().unwrap().values().cloned().collect();
+        for session in sessions {
+            self.0.tell_addresses(&session);
         }
     }
 
@@ -339,6 +383,7 @@ impl Node {
         let listener = TcpListener::bind(address)?;
         let bound = listener.local_addr()?;
         self.0.listeners.lock().unwrap().push(listener.try_clone()?);
+        let _ = self.0.port.compare_exchange(0, bound.port(), Ordering::SeqCst, Ordering::SeqCst);
         let node = self.0.clone();
         std::thread::Builder::new().name("link-listen".into()).spawn(move || {
             for tcp in listener.incoming() {
