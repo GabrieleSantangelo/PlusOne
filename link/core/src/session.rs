@@ -102,6 +102,9 @@ const UDP_PROBE: Duration = Duration::from_millis(200);
 /// second, and a tenth of what the path's controller allows: more goes on
 /// QUIC's datagrams, under its window. (The side socket is outside the
 /// controller; this keeps it a small, bounded part of the load.)
+/// What a Bluetooth reserve may hold of sound waiting for the session's
+/// thread (steer_audio; late is lost).
+const SIDE_MOST: usize = 8 << 10;
 const RAW_MAX: usize = 512;
 const RAW_RATE: f64 = 128_000.0;
 const RAW_BURST: f64 = 16_384.0;
@@ -593,6 +596,10 @@ struct Path {
     /// A QUIC path's side socket (udp): a pong's time on it (0: none yet);
     /// small realtime goes on it only while it is proven, else on QUIC's
     /// datagrams, and what it may carry is bounded (raw_room).
+    /// Frames for this path's stream that did not come from the outbox
+    /// (the carrier's): a reserve's, which the session's thread writes
+    /// ahead of its pings (steer_audio); bounded, the oldest dropped.
+    side: Mutex<Vec<u8>>,
     raw_us: AtomicU64,
     raw_bucket: Mutex<(f64, Instant)>,
     /// Not the session's path any more (lost, or a better one took over;
@@ -1019,6 +1026,8 @@ pub struct Session {
     /// Every path the session's thread drives now, the carrier first (it
     /// alone with a peer from before): Session::paths, adopt()'s choice.
     live: Mutex<Vec<Arc<Path>>>,
+    /// Sound on a Bluetooth reserve when there is one (steer_audio).
+    audio_bt: bool,
     /// The other side keeps several paths ("paths": 1 in its hello).
     multipath: bool,
     /// With a peer from before: the path that takes over next.
@@ -1256,7 +1265,7 @@ fn prepare(established: &mut Established, id: u32) -> io::Result<Arc<Path>> {
                        udp_peer: Mutex::new(established.udp_peer), quic, transport,
                        started: Instant::now(), heard_us: AtomicU64::new(1),
                        proven_us: AtomicU64::new(0), rtt_us: AtomicU64::new(0), realtime_us: AtomicU64::new(0),
-                       raw_us: AtomicU64::new(0), raw_bucket: Mutex::new((RAW_BURST, Instant::now())),
+                       side: Mutex::new(Vec::new()), raw_us: AtomicU64::new(0), raw_bucket: Mutex::new((RAW_BURST, Instant::now())),
                        gone: AtomicBool::new(false), leaving: AtomicBool::new(false), ended: AtomicBool::new(false),
                        state: AtomicU8::new(PathState::Active as u8), budget: AtomicU64::new(budget),
                        drained: AtomicBool::new(false), prior: budget }))
@@ -1311,6 +1320,7 @@ impl Session {
             wake: Wake::new()?,
             path: Mutex::default(),
             live: Mutex::default(),
+            audio_bt: std::env::var_os("PLUSONE_LINK_AUDIO_BT").is_none_or(|v| v != "0"),
             // Ours says it too (NodeInner::hello).
             multipath: hello["paths"].as_u64() == Some(1),
             arriving: Mutex::default(),
@@ -1672,6 +1682,7 @@ impl Session {
                         me.queue_reliable(frame::MESSAGE, end.id, &buf[..length])
                     }
                     Class::Video => me.send_grouped(end.id, &buf[..length], &mut sealed, &mut went),
+                    Class::Realtime if me.steer_audio(end.id, &buf[..length]) => {}
                     _ => me.send_datagram(end.id, &buf[..length], &mut sealed),
                 }
             }
@@ -2461,6 +2472,13 @@ impl Session {
         }
         for (index, live) in lives.iter_mut().enumerate() {
             (live.blocked, live.took) = (false, false);
+            if index > 0 {
+                let side = std::mem::take(&mut *live.path.side.lock().unwrap());
+                if !side.is_empty() && live.conn.writer().write_all(&side).is_err() {
+                    lost.push((index, Lost::Failed("a write to the stream".to_owned())));
+                    continue;
+                }
+            }
             while live.conn.wants_write() {
                 match live.conn.write_tls(&mut live.stream) {
                     Ok(written) => {
@@ -2829,6 +2847,30 @@ impl Session {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Sound (a Realtime channel's datagram) on a Bluetooth reserve while
+    /// one is up (Standby: Suspect once it is not heard), so the Wi-Fi's queue (the video's) is not
+    /// the sound's, nor the sound the video's: its frame on that path's
+    /// stream at the session thread's next round (false: no such path, it
+    /// goes on the carrier as before). PLUSONE_LINK_AUDIO_BT=0: never.
+    fn steer_audio(&self, channel: u16, body: &[u8]) -> bool {
+        if !self.audio_bt || body.len() > 1024 {
+            return false;
+        }
+        let Some(path) = self.live.lock().unwrap().iter()
+            .find(|path| path.kind == "bt" && path.state() == PathState::Standby).cloned() else { return false };
+        {
+            let mut side = path.side.lock().unwrap();
+            if side.len() > SIDE_MOST {
+                side.clear();  // what waited is late: lost
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            frame::encode(frame::DATAGRAM, channel, body, &mut side);
+        }
+        path.realtime_us.store(path.us().max(1), Ordering::Relaxed);
+        self.wake.wake();
+        true
     }
 
     fn send_datagram_now(&self, path: &Path, channel: u16, body: &[u8], sealed: &mut Vec<u8>) {
@@ -3523,6 +3565,41 @@ mod tests {
             }
             devices.pc.close();
         }
+    }
+
+    #[test]
+    fn sound_goes_on_a_bluetooth_reserve_while_there_is_one() {
+        // A session on USB with Bluetooth kept as a reserve: a sound's
+        // datagram goes on the reserve's stream (the frame the tablet reads
+        // there); with no reserve, it stays the carrier's to send.
+        let _one = one_at_a_time();
+        let devices = devices();
+        let (session, bt) = devices.by_stream(json!({"paths": 1}), None, "bt");
+        let bt = pinging(bt);
+        let (again, usb) = devices.by_stream(json!({"paths": 1}), Some((session.id.clone(), false)), "usb");
+        assert!(Arc::ptr_eq(&again, &session));
+        let (stop_usb, usb) = pinging(usb);
+        until("on usb", Duration::from_secs(5), || session.path().as_deref() == Some("usb"));
+        until("bt standby", Duration::from_secs(2), || {
+            session.paths().iter().any(|path| path.kind == "bt" && path.state.name() == "standby")
+        });
+        drop(bt.0);
+        let (mut bt, _) = bt.1.join().unwrap();
+        bt.send(frame::PING, 0, &0u64.to_be_bytes());
+        assert!(session.steer_audio(7, b"sound"), "no reserve for the sound");
+        bt.stream.set_timeouts(Some(Duration::from_secs(3))).unwrap();
+        let got = loop {
+            let Some((kind, channel, body)) = read_frame(&mut bt.conn, &mut bt.stream, &mut bt.decoder).unwrap()
+            else { continue };
+            if kind == frame::DATAGRAM {
+                break (channel, body);
+            }
+        };
+        assert_eq!(got, (7, b"sound".to_vec()));
+        drop(stop_usb);
+        let (usb, _) = usb.join().unwrap();
+        usb.stream.shutdown();
+        devices.pc.close();
     }
 
     #[test]
