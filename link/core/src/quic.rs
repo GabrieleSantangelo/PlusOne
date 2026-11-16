@@ -49,6 +49,9 @@ const LOCAL_MTU: u16 = 1452;
 /// one's messages wait this long for it on the other side, or two round
 /// trips: groups.rs).
 pub(crate) const LATE: Duration = Duration::from_millis(100);
+/// The queue the groups may hold past the path's round trip before the
+/// application is told it is behind (queued()).
+const QUEUE_OK: Duration = Duration::from_millis(20);
 const DATAGRAM_SEND_BUFFER: usize = 512 << 10;
 /// What quinn takes from the session's stream before it is acknowledged,
 /// at first (about a fast path's bandwidth-delay product); then the
@@ -248,7 +251,22 @@ impl Quic {
     /// The datagrams handed to quinn and not sent yet, and the groups'
     /// messages not yet on their streams (bytes).
     pub(crate) fn queued(&self) -> usize {
-        self.idle.saturating_sub(self.conn.datagram_send_buffer_space()) + self.groups.queued()
+        self.idle.saturating_sub(self.conn.datagram_send_buffer_space()) + self.groups.queued() + self.group_backlog()
+    }
+
+    /// The groups' bytes written to quinn and not acknowledged, past what the
+    /// path carries in its least round trip (and QUEUE_OK): in its send
+    /// buffer, in the router's queue. Groups never wait for quinn's window
+    /// (groups.rs), so without this the application saw no backlog on QUIC,
+    /// and left out no frame, asked no keyframe to wait, however deep it was.
+    fn group_backlog(&self) -> usize {
+        let rate = self.cc.rate.load(Ordering::Relaxed) as f64;
+        let base = match self.cc.losses.base_rtt_us.load(Ordering::Relaxed) {
+            0 => self.conn.rtt(),
+            us => Duration::from_micros(us),
+        };
+        let carried = (rate * (base + QUEUE_OK).as_secs_f64()) as u64;
+        self.groups.shared.unacked().saturating_sub(carried) as usize
     }
 
     /// Video's groups on streams, and the session's messages on one of
@@ -796,13 +814,31 @@ mod tests {
         let stats = quic.group_stats();
         assert_eq!((stats.groups, stats.late, stats.dropped, stats.stream_bytes), (1, 0, 0, 200 * 1006));
         assert_eq!(quic.conn.stats().frame_tx.datagram, 0, "a group's message as a datagram");
-        assert_eq!(quic.queued(), 0);
-        // All acknowledged: no room held for it in quinn's send window.
+        // All acknowledged: no room held for it in quinn's send window, and no backlog.
         let started = Instant::now();
         while quic.groups.shared.unacked() > 0 {
             assert!(started.elapsed() < Duration::from_secs(3), "{} bytes held", quic.groups.shared.unacked());
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert_eq!(quic.queued(), 0);
+    }
+
+    #[test]
+    fn what_the_groups_hold_past_the_rates_round_trip_is_queued() {
+        let (_stream, mut quic, _theirs, far) = dialed();
+        let _got = read(&far);
+        quic.set_streams(true, false);
+        // 100 KB/s: a round trip and QUEUE_OK carry a few KB of 200.
+        quic.cc.rate.store(100_000, Ordering::Relaxed);
+        for i in 0..200u32 {
+            let message = [&i.to_be_bytes()[..], &[7u8; 1000]].concat();
+            assert!(quic.send_in_group(5, 1, false, i == 199, &message));
+        }
+        let started = Instant::now();
+        while quic.queued() < 100_000 && started.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(quic.queued() >= 100_000, "{} queued of 200 KB held at 100 KB/s", quic.queued());
     }
 
     /// What comes on got within wait of each other, until none does.

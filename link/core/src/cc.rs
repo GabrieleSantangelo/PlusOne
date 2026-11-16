@@ -124,6 +124,9 @@ pub struct Losses {
     pub lost: AtomicU64,
     pub after_cut: AtomicU64,
     pub cuts: AtomicU64,
+    /// The path's least round trip over BASE (µs; 0 before one is known),
+    /// as the controller last read it: what a queue is counted against.
+    pub base_rtt_us: AtomicU64,
 }
 
 impl Default for CcConfig {
@@ -723,6 +726,9 @@ impl Gcc {
             self.loss_window = now;
         }
         self.control(now, app_limited);
+        if let Some(base) = self.samples.iter().map(|(_, rtt)| *rtt).min() {
+            self.losses.base_rtt_us.store(base.as_micros() as u64, Ordering::Relaxed);
+        }
         self.out.store(self.rate as u64, Ordering::Relaxed);
         self.publish(now);
         if tracing() && now.duration_since(self.traced) >= TRACE_EVERY {
