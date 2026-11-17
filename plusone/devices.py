@@ -15,6 +15,7 @@ import glob
 import itertools
 import json
 import os
+import re
 import secrets
 import shutil
 import struct
@@ -729,7 +730,12 @@ class AudioDevice(Device):
             return  # switched off, or PipeWire went (the links' watch handles that)
         if "sink-input" in line and self.links:
             self._look_again()
+        if (on_event := getattr(self, "_on_event", None)) is not None:
+            on_event(line)
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._event, pauses)
+
+    def _on_event(self, line):
+        """Each line pactl subscribe says (the sink's own changes among them)."""
 
     def _look_again(self):
         """Who uses it, now and once more a moment later: a stream played
@@ -1017,6 +1023,7 @@ class Speakers(AudioDevice):
 
     def __init__(self, app):
         super().__init__(app, "speakers")
+        self._pinned = False
         self.bluetooth = BluetoothAudio(lambda: (self.app.tablets.active() or types.SimpleNamespace(name=None)).name)
 
     # The output the user picked, across Plus One's restarts (an update's):
@@ -1024,9 +1031,33 @@ class Speakers(AudioDevice):
     # (earbuds, say) and stayed there.
     WAS_OUTPUT = os.path.join(GLib.get_user_state_dir(), "plus-one", "speakers-were-the-output")
 
+    def _on_event(self, line):
+        # The sink changed (its volume turned down at the PC's keys, say): full again.
+        if self.module and "'change' on sink #" in line:
+            GLib.idle_add(once(self.pin_volume))
+
+    def pin_volume(self):
+        """The sink at full volume, always: the volume is the tablet's to set.
+        What the PC lowers here lowers only what is sent (24 % was -37 dB: a
+        signal of 8 bits, whose quiet packets the tablet took for silence and
+        left out, heard as the sound going up and down)."""
+        try:
+            volume = subprocess.run(["pactl", "get-sink-volume", SPEAKERS_NAME], capture_output=True, text=True,
+                                    timeout=5).stdout
+            levels = re.findall(r"(\d+)%", volume)
+            if levels and any(int(level) != 100 for level in levels):
+                subprocess.run(["pactl", "set-sink-volume", SPEAKERS_NAME, "100%"], capture_output=True, timeout=5)
+            muted = subprocess.run(["pactl", "get-sink-mute", SPEAKERS_NAME], capture_output=True, text=True,
+                                   timeout=5).stdout
+            if "yes" in muted.lower() or "sì" in muted.lower():
+                subprocess.run(["pactl", "set-sink-mute", SPEAKERS_NAME, "0"], capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as e:
+            log("speakers: its volume not set:", repr(e))
+
     def enable(self):
         super().enable()
         if self.module:
+            self.pin_volume()
             self.bluetooth.hold()
             if os.path.exists(self.WAS_OUTPUT):
                 make_default_sink(SPEAKERS_NAME)

@@ -437,6 +437,6 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
         const val OVER_MS = 100          // over the cushion: far over it...
         const val OVER_FOR_MS = 1000     // ...for this long: skipped
         const val HELD_SMOOTHING_MS = 500.0  // the wait smoothed over about this long
-        const val QUIET = 330            // of 32767: -40 dBFS
+        const val QUIET = 40             // of 32767: -58 dBFS, silence and its noise (330, -40, took a source at 24 % of the volume for silence)
     }
 }
