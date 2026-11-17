@@ -36,8 +36,10 @@ from .link import Datagrams
 PCM = 7                  # the packets' kind (after appdisplay's)
 OPUS = 8                 # the same 5 ms, in Opus
 OPUS_KBPS = 160
-OPUS_UNDER = 8000        # kbit/s of the link's budget: PCM would be a fifth of it and more
-PCM_OVER = 12000         # kbit/s...
+OPUS_UNDER = 3000        # kbit/s of the link's budget: PCM (1.5 Mbit/s) would be half of it and more. (8000: a
+                         # still screen leaves the rate at its start, 10 Mbit/s, and each cut a Wi-Fi's stall
+                         # made took the sound to Opus and back, heard as it going up and down.)
+PCM_OVER = 5000          # kbit/s...
 PCM_AFTER = 10.0         # ...held this long (s): PCM again
 STATS = 5                # the app's report (appdisplay.STATS's number, its own layout)
 RATE, CHANNELS = 48000, 2

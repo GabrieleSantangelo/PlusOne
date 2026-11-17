@@ -110,7 +110,7 @@ def until(condition, seconds=5):
 
 
 def test_under_a_low_budget_the_sound_goes_in_opus_and_as_it_is_again_after():
-    sender, sent, watched = opus_sender(["pcm", "opus"], 5000)
+    sender, sent, watched = opus_sender(["pcm", "opus"], 2000)
     try:
         assert sender.codec == "opus" and watched == [sender.follow]
         until(lambda: len(sent) >= 40)
@@ -129,7 +129,7 @@ def test_under_a_low_budget_the_sound_goes_in_opus_and_as_it_is_again_after():
         numbers = [pcm.HEADER.unpack_from(body)[1] for body in sent]
         assert numbers == list(range(numbers[0], numbers[0] + len(numbers)))  # one count, whatever the codec
         # Down again: Opus at once.
-        sender.follow(4000)
+        sender.follow(2000)
         assert sender.codec == "opus"
     finally:
         sender.close()
