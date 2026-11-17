@@ -81,6 +81,7 @@ const PROBE_AFTER: Duration = Duration::from_secs(2);
 /// video and the sound (Opus under 8 Mbit/s) followed it down; the first
 /// overuse, once the screen moves, cuts what was not true.
 const IDLE_GROWTH: f64 = 1.3;
+const IDLE_CEILING: f64 = 1.25;
 const PEAK_DECAY: f64 = 0.9;
 const MIN_RATE: f64 = 30_000.0;     // bytes a second
 const START_RATE: f64 = 1_250_000.0; // 10 Mbit/s
@@ -623,7 +624,7 @@ impl Gcc {
             // Sending less than allowed, and no overuse for a while: up, to
             // what the path has shown it carries twice, never past.
             State::Increase if app_limited && now.duration_since(self.last_over) > PROBE_AFTER => {
-                let ceiling = (2.0 * self.peak).max(START_RATE);
+                let ceiling = (IDLE_CEILING * self.peak).max(START_RATE);
                 if self.rate < ceiling {
                     self.rate = (self.rate * IDLE_GROWTH.powf(since.min(1.0))).min(ceiling);
                 }

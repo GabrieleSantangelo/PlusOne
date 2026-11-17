@@ -25,11 +25,11 @@ pub(crate) enum Choice {
 pub(crate) const NAMES: [&str; 6] = ["gcc", "gcc-l23", "copa", "c4", "bbr", "cubic"];
 
 impl Choice {
-    /// The controller named (none: gcc) with its tunables as text
+    /// The controller named (none: gcc-l23) with its tunables as text
     /// ("key=value,..."), and what was refused, a line each.
     pub(crate) fn parse(name: Option<&str>, params: Option<&str>) -> (Choice, Vec<String>) {
         let mut notes = Vec::new();
-        let name = name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or("gcc").to_ascii_lowercase();
+        let name = name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or("gcc-l23").to_ascii_lowercase();
         let mut choice = match name.as_str() {
             "gcc" => Choice::Gcc(GccParams::default()),
             "gcc-l23" => Choice::Gcc(GccParams { l23: true, ..GccParams::default() }),
@@ -38,8 +38,8 @@ impl Choice {
             "bbr" => Choice::Bbr,
             "cubic" => Choice::Cubic,
             other => {
-                notes.push(format!("PLUSONE_LINK_CC: \"{other}\" is none of {}: gcc", NAMES.join(", ")));
-                Choice::Gcc(GccParams::default())
+                notes.push(format!("PLUSONE_LINK_CC: \"{other}\" is none of {}: gcc-l23", NAMES.join(", ")));
+                Choice::Gcc(GccParams { l23: true, ..GccParams::default() })
             }
         };
         for pair in params.unwrap_or("").split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -150,14 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn none_or_unknown_is_gcc_as_it_was() {
-        assert_eq!(Choice::parse(None, None), (Choice::Gcc(GccParams::default()), vec![]));
-        assert_eq!(Choice::parse(Some(" "), None).0, Choice::Gcc(GccParams::default()));
+    fn none_or_unknown_is_gcc_l23() {
+        assert_eq!(Choice::parse(None, None), (Choice::Gcc(GccParams { l23: true, ..GccParams::default() }), vec![]));
+        let l23 = || Choice::Gcc(GccParams { l23: true, ..GccParams::default() });
+        assert_eq!(Choice::parse(Some(" "), None).0, l23());
         assert_eq!(Choice::parse(Some("GCC-L23"), None).0.name(), "gcc-l23");
         let (choice, notes) = Choice::parse(Some("reno"), None);
-        assert_eq!(choice, Choice::Gcc(GccParams::default()));
+        assert_eq!(choice, l23());
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("\"reno\"") && notes[0].ends_with(": gcc"), "{}", notes[0]);
+        assert!(notes[0].contains("\"reno\"") && notes[0].ends_with(": gcc-l23"), "{}", notes[0]);
     }
 
     #[test]
@@ -184,7 +185,7 @@ mod tests {
         // What does not hold together: both back.
         let (choice, notes) = Choice::parse(None, Some("threshold_min=50,threshold_max=20"));
         assert_eq!(notes.len(), 1, "{notes:?}");
-        assert_eq!(choice, Choice::Gcc(GccParams::default()));
+        assert_eq!(choice, Choice::Gcc(GccParams { l23: true, ..GccParams::default() }));
         // References take none; Copa its delta.
         let (choice, notes) = Choice::parse(Some("bbr"), Some("delta=0.2"));
         assert_eq!((choice, notes.len()), (Choice::Bbr, 1));
