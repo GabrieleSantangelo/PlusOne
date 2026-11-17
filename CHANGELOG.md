@@ -17,9 +17,9 @@
   512 bytes go on a UDP socket of their own beside the QUIC connection (proven
   apart by pings, at most 128 KB/s and a tenth of the controller's rate, QUIC's
   datagrams otherwise; `PLUSONE_LINK_RAW=0` turns it off), so they never wait
-  behind the video's window. A group's deadline and the bulk's window follow
-  the path's least round trip, not the smoothed one that holds the queue; a
-  keyframe is asked again after three round trips.
+  behind the video's window. The bulk's window follows the path's least round
+  trip, not the smoothed one that holds the queue; a keyframe is asked again
+  after three round trips.
 - **The rate recovers on a still screen**: with the application sending less
   than the rate and no overuse for 2 s, the rate goes up 30 % a second (to
   twice what was acknowledged lately, 10 Mbit/s at least), where jitter's cut
