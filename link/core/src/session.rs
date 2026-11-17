@@ -2190,8 +2190,13 @@ impl Session {
     /// being let go of).
     fn best_reserve(&self, paths: &Paths, carrier_lost: bool) -> Option<usize> {
         paths.lives.iter().enumerate().skip(if carrier_lost { 0 } else { 1 })
+            // (A Bluetooth reserve is the sound's, not the screen's: a Wi-Fi stall of a
+            // second and a half moved the whole session to it, the screen on 0.9 Mbit/s,
+            // until the Wi-Fi had been heard HYSTERESIS. It carries only when the carrier
+            // is lost: then any is better than none.)
             .filter(|(_, live)| carrier_lost || (live.leaving.is_none() && live.suspect_since.is_none()
-                                                 && live.path.silent() < RESERVE_HEARD.as_micros() as u64))
+                                                 && live.path.silent() < RESERVE_HEARD.as_micros() as u64
+                                                 && !(self.audio_bt && live.path.kind == "bt")))
             .max_by_key(|(_, live)| (live.leaving.is_none(), live.suspect_since.is_none(), !paths.held(&live.path.kind),
                                      live.path.rank()))
             .map(|(index, _)| index)
