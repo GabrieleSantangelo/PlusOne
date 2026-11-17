@@ -531,6 +531,16 @@ impl Node {
     }
 }
 
+/// A QUIC path's stream with the IP under it: the session's side socket
+/// for small realtime datagrams (session.rs) goes to the same host.
+/// PLUSONE_LINK_RAW=0: none (a live A/B).
+fn addressed(stream: std::os::unix::net::UnixStream, quic: &crate::quic::Quic) -> Box<dyn Stream> {
+    if std::env::var_os("PLUSONE_LINK_RAW").is_some_and(|v| v == "0") {
+        return Box::new(stream);
+    }
+    Box::new(crate::stream::Addressed::new(stream, quic.peer_ip()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,14 +665,4 @@ mod tests {
         pc.close();
         tablet.close();
     }
-}
-
-/// A QUIC path's stream with the IP under it: the session's side socket
-/// for small realtime datagrams (session.rs) goes to the same host.
-/// PLUSONE_LINK_RAW=0: none (a live A/B).
-fn addressed(stream: std::os::unix::net::UnixStream, quic: &crate::quic::Quic) -> Box<dyn Stream> {
-    if std::env::var_os("PLUSONE_LINK_RAW").is_some_and(|v| v == "0") {
-        return Box::new(stream);
-    }
-    Box::new(crate::stream::Addressed::new(stream, quic.peer_ip()))
 }

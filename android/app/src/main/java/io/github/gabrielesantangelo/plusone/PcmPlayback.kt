@@ -59,8 +59,8 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
     private var underrunsSeen = 0  // the track's underruns the player knows of
     private var held = counts.prefill.toDouble()  // packets waiting, smoothed
     // The player's thread's: the cushion a stall asked for, and what the wait is brought to.
-    private var target = counts.prefill
-    private var aim = counts.prefill
+    @Volatile private var target = counts.prefill  // (the receiving thread sets them too: longPath)
+    @Volatile private var aim = counts.prefill
     private var underrunsBefore = 0  // the track's count at the last report
     private var lastStall = -CALM_MS  // uptime ms of the last stall that held packets back
     private val track = AudioTrack.Builder()

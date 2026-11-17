@@ -44,9 +44,11 @@ OPUS_UNDER = 3000        # kbit/s of the link's budget: PCM (1.5 Mbit/s) would b
                          # still screen leaves the rate at its start, 10 Mbit/s, and each cut a Wi-Fi's stall
                          # made took the sound to Opus and back, heard as it going up and down.)
 PCM_OVER = 5000          # kbit/s...
-# The sound on a Bluetooth reserve when there is one (PLUSONE_AUDIO_BT=0: never), looked for each so often (s).
-BLUETOOTH_AUDIO = os.environ.get("PLUSONE_AUDIO_BT", "1").strip() != "0"
-BLUETOOTH_EVERY = 2.0
+# The sound on a Bluetooth reserve (PLUSONE_AUDIO_BT=1, with plus-one-link's PLUSONE_LINK_AUDIO_BT=1): off
+# by default (measured, RFCOMM hands the sound over in bursts: more gaps than the Wi-Fi's, with a 200 ms
+# cushion too), looked for each so often (s).
+BLUETOOTH_AUDIO = os.environ.get("PLUSONE_AUDIO_BT", "0").strip() == "1"
+BLUETOOTH_EVERY = 5.0
 PCM_AFTER = 10.0         # ...held this long (s): PCM again
 STATS = 5                # the app's report (appdisplay.STATS's number, its own layout)
 RATE, CHANNELS = 48000, 2

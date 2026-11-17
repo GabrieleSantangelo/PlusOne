@@ -95,19 +95,19 @@ const RESERVE_HEARD: Duration = Duration::from_millis(1200);
 const UDP_PROOF: Duration = Duration::from_secs(3);
 /// While UDP is not proven yet, a ping this often (the first ones sooner).
 const UDP_PROBE: Duration = Duration::from_millis(200);
-/// No room in the UDP socket: this long for some, then the packet is lost
-/// (a keyframe's tail where the system caps the socket's room).
 /// A QUIC path's side socket carries the datagrams up to this long
 /// (input, pen, audio's frames: a few hundred bytes), at most this much a
 /// second, and a tenth of what the path's controller allows: more goes on
 /// QUIC's datagrams, under its window. (The side socket is outside the
 /// controller; this keeps it a small, bounded part of the load.)
-/// What a Bluetooth reserve may hold of sound waiting for the session's
-/// thread (steer_audio; late is lost).
-const SIDE_MOST: usize = 8 << 10;
 const RAW_MAX: usize = 512;
 const RAW_RATE: f64 = 128_000.0;
 const RAW_BURST: f64 = 16_384.0;
+/// What a Bluetooth reserve may hold of sound waiting for the session's
+/// thread (steer_audio; late is lost).
+const SIDE_MOST: usize = 8 << 10;
+/// No room in the UDP socket: this long for some, then the packet is lost
+/// (a keyframe's tail where the system caps the socket's room).
 const UDP_STALL: Duration = Duration::from_millis(20);
 /// Each read and write of a connection's handshake and hellos waits this
 /// long at most, and the whole of them HANDSHAKE_WHOLE (a host that
@@ -593,13 +593,13 @@ struct Path {
     proven_us: AtomicU64,  // a pong's (0: none yet)
     rtt_us: AtomicU64,
     realtime_us: AtomicU64,  // since started: the last realtime or input datagram sent (0: none)
-    /// A QUIC path's side socket (udp): a pong's time on it (0: none yet);
-    /// small realtime goes on it only while it is proven, else on QUIC's
-    /// datagrams, and what it may carry is bounded (raw_room).
     /// Frames for this path's stream that did not come from the outbox
     /// (the carrier's): a reserve's, which the session's thread writes
     /// ahead of its pings (steer_audio); bounded, the oldest dropped.
     side: Mutex<Vec<u8>>,
+    /// A QUIC path's side socket (udp): a pong's time on it (0: none yet);
+    /// small realtime goes on it only while it is proven, else on QUIC's
+    /// datagrams, and what it may carry is bounded (raw_room).
     raw_us: AtomicU64,
     raw_bucket: Mutex<(f64, Instant)>,
     /// Not the session's path any more (lost, or a better one took over;
@@ -669,7 +669,7 @@ impl Path {
         if size > RAW_MAX || proven == 0 || self.us().saturating_sub(proven) >= UDP_PROOF.as_micros() as u64 {
             return false;
         }
-        let rate = RAW_RATE.min(quic.rate_now() as f64 / 10.0);
+        let rate = RAW_RATE.min(quic.rate() as f64 / 10.0);
         let mut bucket = self.raw_bucket.lock().unwrap();
         let now = Instant::now();
         bucket.0 = (bucket.0 + rate * now.duration_since(bucket.1).as_secs_f64()).min(RAW_BURST);
@@ -1060,8 +1060,9 @@ pub struct Session {
     /// Every path the session's thread drives now, the carrier first (it
     /// alone with a peer from before): Session::paths, adopt()'s choice.
     live: Mutex<Vec<Arc<Path>>>,
-    /// Sound on a Bluetooth reserve when there is one (steer_audio).
-    audio_bt: bool,
+    /// Sound on a Bluetooth reserve when there is one (steer_audio): off unless
+    /// PLUSONE_LINK_AUDIO_BT=1 (measured, the Wi-Fi's is the better road).
+    audio_bt: AtomicBool,
     /// The other side keeps several paths ("paths": 1 in its hello).
     multipath: bool,
     /// With a peer from before: the path that takes over next.
@@ -1355,7 +1356,7 @@ impl Session {
             wake: Wake::new()?,
             path: Mutex::default(),
             live: Mutex::default(),
-            audio_bt: std::env::var_os("PLUSONE_LINK_AUDIO_BT").is_none_or(|v| v != "0"),
+            audio_bt: AtomicBool::new(std::env::var_os("PLUSONE_LINK_AUDIO_BT").is_some_and(|v| v == "1")),
             // Ours says it too (NodeInner::hello).
             multipath: hello["paths"].as_u64() == Some(1),
             arriving: Mutex::default(),
@@ -2196,7 +2197,7 @@ impl Session {
             // is lost: then any is better than none.)
             .filter(|(_, live)| carrier_lost || (live.leaving.is_none() && live.suspect_since.is_none()
                                                  && live.path.silent() < RESERVE_HEARD.as_micros() as u64
-                                                 && !(self.audio_bt && live.path.kind == "bt")))
+                                                 && live.path.kind != "bt"))
             .max_by_key(|(_, live)| (live.leaving.is_none(), live.suspect_since.is_none(), !paths.held(&live.path.kind),
                                      live.path.rank()))
             .map(|(index, _)| index)
@@ -2527,8 +2528,10 @@ impl Session {
         }
         for (index, live) in lives.iter_mut().enumerate() {
             (live.blocked, live.took) = (false, false);
+            let side = std::mem::take(&mut *live.path.side.lock().unwrap());
             if index > 0 {
-                let side = std::mem::take(&mut *live.path.side.lock().unwrap());
+                // (The carrier's own sound goes with the outbox: what a reserve held when it took
+                // the carrier's place is late, left out.)
                 if !side.is_empty() && live.conn.writer().write_all(&side).is_err() {
                     lost.push((index, Lost::Failed("a write to the stream".to_owned())));
                     continue;
@@ -2917,9 +2920,9 @@ impl Session {
     /// one is up (Standby: Suspect once it is not heard), so the Wi-Fi's queue (the video's) is not
     /// the sound's, nor the sound the video's: its frame on that path's
     /// stream at the session thread's next round (false: no such path, it
-    /// goes on the carrier as before). PLUSONE_LINK_AUDIO_BT=0: never.
+    /// goes on the carrier as before). Only with PLUSONE_LINK_AUDIO_BT=1.
     fn steer_audio(&self, channel: u16, body: &[u8]) -> bool {
-        if !self.audio_bt || body.len() > 1024 {
+        if !self.audio_bt.load(Ordering::Relaxed) || body.len() > 1024 {
             return false;
         }
         let Some(path) = self.live.lock().unwrap().iter()
@@ -3639,6 +3642,7 @@ mod tests {
         let _one = one_at_a_time();
         let devices = devices();
         let (session, bt) = devices.by_stream(json!({"paths": 1}), None, "bt");
+        session.audio_bt.store(true, Ordering::Relaxed);
         let bt = pinging(bt);
         let (again, usb) = devices.by_stream(json!({"paths": 1}), Some((session.id.clone(), false)), "usb");
         assert!(Arc::ptr_eq(&again, &session));

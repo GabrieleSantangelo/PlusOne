@@ -2,6 +2,32 @@
 
 ## Unreleased (1.0)
 
+- **The speakers' sound at the PC's volume, but never a weak signal**: the
+  sink's volume (what the PC's keys set) was applied before the 16 bits, so at
+  24 % the tablet got a signal of 8 bits, whose quiet packets its player took
+  for silence and left out: the sound went up and down, and jumped after a
+  pause. Now the sound goes at full scale, the PC's volume goes to the tablet
+  as a gain (a packet each second) and the tablet plays its track at it, in
+  float; a packet counts as silence only under -58 dBFS (was -40).
+- **H.265 where both ends have it**: the display request offers the
+  codecs the PC's encoder makes (`PLUSONE_CODEC=h264` offers only H.264) and the
+  tablet's answer names the one it decodes: a third fewer bytes at the same
+  picture, so the keyframe after a stall is smaller.
+- **Small realtime beside QUIC's window**: input, pen and sound frames up to
+  512 bytes go on a UDP socket of their own beside the QUIC connection (proven
+  apart by pings, at most 128 KB/s and a tenth of the controller's rate, QUIC's
+  datagrams otherwise; `PLUSONE_LINK_RAW=0` turns it off), so they never wait
+  behind the video's window. A group's deadline and the bulk's window follow
+  the path's least round trip, not the smoothed one that holds the queue; a
+  keyframe is asked again after three round trips.
+- **The rate recovers on a still screen**: with the application sending less
+  than the rate and no overuse for 2 s, the rate goes up 30 % a second (to
+  twice what was acknowledged lately, 10 Mbit/s at least), where jitter's cut
+  kept it at 3 Mbit/s for good, and the sound (Opus under 3 Mbit/s now, PCM over 5) and
+  the video followed it down. A Bluetooth path never takes the carrier's place
+  while the carrier is only suspect (a Wi-Fi's stall moved the screen onto it);
+  `PLUSONE_AUDIO_BT=1` with `PLUSONE_LINK_AUDIO_BT=1` sends the sound over it
+  (off: RFCOMM's bursts gave more gaps than the Wi-Fi).
 - **The desktop's frames each on a stream of their own** (test build,
   `PLUSONE_LINK_VIDEO_STREAMS=0` turns it off): on QUIC a frame of the
   desktop goes on a QUIC stream of its own, what is lost of it sent again

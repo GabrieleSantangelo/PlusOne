@@ -253,12 +253,6 @@ impl Quic {
         self.conn.remote_address().ip()
     }
 
-    /// What the path carries now (bytes a second): the side socket's
-    /// datagrams stay a small part of it (session.rs raw_room).
-    pub(crate) fn rate_now(&self) -> u64 {
-        self.cc.rate.load(Ordering::Relaxed)
-    }
-
     /// Realtime went on it now, either way (input too): the endpoint's
     /// packets go as video (AF41) for a while (dscp.rs).
     pub(crate) fn realtime(&self) {

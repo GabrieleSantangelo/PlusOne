@@ -35,6 +35,7 @@ from .link import channels  # noqa: E402
 CAMERA_LABEL = "Plus One tablet camera"  # data/plus-one-camera-options.conf
 MIC_NAME = "plusone_mic"
 SPEAKERS_NAME = "plusone_speakers"
+VOLUME_AFTER = 150  # ms the sink's volume is quiet before its gain is read (Speakers._on_event)
 QUALITIES = {"720p": (1280, 720, 2_500_000), "1080p": (1920, 1080, 5_000_000)}
 FPS = 30
 AGAIN_AFTER_EVENT = 500  # ms: a stream's pause, play or link, looked at again (AudioDevice._look_again)
@@ -1024,6 +1025,7 @@ class Speakers(AudioDevice):
     def __init__(self, app):
         super().__init__(app, "speakers")
         self._sender_now = None  # the PcmSender made last (its gain, volume_changed)
+        self._volume_due = False
         self.bluetooth = BluetoothAudio(lambda: (self.app.tablets.active() or types.SimpleNamespace(name=None)).name)
 
     # The output the user picked, across Plus One's restarts (an update's):
@@ -1032,9 +1034,15 @@ class Speakers(AudioDevice):
     WAS_OUTPUT = os.path.join(GLib.get_user_state_dir(), "plus-one", "speakers-were-the-output")
 
     def _on_event(self, line):
-        # The sink changed (its volume turned at the PC's keys, say): its gain told again.
-        if self.module and "'change' on sink #" in line:
-            GLib.idle_add(once(self.volume_changed))
+        # The sink changed (its volume turned at the PC's keys, say): its gain told again,
+        # once the changes stop for a moment (a volume dragged says many).
+        if self.module and "'change' on sink #" in line and not self._volume_due:
+            self._volume_due = True
+            GLib.timeout_add(VOLUME_AFTER, once(self._volume_now))
+
+    def _volume_now(self):
+        self._volume_due = False
+        threading.Thread(target=self.volume_changed, daemon=True).start()  # (pactl: not on the main loop)
 
     @staticmethod
     def sink_gain():
