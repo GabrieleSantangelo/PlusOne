@@ -182,11 +182,11 @@ class PcmSender:
         self._tell_gain()
 
     def _tell_gain(self):
-        if not self._gain_known:
-            return
+        if not self._gain_known or not (self._over_link or self.peer):
+            return  # (not told yet where the app is: the next second's)
         try:
             self.channel.send(HEADER.pack(VOLUME, 0) + struct.pack("!f", self._gain))
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, TypeError):
             pass
 
     def _watch_bluetooth(self, budget):
