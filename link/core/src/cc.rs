@@ -73,6 +73,15 @@ const SMOOTHING: f64 = 0.9;
 const ACKED_WINDOW: Duration = Duration::from_millis(500);
 /// Clean this long with the window full: probe up fast again.
 const PROBE_AFTER: Duration = Duration::from_secs(2);
+/// The application sending less than the rate for PROBE_AFTER, with no
+/// overuse: the rate goes up all the same, by this much a second, to twice
+/// the most acknowledged lately (peak, PEAK_DECAY a second) or START_RATE,
+/// the more. A still screen sends 100 KB/s: with no way up the rate was
+/// left where a Wi-Fi's jitter had cut it (3 Mbit/s on a link of 30) and the
+/// video and the sound (Opus under 8 Mbit/s) followed it down; the first
+/// overuse, once the screen moves, cuts what was not true.
+const IDLE_GROWTH: f64 = 1.3;
+const PEAK_DECAY: f64 = 0.9;
 const MIN_RATE: f64 = 30_000.0;     // bytes a second
 const START_RATE: f64 = 1_250_000.0; // 10 Mbit/s
 const MIN_PACKETS: u64 = 4;
@@ -362,6 +371,11 @@ struct Gcc {
     acked_bytes: u64,  // the sum of acked's
     max_mean: Option<f64>,
     max_var: f64,
+    /// The most acknowledged lately (decaying: PEAK_DECAY a second), and
+    /// when it was told: what the path has shown it carries, for what a
+    /// still screen sends too little to show (the rate going up unseen).
+    peak: f64,
+    peak_at: Instant,
     last_change: Instant,
     lost: u64,
     acked_since: u64,
@@ -427,7 +441,7 @@ impl Gcc {
               last_ack: None, ack_gap: Duration::ZERO, released_until: None, held_until: None,
               previous: None, accumulated: 0.0, smoothed: 0.0, history: VecDeque::new(), deltas: 0, threshold,
               last_update: None, over_time: -1.0, over_count: 0, previous_trend: 0.0, signal: Signal::Normal,
-              acked: VecDeque::new(), acked_bytes: 0, max_mean: None, max_var: 0.4, last_change: now, lost: 0,
+              acked: VecDeque::new(), acked_bytes: 0, max_mean: None, max_var: 0.4, peak: 0.0, peak_at: now, last_change: now, lost: 0,
               acked_since: 0, loss_window: now, srtt: Duration::from_millis(50), last_over: now, samples: VecDeque::new(),
               traced: now, cuts: [0; 3], why: 0, id, losses: Arc::default(), last_cut: None }
     }
@@ -534,6 +548,9 @@ impl Gcc {
 
     fn control(&mut self, now: Instant, app_limited: bool) {
         let Some(acked) = self.acked_rate(now) else { return };
+        let decay = PEAK_DECAY.powf(now.duration_since(self.peak_at).as_secs_f64());
+        self.peak = acked.max(self.peak * decay);
+        self.peak_at = now;
         if self.standing_queue(now) > self.queue_limit {
             self.signal = Signal::Over;
             self.why = 1;
@@ -601,6 +618,15 @@ impl Gcc {
                     self.rate *= 1.08f64.powf(since.min(1.0));
                 }
                 self.rate = self.rate.min(1.5 * acked + 10_000.0);
+                self.last_change = now;
+            }
+            // Sending less than allowed, and no overuse for a while: up, to
+            // what the path has shown it carries twice, never past.
+            State::Increase if app_limited && now.duration_since(self.last_over) > PROBE_AFTER => {
+                let ceiling = (2.0 * self.peak).max(START_RATE);
+                if self.rate < ceiling {
+                    self.rate = (self.rate * IDLE_GROWTH.powf(since.min(1.0))).min(ceiling);
+                }
                 self.last_change = now;
             }
             _ => self.last_change = now,
@@ -1311,6 +1337,21 @@ mod tests {
         let got = closed_loop(|t| if t < 4.0 { 5e6 } else { 2e6 }, 0.005, 8.0, false, &|_| f64::MAX, &mut |_, _| {});
         assert!(got.rate < 2.6e6, "{got:?}");
         assert!(got.through > 1.5e6, "{got:?}");
+    }
+
+    #[test]
+    fn a_still_screen_does_not_keep_the_rate_where_jitter_cut_it() {
+        // 20 MB/s of path, a screen sending 100 KB/s, the rate cut to 150 KB/s
+        // at 1 s (a Wi-Fi's jitter): it goes up on its own, with no overuse.
+        let mut cut = false;
+        let got = closed_loop(|_| 20e6, 0.005, 12.0, true, &|_| 1e5, &mut |gcc, t| {
+            if t > 1.0 && !cut {
+                cut = true;
+                gcc.rate = 150_000.0;
+                gcc.last_over = Instant::now();
+            }
+        });
+        assert!(got.rate >= START_RATE * 0.95, "{got:?}");
     }
 
     #[test]

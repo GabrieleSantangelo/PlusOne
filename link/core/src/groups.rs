@@ -758,7 +758,9 @@ pub(crate) async fn write(conn: Connection, mut pieces: mpsc::Receiver<Piece>, s
             _ = sleep_until(due) => None,
         };
         if let Some(line) = seconds.note(std::time::Instant::now(), shared.stats(), Stats::line) {
-            log!("{}: {line}", conn.remote_address());
+            log!("{}: {line} [rate {} KB/s, rtt {:.0} least {:.0} ms, {} KB unacknowledged]", conn.remote_address(),
+                 shared.rate.load(Ordering::Relaxed) / 1000, conn.rtt().as_secs_f64() * 1000.0,
+                 shared.base_rtt().as_secs_f64() * 1000.0, shared.unacked() / 1000);
         }
         let Some(piece) = piece else { continue };
         let (channel, group) = (piece.channel, piece.group);
