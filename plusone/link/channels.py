@@ -78,6 +78,12 @@ class Budget:
         except (OSError, ValueError, plusone_link.LinkError):
             return None
 
+    def bluetooth_reserve(self):
+        """Whether the session has a Bluetooth path up as a reserve (or the
+        carrier): plus-one-link then sends the sound over it."""
+        device = next((d for d in self.connection.devices() if d["id"] == self.device), {})
+        return any(p.get("kind") == "bt" and p.get("state") in ("standby", "active") for p in device.get("paths") or [])
+
     def _asked(self):
         return next((d for d in self.connection.devices() if d["id"] == self.device), {}).get("rate_kbps") or None
 

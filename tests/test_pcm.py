@@ -94,7 +94,7 @@ def opus_sender(codecs, kbps):
     """A sender over the link (its channel faked), its app playing codecs, the link's budget kbps."""
     sender = pcm.PcmSender("audiotestsrc wave=sine is-live=true samplesperbuffer=240")
     sent, watched = [], []
-    budget = types.SimpleNamespace(kbps=lambda: kbps, watch=watched.append)
+    budget = types.SimpleNamespace(kbps=lambda: kbps, watch=watched.append, bluetooth_reserve=lambda: False)
     sender.channel = types.SimpleNamespace(send=sent.append, budget=budget, receive=lambda timeout: time.sleep(0.05),
                                            close=lambda: None)
     sender._over_link = True
@@ -175,10 +175,25 @@ def test_on_bluetooth_s_budget_the_sound_goes_in_opus(asked, told):
     try:
         sender.answer(json.dumps({"codecs": ["pcm", "opus"]}))
         if told:
-            assert sender.codec == "pcm"  # none yet: PCM
             watches[0]({"event": "budget", "device": device, "kbps": told})
-        assert sender.codec == "opus"
+        # (A Bluetooth path up: Opus whatever the budget, once looked for.)
+        until(lambda: sender.codec == "opus")
         until(lambda: len(sent) >= 20)
         assert {body[0] for body in sent[-10:]} == {pcm.OPUS}
+    finally:
+        sender.close()
+
+
+def test_with_a_bluetooth_reserve_up_the_sound_goes_in_opus_whatever_the_budget():
+    sender, sent, _ = opus_sender(["pcm", "opus"], 40000)
+    try:
+        assert sender.codec == "pcm"
+        sender._bt = True
+        sender.follow(40000)
+        assert sender.codec == "opus"
+        sender._bt = False
+        sender.follow(40000)
+        sender._pcm_at = time.monotonic()
+        until(lambda: sender.codec == "pcm" or (sent and sent[-1][0] == pcm.PCM))
     finally:
         sender.close()

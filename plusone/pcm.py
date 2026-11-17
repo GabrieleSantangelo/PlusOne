@@ -24,6 +24,7 @@ bandwidth abounds, the cable, Wi-Fi Direct). The encoder runs only then (a
 valve before it): nothing spent on it otherwise.
 """
 import json
+import os
 import struct
 import threading
 import time
@@ -31,6 +32,7 @@ import time
 from gi.repository import Gst
 
 from . import log
+import plusone_link
 from .link import Datagrams
 
 PCM = 7                  # the packets' kind (after appdisplay's)
@@ -40,6 +42,9 @@ OPUS_UNDER = 3000        # kbit/s of the link's budget: PCM (1.5 Mbit/s) would b
                          # still screen leaves the rate at its start, 10 Mbit/s, and each cut a Wi-Fi's stall
                          # made took the sound to Opus and back, heard as it going up and down.)
 PCM_OVER = 5000          # kbit/s...
+# The sound on a Bluetooth reserve when there is one (PLUSONE_AUDIO_BT=0: never), looked for each so often (s).
+BLUETOOTH_AUDIO = os.environ.get("PLUSONE_AUDIO_BT", "1").strip() != "0"
+BLUETOOTH_EVERY = 2.0
 PCM_AFTER = 10.0         # ...held this long (s): PCM again
 STATS = 5                # the app's report (appdisplay.STATS's number, its own layout)
 RATE, CHANNELS = 48000, 2
@@ -95,6 +100,7 @@ class PcmSender:
         self.codecs = {"pcm"}  # what the app plays (its answer)
         self.codec = "pcm"
         self._pcm_at = None   # when PCM goes again (the budget high since)
+        self._bt = False      # a Bluetooth reserve is up: the sound goes on it, in Opus
 
     def use_link(self, tablet):
         """The packets on the link's "pcm" channel (tablet: a
@@ -125,15 +131,37 @@ class PcmSender:
         if budget is not None and "opus" in self.codecs:
             self.follow(budget.kbps())
             budget.watch(self.follow)
+            if BLUETOOTH_AUDIO:
+                threading.Thread(target=self._watch_bluetooth, args=(budget,), daemon=True).start()
         self.pipeline.set_state(Gst.State.PLAYING)
         self._listener.start()
+
+    def _watch_bluetooth(self, budget):
+        """While the session keeps a Bluetooth path as a reserve (plus-one-link
+        sends sound over it: Session::steer_audio), the sound goes in Opus:
+        PCM, 1.7 Mbit/s, does not fit its 900 kbit/s, and the Wi-Fi's stalls
+        are not the sound's (the buffer ran dry at each, heard as the volume
+        falling and rising)."""
+        while self._running:
+            try:
+                up = budget.bluetooth_reserve()
+            except (OSError, ValueError, plusone_link.LinkError):
+                up = False
+            if up != self._bt:
+                self._bt = up
+                log(f"speakers: {'on' if up else 'off'} the Bluetooth path")
+                self.follow(budget.kbps())
+            time.sleep(BLUETOOTH_EVERY)
 
     def follow(self, kbps, now=None):
         """The link's budget (kbit/s; None: a path with no controller of its
         own, TCP's): Opus at once under OPUS_UNDER, PCM again once over
         PCM_OVER (or none) for PCM_AFTER."""
         now = time.monotonic() if now is None else now
-        if kbps and kbps < OPUS_UNDER:
+        if self._bt:
+            self._pcm_at = None
+            self._use("opus")
+        elif kbps and kbps < OPUS_UNDER:
             self._pcm_at = None
             self._use("opus")
         elif self.codec == "opus" and (not kbps or kbps >= PCM_OVER):
