@@ -63,6 +63,9 @@ if [ -n "${NETBENCH_TABLET_CPUS:-}" ]; then
 fi
 streams=""
 [ -z "${PLUSONE_LINK_VIDEO_STREAMS:-}" ] || streams="-e PLUSONE_LINK_VIDEO_STREAMS=$PLUSONE_LINK_VIDEO_STREAMS"
+# PLUSONE_LINK_CC (and _PARAMS) in the environment: both sides' controller, for an A/B.
+[ -z "${PLUSONE_LINK_CC:-}" ] || streams="$streams -e PLUSONE_LINK_CC=$PLUSONE_LINK_CC"
+[ -z "${PLUSONE_LINK_CC_PARAMS:-}" ] || streams="$streams -e PLUSONE_LINK_CC_PARAMS=$PLUSONE_LINK_CC_PARAMS"
 low=$(echo "$rate" | awk '{ n = $1 + 0; sub(/[0-9.]+/, "", $1); print int(n / 3 + 0.5) $1 }')
 docker build -q -t plus-one-netbench - < Dockerfile.netbench > /dev/null
 docker network inspect "$name-bench" > /dev/null 2>&1 || docker network create "$name-bench" > /dev/null
