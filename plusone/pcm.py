@@ -29,7 +29,7 @@ import struct
 import threading
 import time
 
-from gi.repository import Gst
+from gi.repository import GLib, Gst
 
 from . import log
 import plusone_link
@@ -101,6 +101,7 @@ class PcmSender:
         self.codec = "pcm"
         self._pcm_at = None   # when PCM goes again (the budget high since)
         self._bt = False      # a Bluetooth reserve is up: the sound goes on it, in Opus
+        self._bluetooth = None  # link/bt.py's, the path this sender made
 
     def use_link(self, tablet):
         """The packets on the link's "pcm" channel (tablet: a
@@ -132,9 +133,39 @@ class PcmSender:
             self.follow(budget.kbps())
             budget.watch(self.follow)
             if BLUETOOTH_AUDIO:
+                threading.Thread(target=self._bring_up_bluetooth, args=(budget,), daemon=True).start()
                 threading.Thread(target=self._watch_bluetooth, args=(budget,), daemon=True).start()
         self.pipeline.set_state(Gst.State.PLAYING)
         self._listener.start()
+
+    def _bring_up_bluetooth(self, budget):
+        """The Bluetooth path with the tablet, if none is up (link/bt.py: over
+        the bond the two made in their Bluetooth settings; the app listens
+        under Plus One's UUID): a reserve of the session, for the sound."""
+        try:
+            from .link.bt import Bluetooth
+            device = next((d for d in budget.connection.devices() if d["id"] == budget.device), {})
+            if not device.get("name") or budget.bluetooth_reserve():
+                return
+            bt = Bluetooth(device["name"], budget.connection)
+            registered, failed = threading.Event(), []
+
+            def register():  # BlueZ calls the profile on the main loop
+                try:
+                    bt.register()
+                except Exception as e:  # noqa: BLE001 - said below
+                    failed.append(e)
+                registered.set()
+                return False
+
+            GLib.idle_add(register)
+            registered.wait(10)
+            if failed:
+                raise failed[0]
+            self._bluetooth = bt
+            bt.up()
+        except Exception as e:  # noqa: BLE001 - no Bluetooth: the sound stays on the Wi-Fi
+            log(f"speakers: no Bluetooth path ({e})")
 
     def _watch_bluetooth(self, budget):
         """While the session keeps a Bluetooth path as a reserve (plus-one-link
@@ -256,4 +287,7 @@ class PcmSender:
         self._opus_sink.disconnect(self._opus_handler)
         if self._listener.is_alive():
             self._listener.join(timeout=2)
+        if self._bluetooth is not None:
+            threading.Thread(target=self._bluetooth.close, daemon=True).start()
+            self._bluetooth = None
         self.channel.close()
