@@ -79,6 +79,10 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
         .build()
     private var opus: OpusDecoder? = null  // the receiver's, from the first Opus packet
     private var opusBroken = false
+    /** Packets come over Bluetooth (kind OPUS_BT): RFCOMM hands them over in
+     * bursts, which a speaker's cushion rides out, as A2DP sinks do (150-250 ms): the
+     * cushion is the longest from the first packet on, and does not come down. */
+    @Volatile private var longPath = false
     private val receiver = Thread(::receive, "plusone-speakers-in")
     private val player = Thread(::play, "plusone-speakers-out")
 
@@ -111,7 +115,15 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
                 val number = ByteBuffer.wrap(body, 1, 4).int
                 when {
                     body[0] == PCM && body.size == 5 + bytes -> came(number, body.copyOfRange(5, body.size))
-                    body[0] == OPUS -> for ((decoded, sound) in decode(body, number)) came(decoded, sound)
+                    body[0] == OPUS || body[0] == OPUS_BT -> {
+                        val long = body[0] == OPUS_BT
+                        if (long && !longPath) {
+                            target = counts.maxTarget
+                            aim = counts.maxTarget
+                        }
+                        longPath = long
+                        for ((decoded, sound) in decode(body, number)) came(decoded, sound)
+                    }
                 }
             }
         } finally {
@@ -173,7 +185,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
             val data: ByteArray = synchronized(lock) {
                 if (!started) {
                     // The first packets: wait for the prefill of them, from the oldest.
-                    while (running && packets.size < counts.prefill) lock.wait()  // stop() wakes it too
+                    while (running && packets.size < (if (longPath) counts.maxTarget else counts.prefill)) lock.wait()  // stop() wakes it too
                     if (!running) return
                     next = oldest()
                     held = packets.size.toDouble()
@@ -298,6 +310,10 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
      * slower while less. Once the Wi-Fi is calm the aim is the prefill again,
      * and the cushion follows the wait down as it gets there. */
     private fun trim() {
+        if (longPath) {
+            target = counts.maxTarget
+            lastStall = SystemClock.uptimeMillis()
+        }
         if (SystemClock.uptimeMillis() - lastStall > CALM_MS) {
             target = maxOf(counts.prefill, minOf(target, kotlin.math.ceil(held).toInt()))
             aim = counts.prefill
@@ -400,6 +416,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
     companion object {
         const val PCM: Byte = 7
         const val OPUS: Byte = 8
+        const val OPUS_BT: Byte = 9  // Opus over Bluetooth: a speaker's cushion (A2DP sinks hold 150-250 ms)
         const val STATS: Byte = 5
         const val CHANNELS = 2
         // Lengths of sound (ms), counted in packets as they come (Counts).

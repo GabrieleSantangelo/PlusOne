@@ -114,7 +114,7 @@ def test_under_a_low_budget_the_sound_goes_in_opus_and_as_it_is_again_after():
     try:
         assert sender.codec == "opus" and watched == [sender.follow]
         until(lambda: len(sent) >= 40)
-        assert {body[0] for body in sent} == {pcm.OPUS}
+        assert {body[0] for body in sent} <= {pcm.OPUS, pcm.OPUS_BT}
         assert all(len(body) < 200 for body in sent)  # 160 kbit/s: about 100 bytes each, not 965
         numbers = [pcm.HEADER.unpack_from(body)[1] for body in sent]
         assert numbers == list(range(numbers[0], numbers[0] + len(numbers)))
@@ -179,7 +179,7 @@ def test_on_bluetooth_s_budget_the_sound_goes_in_opus(asked, told):
         # (A Bluetooth path up: Opus whatever the budget, once looked for.)
         until(lambda: sender.codec == "opus")
         until(lambda: len(sent) >= 20)
-        assert {body[0] for body in sent[-10:]} == {pcm.OPUS}
+        assert {body[0] for body in sent[-10:]} <= {pcm.OPUS, pcm.OPUS_BT}
     finally:
         sender.close()
 

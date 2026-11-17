@@ -37,6 +37,7 @@ from .link import Datagrams
 
 PCM = 7                  # the packets' kind (after appdisplay's)
 OPUS = 8                 # the same 5 ms, in Opus
+OPUS_BT = 9              # ...in Opus on a Bluetooth path: the app keeps a cushion as a speaker's (a2dp: 150-250 ms)
 OPUS_KBPS = 160
 OPUS_UNDER = 3000        # kbit/s of the link's budget: PCM (1.5 Mbit/s) would be half of it and more. (8000: a
                          # still screen leaves the rate at its start, 10 Mbit/s, and each cut a Wi-Fi's stall
@@ -240,7 +241,8 @@ class PcmSender:
             return Gst.FlowReturn.EOS
         if self.codec == "opus" and self._quiet < QUIET_AFTER:
             buf = sample.get_buffer()
-            self.channel.send(HEADER.pack(OPUS, self.sent & 0xFFFFFFFF) + buf.extract_dup(0, buf.get_size()))
+            self.channel.send(HEADER.pack(OPUS_BT if self._bt else OPUS, self.sent & 0xFFFFFFFF)
+                              + buf.extract_dup(0, buf.get_size()))
             self.sent += 1
         return Gst.FlowReturn.OK
 
