@@ -112,6 +112,15 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
                     break
                 }
                 if (body.size < 5) continue
+                if (body[0] == VOLUME) {
+                    if (body.size == 9) {
+                        try {
+                            track.setVolume(ByteBuffer.wrap(body, 5, 4).float.coerceIn(0f, 1f))
+                        } catch (e: IllegalStateException) {
+                        }
+                    }
+                    continue
+                }
                 val number = ByteBuffer.wrap(body, 1, 4).int
                 when {
                     body[0] == PCM && body.size == 5 + bytes -> came(number, body.copyOfRange(5, body.size))
@@ -416,6 +425,7 @@ class PcmPlayback(private val datagrams: Packets, private val rate: Int, private
     companion object {
         const val PCM: Byte = 7
         const val OPUS: Byte = 8
+        const val VOLUME: Byte = 10  // the gain the PC's volume put on the sound (a float): played at it, in float
         const val OPUS_BT: Byte = 9  // Opus over Bluetooth: a speaker's cushion (A2DP sinks hold 150-250 ms)
         const val STATS: Byte = 5
         const val CHANNELS = 2

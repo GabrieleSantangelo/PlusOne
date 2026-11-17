@@ -37,6 +37,7 @@ from .link import Datagrams
 
 PCM = 7                  # the packets' kind (after appdisplay's)
 OPUS = 8                 # the same 5 ms, in Opus
+VOLUME = 10             # the gain the PC's volume put on the sound (a float, 0 to 1): the app plays it so
 OPUS_BT = 9              # ...in Opus on a Bluetooth path: the app keeps a cushion as a speaker's (a2dp: 150-250 ms)
 OPUS_KBPS = 160
 OPUS_UNDER = 3000        # kbit/s of the link's budget: PCM (1.5 Mbit/s) would be half of it and more. (8000: a
@@ -85,7 +86,7 @@ class PcmSender:
         # Both branches in the source's thread (nothing in them waits): the
         # sound as it is, and Opus behind a valve, shut while PCM goes.
         self.pipeline = Gst.parse_launch(
-            f"{source} ! audioconvert ! audioresample "
+            f"{source} ! audioamplify name=gain amplification=1.0 ! audioconvert ! audioresample "
             f"! audio/x-raw,format=S16LE,rate={RATE},channels={CHANNELS},layout=interleaved ! tee name=t "
             f"t. ! appsink name=out emit-signals=true sync=false async=false max-buffers=0 "
             f"t. ! valve name=opus-on drop=true "
@@ -96,6 +97,9 @@ class PcmSender:
         self._opus_sink = self.pipeline.get_by_name("opus")
         self._opus_handler = self._opus_sink.connect("new-sample", self._send_opus)
         self._valve = self.pipeline.get_by_name("opus-on")
+        self._gain_element = self.pipeline.get_by_name("gain")
+        self._gain_known = False
+        self._gain = 1.0      # what the PC's volume takes off the sound (the sink's): put back here, told to the app
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._over_link = False
         self.codecs = {"pcm"}  # what the app plays (its answer)
@@ -167,6 +171,23 @@ class PcmSender:
             bt.up()
         except Exception as e:  # noqa: BLE001 - no Bluetooth: the sound stays on the Wi-Fi
             log(f"speakers: no Bluetooth path ({e})")
+
+    def set_gain(self, gain):
+        """The PC's volume on the sound is gain (0 to 1): the sound goes at full
+        scale (the gain put back before it is 16 bits) and the app plays it at
+        gain, in float: a quiet source lost bits and was taken for silence."""
+        gain = max(0.0, min(1.0, float(gain)))
+        self._gain, self._gain_known = gain, True
+        self._gain_element.set_property("amplification", 1.0 / max(gain, 0.001))
+        self._tell_gain()
+
+    def _tell_gain(self):
+        if not self._gain_known:
+            return
+        try:
+            self.channel.send(HEADER.pack(VOLUME, 0) + struct.pack("!f", self._gain))
+        except (OSError, ValueError, AttributeError):
+            pass
 
     def _watch_bluetooth(self, budget):
         """While the session keeps a Bluetooth path as a reserve (plus-one-link
@@ -250,8 +271,11 @@ class PcmSender:
         """The app's reports, for the log: how much it holds, what it missed,
         how far behind the PC its speaker is, the gaps heard (the speaker
         ran dry); an app of 0.8: 21 bytes, of 0.7: 13."""
-        reports = 0
+        reports, told = 0, 0.0
         while self._running:
+            if time.monotonic() - told >= 1.0:  # (its gain, again each second: a packet may be lost)
+                told = time.monotonic()
+                self._tell_gain()
             report = app_report(self.channel.receive(1.0))
             if report is None:
                 continue

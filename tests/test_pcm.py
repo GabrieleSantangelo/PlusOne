@@ -197,3 +197,16 @@ def test_with_a_bluetooth_reserve_up_the_sound_goes_in_opus_whatever_the_budget(
         until(lambda: sender.codec == "pcm" or (sent and sent[-1][0] == pcm.PCM))
     finally:
         sender.close()
+
+
+def test_the_pc_volume_is_put_back_before_16_bits_and_told_to_the_app():
+    sender, sent, _ = opus_sender(["pcm"], 40000)
+    try:
+        sender.set_gain(0.0138)  # 24 % of the sink: -37 dB
+        assert abs(sender._gain_element.get_property("amplification") - 1 / 0.0138) < 0.1
+        told = [body for body in sent if body[0] == pcm.VOLUME]
+        assert told and struct.unpack("!f", told[-1][pcm.HEADER.size:])[0] == pytest.approx(0.0138)
+        sender.set_gain(0.0)  # muted: no division by it
+        assert sender._gain_element.get_property("amplification") == pytest.approx(1000.0)
+    finally:
+        sender.close()

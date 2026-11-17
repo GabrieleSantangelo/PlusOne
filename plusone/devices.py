@@ -1023,7 +1023,7 @@ class Speakers(AudioDevice):
 
     def __init__(self, app):
         super().__init__(app, "speakers")
-        self._pinned = False
+        self._sender_now = None  # the PcmSender made last (its gain, volume_changed)
         self.bluetooth = BluetoothAudio(lambda: (self.app.tablets.active() or types.SimpleNamespace(name=None)).name)
 
     # The output the user picked, across Plus One's restarts (an update's):
@@ -1032,32 +1032,41 @@ class Speakers(AudioDevice):
     WAS_OUTPUT = os.path.join(GLib.get_user_state_dir(), "plus-one", "speakers-were-the-output")
 
     def _on_event(self, line):
-        # The sink changed (its volume turned down at the PC's keys, say): full again.
+        # The sink changed (its volume turned at the PC's keys, say): its gain told again.
         if self.module and "'change' on sink #" in line:
-            GLib.idle_add(once(self.pin_volume))
+            GLib.idle_add(once(self.volume_changed))
 
-    def pin_volume(self):
-        """The sink at full volume, always: the volume is the tablet's to set.
-        What the PC lowers here lowers only what is sent (24 % was -37 dB: a
-        signal of 8 bits, whose quiet packets the tablet took for silence and
-        left out, heard as the sound going up and down)."""
+    @staticmethod
+    def sink_gain():
+        """The sink's volume as the gain it applies (PipeWire's cubic: 24 % is
+        -37 dB), 0 muted; None if unknown."""
         try:
             volume = subprocess.run(["pactl", "get-sink-volume", SPEAKERS_NAME], capture_output=True, text=True,
                                     timeout=5).stdout
-            levels = re.findall(r"(\d+)%", volume)
-            if levels and any(int(level) != 100 for level in levels):
-                subprocess.run(["pactl", "set-sink-volume", SPEAKERS_NAME, "100%"], capture_output=True, timeout=5)
             muted = subprocess.run(["pactl", "get-sink-mute", SPEAKERS_NAME], capture_output=True, text=True,
                                    timeout=5).stdout
-            if "yes" in muted.lower() or "sì" in muted.lower():
-                subprocess.run(["pactl", "set-sink-mute", SPEAKERS_NAME, "0"], capture_output=True, timeout=5)
-        except (OSError, subprocess.SubprocessError) as e:
-            log("speakers: its volume not set:", repr(e))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        levels = [int(level) for level in re.findall(r"(\d+)%", volume)]
+        if not levels:
+            return None
+        if re.search(r"\b(yes|sì|si)\b", muted.lower()):
+            return 0.0
+        return min(1.0, (sum(levels) / len(levels) / 100.0) ** 3)
+
+    def volume_changed(self):
+        """The PC's volume is the sink's: what the sink takes off is put back
+        before the 16 bits (full scale on the way: a signal at -37 dB left 8
+        bits and the tablet's silence gate) and told to the tablet, which
+        applies it as its track's volume, in float, as the PC chose."""
+        sender = self._sender_now
+        gain = self.sink_gain()
+        if sender is not None and gain is not None:
+            sender.set_gain(gain)
 
     def enable(self):
         super().enable()
         if self.module:
-            self.pin_volume()
             self.bluetooth.hold()
             if os.path.exists(self.WAS_OUTPUT):
                 make_default_sink(SPEAKERS_NAME)
@@ -1090,9 +1099,14 @@ class Speakers(AudioDevice):
         # forced on the whole graph: Chrome's playback, writing in larger
         # pieces, stopped itself after about 10 s at that (Firefox did not),
         # and every program's sound woke the CPU four times as often.
-        return PcmSender(f"pipewiresrc target-object={SPEAKERS_NAME} do-timestamp=true "
-                         f"stream-properties=\"props,stream.capture.sink=true,"
-                         f"node.name=plusone-speakers-feed\"")
+        sender = PcmSender(f"pipewiresrc target-object={SPEAKERS_NAME} do-timestamp=true "
+                           f"stream-properties=\"props,stream.capture.sink=true,"
+                           f"node.name=plusone-speakers-feed\"")
+        self._sender_now = sender
+        gain = self.sink_gain()
+        if gain is not None:
+            sender.set_gain(gain)
+        return sender
 
 
 def pw_objects(text):
